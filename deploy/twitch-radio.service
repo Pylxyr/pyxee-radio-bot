@@ -1,0 +1,49 @@
+[Unit]
+Description=Twitch Radio Bot
+After=network.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/twitch-radio-bot
+Environment="PATH=/home/ubuntu/twitch-radio-bot/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+Environment="PYTHONMALLOC=malloc"
+EnvironmentFile=/home/ubuntu/twitch-radio-bot/.env
+ExecStart=/home/ubuntu/twitch-radio-bot/.venv/bin/python /home/ubuntu/twitch-radio-bot/bot.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+OOMScoreAdjust=-100
+LimitNOFILE=65536
+
+# Hardening. Deliberately does NOT include MemoryDenyWriteExecute=yes: this
+# service needs a working V8-based JS runtime (Deno by default — see
+# deploy/setup.sh) for yt-dlp to fully support YouTube, and that directive
+# is fundamentally incompatible with any V8-based runtime's JIT compiler.
+# Tested directly (native Linux MDWE, the same enforcement mechanism this
+# systemd directive uses): Deno panics on ENOMEM on the very first script it
+# runs under that restriction, not just under heavy load — trivial one-liners
+# crash it immediately. Enabling it here would break song requests outright.
+ProtectSystem=full
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectHome=read-only
+# Only data/ and logs/ are writable — the OAuth token file, tunables.json,
+# and history.sqlite3 all live under data/ (see twitch_radio/config.py's
+# DATA_DIR) specifically so this one entry covers everything the process
+# needs to persist.
+ReadWritePaths=/home/ubuntu/twitch-radio-bot/data /home/ubuntu/twitch-radio-bot/logs
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target
