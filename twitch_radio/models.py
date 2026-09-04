@@ -17,3 +17,4 @@ class Track:
     requester_id: int
     thumbnail_url: str | None = None
     query: str = ""
+    is_live: bool = False

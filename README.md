@@ -24,9 +24,9 @@ talks to Twitch and to yt-dlp, and that's it.
 ## Installation
 
 ```bash
-git clone https://github.com/Pylxyr/pyxee-radio-bot.git twitch-radio-bot
+git clone <this-repo> twitch-radio-bot
 cd twitch-radio-bot
-bash ./deploy/setup.sh
+./deploy/setup.sh
 ```
 
 This installs system packages (`ffmpeg`, `python3-venv`, etc.), installs
@@ -83,7 +83,7 @@ OAuth authorization — both are manual steps, covered next.
 | Command | Who | Does |
 |---|---|---|
 | `!sr <query>` / `!songrequest <query>` | anyone | Resolves a search or URL and queues it |
-| `!skip` | moderators | Skips the currently playing track |
+| `!skip` | moderators (broadcaster included automatically) | Skips the currently playing track |
 | `!queue` | anyone | Shows how many requests are queued |
 | `!nowplaying` / `!np` | anyone | Shows the current track and who requested it |
 

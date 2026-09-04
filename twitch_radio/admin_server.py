@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import base64
+import hmac
 import logging
 import time
 from html import escape
+from typing import Any
 
 from aiohttp import web
 
@@ -51,7 +53,9 @@ class AdminServer:
         except Exception:
             return False
         _, _, password = decoded.partition(":")
-        return password == self._settings_password
+        # Constant-time: a plain `==` here leaks how many leading characters
+        # matched via response timing to anyone who can hit this endpoint.
+        return hmac.compare_digest(password, self._settings_password)
 
     def _unauthorized(self) -> web.Response:
         return web.Response(
@@ -88,33 +92,42 @@ class AdminServer:
         if not self._check_auth(request):
             return self._unauthorized()
         form = await request.post()
-        current = TwitchTunables.from_dict(await self._tunables_store.read())
-        updated = dict(current.to_dict())
         errors: list[str] = []
-        for field, attr, lo, hi in _FIELDS:
-            raw = form.get(field)
-            if raw is None:
-                continue
-            try:
-                value = int(str(raw))
-            except ValueError:
-                errors.append(f"{field}: not a number")
-                continue
-            if value < lo or value > hi:
-                errors.append(f"{field}: must be between {lo} and {hi}")
-                continue
-            updated[attr] = value
+        preview: dict[str, Any] = {}
+
+        def _mutate(current: dict[str, Any]) -> dict[str, Any] | None:
+            # Runs inside the store's lock — read, validate, and write happen
+            # as one atomic step, so two concurrent submissions can't read
+            # the same starting point and have one silently clobber the
+            # other's change.
+            updated = dict(TwitchTunables.from_dict(current).to_dict())
+            for field, attr, lo, hi in _FIELDS:
+                raw = form.get(field)
+                if raw is None:
+                    continue
+                try:
+                    value = int(str(raw))
+                except ValueError:
+                    errors.append(f"{field}: not a number")
+                    continue
+                if value < lo or value > hi:
+                    errors.append(f"{field}: must be between {lo} and {hi}")
+                    continue
+                updated[attr] = value
+            preview.update(updated)
+            return None if errors else updated
+
+        result = await self._tunables_store.update(_mutate)
 
         if errors:
-            tunables = TwitchTunables.from_dict(updated)
+            tunables = TwitchTunables.from_dict(preview or result)
             return web.Response(
                 text=self._render_page(tunables, message="Not saved — " + "; ".join(errors)),
                 content_type="text/html",
                 status=400,
             )
 
-        await self._tunables_store.write(updated)
-        tunables = TwitchTunables.from_dict(updated)
+        tunables = TwitchTunables.from_dict(result)
         return web.Response(text=self._render_page(tunables, message="Saved."), content_type="text/html")
 
     def _render_page(self, tunables: TwitchTunables, *, message: str | None) -> str:

@@ -5,7 +5,7 @@ import contextlib
 import logging
 import shutil
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -22,6 +22,12 @@ _SILENCE_CHUNK = b"\x00" * _CHUNK_BYTES
 
 _MIN_BACKOFF = 5.0
 _MAX_BACKOFF = 300.0
+
+# How long to wait for the decoder to produce its first chunk of audio once
+# it's spawned. There's no -timeout on the decoder's network input, so
+# without this a stream that connects but never sends data blocks the queue
+# forever — silence keeps the muxer alive, but nothing else ever plays.
+_DECODER_START_TIMEOUT = 20.0
 
 
 class TrackResolver(Protocol):
@@ -91,6 +97,15 @@ class TwitchRadioRelay:
         self._current_decoder: asyncio.subprocess.Process | None = None
         self._now_playing: NowPlaying | None = None
         self._stopping = False
+        # Set while a request is between "left the queue" and "decoder
+        # spawned" — i.e. mid-resolve, with no process yet for skip_current()
+        # to kill. See skip_current()/_skip_pending below.
+        self._resolving = False
+        self._skip_pending = False
+        # Optional: lets the chat bot hear about tracks that get silently
+        # dropped (failed re-resolve, stalled decoder, turned out to be
+        # live) so it can say something in chat instead of just a log line.
+        self._notify_failure: Callable[[str], Awaitable[None]] | None = None
 
     # -- public interface used by the chat bot / admin server ------------
 
@@ -104,12 +119,28 @@ class TwitchRadioRelay:
     def enqueue(self, request: QueuedRequest) -> None:
         self._queue.put_nowait(request)
 
+    def set_track_failure_notifier(self, notifier: Callable[[str], Awaitable[None]] | None) -> None:
+        self._notify_failure = notifier
+
     def skip_current(self) -> bool:
-        if self._current_decoder is None:
-            return False
-        with contextlib.suppress(ProcessLookupError):
-            self._current_decoder.kill()
-        return True
+        if self._current_decoder is not None:
+            with contextlib.suppress(ProcessLookupError):
+                self._current_decoder.kill()
+            return True
+        if self._resolving:
+            # Nothing to kill yet — the next track is still being resolved
+            # or its decoder is still starting up. Flag it so
+            # _play_one_inner discards that track the moment it's ready,
+            # instead of the skip silently doing nothing.
+            self._skip_pending = True
+            return True
+        return False
+
+    async def _notify(self, message: str) -> None:
+        if self._notify_failure is None:
+            return
+        with contextlib.suppress(Exception):
+            await self._notify_failure(message)
 
     def start(self) -> None:
         if shutil.which("ffmpeg") is None:
@@ -255,19 +286,35 @@ class TwitchRadioRelay:
             log.exception("Error playing queued request: %s", request.webpage_url)
 
     async def _play_one_inner(self, request: QueuedRequest, muxer_stdin: asyncio.StreamWriter) -> None:
+        self._skip_pending = False  # a stale flag from a previous track must never carry over
         silence_task = asyncio.create_task(
             self._trickle_silence_until_cancelled(muxer_stdin), name="twitch-relay-prefeed-silence"
         )
         decoder: asyncio.subprocess.Process | None = None
         first_chunk = b""
+        self._resolving = True
         try:
             try:
                 track = await self._resolver(request.webpage_url, request.requester_id)
             except Exception:
                 log.exception("Failed to re-resolve queued request: %s", request.webpage_url)
+                await self._notify(f"Couldn't load {request.requester_name}'s song — skipping it.")
                 return
             if track is None:
                 log.warning("Re-resolve returned nothing for %s — skipping", request.webpage_url)
+                await self._notify(f"Couldn't load {request.requester_name}'s song — skipping it.")
+                return
+            if track.is_live:
+                # The chat bot rejects live streams up front, but the underlying
+                # content can also *become* live between queue time and play
+                # time (e.g. a premiere) — catch it here too, since an
+                # indefinite live feed would otherwise hog the relay forever.
+                log.warning("Re-resolve found %s is now live — skipping", request.webpage_url)
+                await self._notify(f"Skipped {request.requester_name}'s song — it's a livestream now.")
+                return
+            if self._skip_pending:
+                self._skip_pending = False
+                log.info("Skipped %s before it started playing (mid-resolve skip).", track.title)
                 return
 
             self._now_playing = NowPlaying(
@@ -300,8 +347,23 @@ class TwitchRadioRelay:
             )
             self._current_decoder = decoder
             assert decoder.stdout is not None
-            first_chunk = await decoder.stdout.read(_CHUNK_BYTES)
+            stdout = decoder.stdout  # local binding — see note below on why this matters to mypy
+            try:
+                first_chunk = await asyncio.wait_for(
+                    stdout.read(_CHUNK_BYTES), timeout=_DECODER_START_TIMEOUT
+                )
+            except TimeoutError:
+                log.warning("Timed out waiting for decoder output for %s — skipping.", request.webpage_url)
+                await self._notify(f"Skipped {request.requester_name}'s song — it took too long to start.")
+                with contextlib.suppress(ProcessLookupError):
+                    decoder.kill()
+                await decoder.wait()
+                self._current_decoder = None
+                self._now_playing = None
+                decoder = None
+                return
         finally:
+            self._resolving = False
             silence_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await silence_task
@@ -313,7 +375,7 @@ class TwitchRadioRelay:
             while chunk:
                 muxer_stdin.write(chunk)
                 await muxer_stdin.drain()
-                chunk = await decoder.stdout.read(_CHUNK_BYTES)
+                chunk = await stdout.read(_CHUNK_BYTES)
         finally:
             with contextlib.suppress(ProcessLookupError):
                 decoder.kill()

@@ -34,8 +34,19 @@ class Resolver:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._semaphore = asyncio.Semaphore(settings.ytdlp_concurrency)
+        # A couple of threads wider than the semaphore on purpose: wait_for()
+        # timing out only cancels our *wait* on a hung extraction, not the
+        # underlying thread — it keeps running (ThreadPoolExecutor can't
+        # preempt it) and stays occupied indefinitely if the hang never
+        # clears. Sizing the pool 1:1 with the concurrency limit means every
+        # such hang permanently steals one of the only slots available, and
+        # repeated hangs eventually starve every future request even though
+        # the semaphore keeps handing out permits. The extra headroom doesn't
+        # prevent that in the limit, but it buys a meaningful margin before
+        # it happens. A real fix would run extraction out-of-process so a
+        # hung one can actually be killed.
         self._executor = ThreadPoolExecutor(
-            max_workers=settings.ytdlp_concurrency, thread_name_prefix="ytdlp"
+            max_workers=settings.ytdlp_concurrency + 2, thread_name_prefix="ytdlp"
         )
 
     def close(self) -> None:
@@ -55,9 +66,13 @@ class Resolver:
             options["cookiefile"] = str(self._settings.ytdlp_cookies_file)
         if self._settings.ytdlp_js_runtime_path:
             # Explicit pin only — an unset path leaves yt-dlp's own default
-            # (auto-detect a `deno` binary on PATH) in place. See README for
-            # why Deno, not Node, is the one to actually install.
-            options["js_runtimes"] = {"node": {"path": self._settings.ytdlp_js_runtime_path}}
+            # (auto-detect a `deno` binary on PATH) in place. The dict key
+            # must be the actual runtime name ("deno", "node", "bun", or
+            # "quickjs") — yt-dlp uses it to pick the calling convention, so
+            # a Deno path filed under "node" silently gets invoked wrong.
+            options["js_runtimes"] = {
+                self._settings.ytdlp_js_runtime_name: {"path": self._settings.ytdlp_js_runtime_path}
+            }
         return options
 
     def _extract_sync(self, query: str) -> dict[str, Any]:
@@ -111,8 +126,12 @@ class Resolver:
             webpage_url=webpage_url,
             stream_url=stream_url,
             uploader=item.get("uploader") or "Unknown uploader",
+            # yt-dlp reports duration=None for an in-progress livestream, which
+            # would otherwise read as "0 seconds" and slip straight past the
+            # max-duration check — is_live is what actually flags that case.
             duration=int(item.get("duration") or 0),
             requester_id=requester_id,
             thumbnail_url=item.get("thumbnail"),
             query=query,
+            is_live=bool(item.get("is_live")),
         )

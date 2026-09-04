@@ -84,6 +84,7 @@ async def _async_run() -> None:
                 tunables_store=tunables_store,
                 token_storage_path=settings.token_path,
             )
+            relay.set_track_failure_notifier(bot.announce)
 
             loop = asyncio.get_running_loop()
 

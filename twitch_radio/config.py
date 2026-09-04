@@ -30,6 +30,23 @@ def _bool_env(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+_VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+
+
+def _log_level_env(name: str, default: str) -> str:
+    # logging.Logger.setLevel() raises ValueError on an unrecognized level
+    # name — a typo'd LOG_LEVEL shouldn't be able to crash startup before
+    # logging even exists to explain why. print() here is deliberate: this
+    # runs before configure_logging() has set anything up.
+    raw = os.getenv(name, "").strip().upper()
+    if not raw:
+        return default
+    if raw not in _VALID_LOG_LEVELS:
+        print(f"WARNING: {name}={raw!r} is not a valid log level — using {default}.")
+        return default
+    return raw
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     # Twitch app credentials — from https://dev.twitch.tv/console/apps
@@ -55,11 +72,11 @@ class Settings:
     # the systemd unit covers everything this process needs to write.
     token_path: Path
     tunables_path: Path
-    db_path: Path
 
     # yt-dlp
     ytdlp_cookies_file: Path | None
     ytdlp_js_runtime_path: str | None
+    ytdlp_js_runtime_name: str
     ytdlp_concurrency: int
     ytdlp_extract_timeout_seconds: int
 
@@ -108,9 +125,12 @@ def load_settings() -> Settings:
         settings_password=os.getenv("TWITCH_SETTINGS_PASSWORD", "").strip() or None,
         token_path=DATA_DIR / os.getenv("TWITCH_TOKEN_FILE", "twitch_tokens.json").strip(),
         tunables_path=DATA_DIR / os.getenv("TWITCH_TUNABLES_FILE", "tunables.json").strip(),
-        db_path=DATA_DIR / os.getenv("HISTORY_DB_FILE", "history.sqlite3").strip(),
         ytdlp_cookies_file=cookies_path,
         ytdlp_js_runtime_path=os.getenv("YTDLP_JS_RUNTIME_PATH", "").strip() or None,
+        # Only matters when YTDLP_JS_RUNTIME_PATH is also set — it tells
+        # yt-dlp what kind of binary that path is. Defaults to "deno" since
+        # that's what setup.sh actually installs.
+        ytdlp_js_runtime_name=os.getenv("YTDLP_JS_RUNTIME_NAME", "deno").strip() or "deno",
         # No Discord process to contend with anymore — this is the only
         # consumer of yt-dlp in this service, so a single modest concurrency
         # knob is enough (unlike the Discord bot's tiered guild/curation/
@@ -118,7 +138,7 @@ def load_settings() -> Settings:
         # cross-feature contention within one shared process).
         ytdlp_concurrency=max(1, min(4, _int_env("YTDLP_CONCURRENCY", 2))),
         ytdlp_extract_timeout_seconds=max(10, min(120, _int_env("YTDLP_EXTRACT_TIMEOUT_SECONDS", 45))),
-        log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
+        log_level=_log_level_env("LOG_LEVEL", "INFO"),
         log_to_file=_bool_env("LOG_TO_FILE", True),
         log_dir=LOG_DIR,
     )

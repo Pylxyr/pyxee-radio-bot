@@ -85,6 +85,15 @@ class SongRequestComponent(commands.Component):
         tunables = TwitchTunables.from_dict(await self.bot.tunables_store.read())
         now = time.monotonic()
 
+        # Everything from here down to the reservation below is synchronous —
+        # no `await` — specifically so the check-and-reserve is one atomic
+        # step. The resolver call further down is a real network request that
+        # can take seconds; checking these limits *before* it but only
+        # recording the request *after* it (the original ordering) lets a
+        # chatter fire off several !sr before any of them land, bypassing
+        # cooldown/pending/queue limits and racing a lost update into
+        # pending_by_chatter. Reserving the slot now, before the await,
+        # closes that window; a rejection later just releases it again.
         last = self.bot.last_request_at.get(chatter_key, 0.0)
         if tunables.request_cooldown_seconds > 0 and (now - last) < tunables.request_cooldown_seconds:
             remaining = tunables.request_cooldown_seconds - (now - last)
@@ -100,48 +109,77 @@ class SongRequestComponent(commands.Component):
             await ctx.reply("Queue's full right now — try again in a bit.")
             return
 
-        try:
-            requester_id = int(ctx.chatter.id)
-        except (TypeError, ValueError):
-            requester_id = 0
-
-        try:
-            track = await self.bot.resolver(query, requester_id)
-        except Exception:
-            log.exception("Failed to resolve Twitch song request: %s", query)
-            await ctx.reply("Couldn't fetch that — try a different search or link.")
-            return
-
-        if track is None:
-            await ctx.reply("No results for that.")
-            return
-
-        if 0 < tunables.max_request_duration_seconds < track.duration:
-            minutes = tunables.max_request_duration_seconds // 60
-            await ctx.reply(f"That's too long to queue — max is {minutes} minute(s).")
-            return
-
         self.bot.last_request_at[chatter_key] = now
         self.bot.pending_by_chatter[chatter_key] = pending + 1
+        reserved = True
 
-        def _on_start(key: str = chatter_key) -> None:
-            remaining_pending = self.bot.pending_by_chatter.get(key, 1) - 1
-            if remaining_pending <= 0:
-                self.bot.pending_by_chatter.pop(key, None)
-            else:
-                self.bot.pending_by_chatter[key] = remaining_pending
+        try:
+            try:
+                requester_id = int(ctx.chatter.id)
+            except (TypeError, ValueError):
+                requester_id = 0
 
-        self.bot.relay.enqueue(
-            QueuedRequest(
-                webpage_url=track.webpage_url,
-                requester_id=requester_id,
-                requester_name=ctx.chatter.display_name or ctx.chatter.name or "a viewer",
-                on_start=_on_start,
+            try:
+                track = await self.bot.resolver(query, requester_id)
+            except Exception:
+                log.exception("Failed to resolve Twitch song request: %s", query)
+                await ctx.reply("Couldn't fetch that — try a different search or link.")
+                return
+
+            if track is None:
+                await ctx.reply("No results for that.")
+                return
+
+            if track.is_live:
+                await ctx.reply("Can't queue a livestream — sorry!")
+                return
+
+            if 0 < tunables.max_request_duration_seconds < track.duration:
+                minutes = tunables.max_request_duration_seconds // 60
+                await ctx.reply(f"That's too long to queue — max is {minutes} minute(s).")
+                return
+
+            # Re-check the cap right before enqueuing (no await between this
+            # check and enqueue() below, so this half is race-free too) — the
+            # resolve above may have taken long enough for the queue to have
+            # filled up in the meantime.
+            if self.bot.relay.queue_size() >= tunables.queue_cap:
+                await ctx.reply("Queue's full right now — try again in a bit.")
+                return
+
+            def _on_start(key: str = chatter_key) -> None:
+                remaining_pending = self.bot.pending_by_chatter.get(key, 1) - 1
+                if remaining_pending <= 0:
+                    self.bot.pending_by_chatter.pop(key, None)
+                else:
+                    self.bot.pending_by_chatter[key] = remaining_pending
+
+            self.bot.relay.enqueue(
+                QueuedRequest(
+                    webpage_url=track.webpage_url,
+                    requester_id=requester_id,
+                    requester_name=ctx.chatter.display_name or ctx.chatter.name or "a viewer",
+                    on_start=_on_start,
+                )
             )
-        )
-        await ctx.reply(f"Queued: {track.title} (#{self.bot.relay.queue_size()} in queue)")
+            reserved = False  # ownership of the reservation now belongs to on_start's eventual decrement
+            await ctx.reply(f"Queued: {track.title} (#{self.bot.relay.queue_size()} in queue)")
+        finally:
+            if reserved:
+                remaining_pending = self.bot.pending_by_chatter.get(chatter_key, 1) - 1
+                if remaining_pending <= 0:
+                    self.bot.pending_by_chatter.pop(chatter_key, None)
+                else:
+                    self.bot.pending_by_chatter[chatter_key] = remaining_pending
 
     @commands.command(name="skip")
+    # NOT is_elevated() — that also allows VIPs, which is broader than this
+    # service ever documented. is_moderator()'s predicate is
+    # `context.chatter.moderator`, and Chatter.moderator's actual property
+    # (verified against the installed twitchio==3.3.2 source, not just its
+    # docstring) is `_is_moderator or _is_lead_moderator or self.broadcaster`
+    # — the broadcaster already passes this guard without needing mod status
+    # on their own channel. No need to broaden it to reach them.
     @commands.is_moderator()
     async def skip(self, ctx: commands.Context) -> None:
         if self.bot.relay.skip_current():
@@ -202,7 +240,7 @@ class TwitchChatBot(commands.Bot):
         # Overridden to redirect TwitchIO's default token file (".tio.tokens.json"
         # in the process's working directory) into DATA_DIR instead, where
         # it's a predictable, single place this whole service already keeps
-        # its other state (tunables.json, history.sqlite3).
+        # its other state (tunables.json).
         self._token_storage_path.parent.mkdir(parents=True, exist_ok=True)
         await super().load_tokens(path or str(self._token_storage_path))
 
@@ -221,6 +259,22 @@ class TwitchChatBot(commands.Bot):
 
     async def event_ready(self) -> None:
         log.info("Twitch chat bot ready (bot_id=%s).", self._bot_id)
+
+    async def announce(self, message: str) -> None:
+        """Proactively sends a message to the broadcaster's channel — used by
+        the relay to tell chat about a track it had to drop (failed
+        re-resolve, stalled decoder, etc). Not tied to a command Context,
+        so this goes through PartialUser.send_message directly rather than
+        ctx.reply. Best-effort: the caller (TwitchRadioRelay._notify)
+        already swallows exceptions from this."""
+        # commands.Bot types _owner_id/_bot_id as `str | None` since the base
+        # class allows constructing without them — this subclass's __init__
+        # requires both (they come from load_settings()'s _required()), so
+        # they're never actually None here; just narrowing for mypy.
+        assert self._owner_id is not None
+        assert self._bot_id is not None
+        channel = self.create_partialuser(user_id=self._owner_id)
+        await channel.send_message(sender=self._bot_id, message=message)
 
     async def event_command_error(self, payload: commands.CommandErrorPayload) -> None:
         exc = payload.exception

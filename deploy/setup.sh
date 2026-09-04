@@ -19,6 +19,22 @@ echo "App directory: ${APP_DIR}"
 echo "Service user:  ${SERVICE_USER}"
 echo ""
 
+# SUDO_USER is only set when this was actually invoked via `sudo`. Run as a
+# root shell directly (common on minimal VPS/container images) and whoami
+# falls back to "root" silently — installing a systemd unit that runs
+# ffmpeg and the yt-dlp JS runtime, both consuming untrusted URLs from chat,
+# as User=root. Require an explicit opt-in for that instead of guessing.
+if [[ "${SERVICE_USER}" == "root" && -z "${SUDO_USER:-}" ]]; then
+  if [[ "${ALLOW_ROOT:-}" != "1" ]]; then
+    error "Running as root with no SUDO_USER — this would install the service as User=root."
+    warn  "Run this via 'sudo' as a normal user instead, so the service runs as that user."
+    warn  "If running as root is actually intended (e.g. a container), re-run with:"
+    warn  "    ALLOW_ROOT=1 ${BASH_SOURCE[0]}"
+    exit 1
+  fi
+  warn "Proceeding as root (ALLOW_ROOT=1) — the service will run as User=root."
+fi
+
 echo "[1/7] Installing system packages"
 sudo apt update
 sudo apt install -y python3 python3-venv ffmpeg logrotate curl unzip

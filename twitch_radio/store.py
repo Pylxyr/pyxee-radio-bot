@@ -3,10 +3,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 
 class JsonStore:
@@ -35,6 +39,27 @@ class JsonStore:
         async with self._lock:
             await asyncio.to_thread(self._write_sync, data)
 
+    async def update(
+        self, mutator: Callable[[dict[str, Any]], dict[str, Any] | None]
+    ) -> dict[str, Any]:
+        """Read-modify-write while holding the lock across all three steps.
+
+        Plain `read()` then `write()` from a caller is two separate lock
+        acquisitions with an await in between — two concurrent callers (e.g.
+        two /settings submissions) can each read the same starting state and
+        the second write silently clobbers the first. `mutator` receives the
+        current dict and returns the dict to persist, or None to leave the
+        file untouched (e.g. the caller's own validation failed) — either
+        way the lock isn't released until the write (or no-op) is done.
+        """
+        async with self._lock:
+            current = await asyncio.to_thread(self._read_sync)
+            updated = mutator(current)
+            if updated is None:
+                return current
+            await asyncio.to_thread(self._write_sync, updated)
+            return updated
+
     def _read_sync(self) -> dict[str, Any]:
         try:
             with self._path.open("r", encoding="utf-8") as f:
@@ -42,8 +67,15 @@ class JsonStore:
         except FileNotFoundError:
             return {}
         except (json.JSONDecodeError, OSError):
+            # Falls back to defaults either way, but silently is the wrong
+            # failure mode for "someone's saved tunables just vanished" —
+            # this should show up in the logs even though it's non-fatal.
+            log.warning("Couldn't read %s — falling back to defaults.", self._path, exc_info=True)
             return {}
-        return loaded if isinstance(loaded, dict) else {}
+        if not isinstance(loaded, dict):
+            log.warning("%s did not contain a JSON object — falling back to defaults.", self._path)
+            return {}
+        return loaded
 
     def _write_sync(self, data: dict[str, Any]) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
