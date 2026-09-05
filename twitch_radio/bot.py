@@ -11,6 +11,7 @@ from twitch_radio.config import Settings, load_settings
 from twitch_radio.extraction import Resolver
 from twitch_radio.relay import TwitchRadioRelay
 from twitch_radio.store import JsonStore
+from twitch_radio.tunables import TwitchTunables
 
 _bg_tasks: set[asyncio.Task[object]] = set()
 
@@ -86,16 +87,29 @@ async def _async_run() -> None:
             )
             relay.set_track_failure_notifier(bot.announce)
 
+            async def _duration_limit() -> int:
+                tunables = TwitchTunables.from_dict(await tunables_store.read())
+                return tunables.max_request_duration_seconds
+
+            relay.set_duration_limit_getter(_duration_limit)
+
             loop = asyncio.get_running_loop()
 
-            def _handle_sigterm() -> None:
-                log.info("SIGTERM received — initiating graceful shutdown.")
+            def _handle_shutdown_signal(signum: int) -> None:
+                log.info("%s received — initiating graceful shutdown.", signal.Signals(signum).name)
                 task = asyncio.create_task(bot.close())
                 _bg_tasks.add(task)
                 task.add_done_callback(_bg_tasks.discard)
 
-            with contextlib.suppress(NotImplementedError):
-                loop.add_signal_handler(signal.SIGTERM, _handle_sigterm)
+            # SIGTERM is what systemd sends on `systemctl stop` — the path
+            # that matters in production. SIGINT (Ctrl+C) gets the same
+            # explicit handler so a manual `python bot.py` during dev shuts
+            # down just as cleanly (killing the muxer/decoder subprocesses)
+            # instead of relying on asyncio.run()'s implicit
+            # cancel-everything-on-KeyboardInterrupt fallback.
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                with contextlib.suppress(NotImplementedError):
+                    loop.add_signal_handler(sig, _handle_shutdown_signal, sig)
 
             async with bot:
                 await bot.start()
