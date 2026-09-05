@@ -57,7 +57,7 @@ from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from twitchio import eventsub
+from twitchio import Chatter, eventsub
 from twitchio.ext import commands
 
 from twitch_radio.relay import QueuedRequest, TwitchRadioRelay
@@ -159,6 +159,7 @@ class SongRequestComponent(commands.Component):
                     webpage_url=track.webpage_url,
                     requester_id=requester_id,
                     requester_name=ctx.chatter.display_name or ctx.chatter.name or "a viewer",
+                    title=track.title,
                     on_start=_on_start,
                 )
             )
@@ -173,19 +174,54 @@ class SongRequestComponent(commands.Component):
                     self.bot.pending_by_chatter[chatter_key] = remaining_pending
 
     @commands.command(name="skip")
-    # NOT is_elevated() — that also allows VIPs, which is broader than this
-    # service ever documented. is_moderator()'s predicate is
-    # `context.chatter.moderator`, and Chatter.moderator's actual property
-    # (verified against the installed twitchio==3.3.2 source, not just its
-    # docstring) is `_is_moderator or _is_lead_moderator or self.broadcaster`
-    # — the broadcaster already passes this guard without needing mod status
-    # on their own channel. No need to broaden it to reach them.
-    @commands.is_moderator()
+    # Deliberately no @commands.is_moderator() guard — mods/the broadcaster
+    # can always skip (checked manually below via ctx.chatter.moderator,
+    # whose actual property, verified against the installed twitchio==3.3.2
+    # source, is `_is_moderator or _is_lead_moderator or self.broadcaster` —
+    # so the broadcaster already passes without needing mod status on their
+    # own channel), but a regular chatter is also allowed to skip *their own*
+    # currently-playing request without needing mod at all.
     async def skip(self, ctx: commands.Context) -> None:
+        chatter = ctx.chatter
+        # ctx.chatter is typed Chatter | PartialUser (the PartialUser case is
+        # only for reward-redemption contexts, which this bot never gets —
+        # it only subscribes to ChatMessageSubscription) — narrowed
+        # explicitly here since .moderator only exists on Chatter, and a
+        # non-Chatter caller should just fall through to "not a mod".
+        is_mod = isinstance(chatter, Chatter) and chatter.moderator
+        if not is_mod:
+            np = self.bot.relay.now_playing
+            if np is None:
+                await ctx.reply("Nothing's playing right now.")
+                return
+            try:
+                requester_id = int(ctx.chatter.id)
+            except (TypeError, ValueError):
+                requester_id = -1
+            if requester_id != np.requester_id:
+                await ctx.reply("You can only skip your own song — mods can skip anything.")
+                return
         if self.bot.relay.skip_current():
             await ctx.reply("Skipped.")
         else:
             await ctx.reply("Nothing's playing right now.")
+
+    @commands.command(name="remove", aliases=["cancel", "unqueue"])
+    async def remove(self, ctx: commands.Context) -> None:
+        """Lets a chatter pull their own most-recently-queued request back
+        out — for requests still waiting in the queue, not the one currently
+        playing (that's what !skip is for)."""
+        try:
+            requester_id = int(ctx.chatter.id)
+        except (TypeError, ValueError):
+            await ctx.reply("Couldn't identify you — try again.")
+            return
+        removed = self.bot.relay.cancel_pending_for(requester_id)
+        if removed is None:
+            await ctx.reply("You don't have anything waiting in the queue.")
+            return
+        title = removed.title or "your request"
+        await ctx.reply(f"Removed: {title}")
 
     @commands.command(name="queue")
     async def queue_cmd(self, ctx: commands.Context) -> None:
@@ -282,6 +318,13 @@ class TwitchChatBot(commands.Bot):
     async def event_command_error(self, payload: commands.CommandErrorPayload) -> None:
         exc = payload.exception
         ctx = payload.context
+        if isinstance(exc, commands.CommandNotFound):
+            # Fires for *every* chat message that starts with our prefix but
+            # isn't one of ours — which, in a channel running Nightbot/
+            # StreamElements/Moobot alongside this bot (all "!"-prefixed
+            # too), is most of them. Not an error worth logging at all,
+            # let alone at ERROR with a traceback on every occurrence.
+            return
         if isinstance(exc, commands.GuardFailure):
             with contextlib.suppress(Exception):
                 await ctx.reply("You don't have permission to use that command.")
