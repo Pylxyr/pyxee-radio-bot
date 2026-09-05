@@ -251,14 +251,14 @@ class TwitchChatBot(commands.Bot):
     async def setup_hook(self) -> None:
         await self.add_component(SongRequestComponent(self))
         subscription = eventsub.ChatMessageSubscription(
-        broadcaster_user_id=self._owner_id,
-        user_id=self._bot_id,
-    )
-    try:
-        await self.subscribe_websocket(payload=subscription)
-        log.info("Subscribed to chat messages for broadcaster=%s bot=%s", self._owner_id, self._bot_id)
-    except Exception as e:
-        log.warning("Skipping chat subscription due to missing tokens (expected on first run): %s", e)
+            broadcaster_user_id=self._owner_id,
+            user_id=self._bot_id,
+        )
+        try:
+            await self.subscribe_websocket(payload=subscription)
+            log.info("Subscribed to chat messages for broadcaster=%s bot=%s", self._owner_id, self._bot_id)
+        except Exception as e:
+            log.warning("Skipping chat subscription due to missing tokens (expected on first run): %s", e)
 
     async def event_ready(self) -> None:
         log.info("Twitch chat bot ready (bot_id=%s).", self._bot_id)
