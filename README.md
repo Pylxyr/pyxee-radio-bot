@@ -2,8 +2,8 @@
 
 A standalone Twitch integration: a 24/7 audio "radio" streamed to a Twitch
 channel via RTMP (static background image, silence between tracks), driven
-entirely by chat — `!sr <query>` to queue a song, `!skip`/`!queue`/`!nowplaying`
-alongside it. Originally part of a Discord music bot; split out into its own
+entirely by chat — `!sr <query>` to queue a song, `!skip`/`!remove`/`!queue`/
+`!nowplaying` alongside it. Originally part of a Discord music bot; split out into its own
 service so a Twitch credential problem, a stuck ffmpeg process, or a systemd
 hardening mistake on one side can never take the other down.
 
@@ -34,14 +34,17 @@ This installs system packages (`ffmpeg`, `python3-venv`, etc.), installs
 full YouTube support — see the note near the bottom of this file), sets up a
 virtualenv, and installs (but does not start) a systemd unit.
 
-It also walks you through `.env` interactively — when it gets to that step it
-prompts for each of the five required credentials one at a time, with
-instructions for where to get each one printed right above the prompt (the
-same instructions are under step 1 below, if you'd rather read them all
-first). Secrets (Client Secret, Stream Key) are hidden as you type. Press
-Enter on any prompt to skip it and fill that one in by hand later — the
-service just won't start until all five are set. Safe to stop and re-run:
-already-filled values are left alone, only blanks get re-prompted.
+It also walks you through `.env` interactively, in two parts. First, the five
+required credentials, one at a time, with instructions for where to get each
+one printed right above the prompt (the same instructions are under step 1
+below, if you'd rather read them all first) — secrets (Client Secret, Stream
+Key) are hidden as you type, and pressing Enter skips one to fill in by hand
+later (the service just won't start until all five are set). Second, every
+other setting in `.env.example` — video bitrate/fps, the local HTTP surface,
+yt-dlp options, logging — each with a one-line explanation and its current
+default shown; Enter keeps the default, so this part is quick to click
+through even though it covers everything. Safe to stop and re-run either
+way: already-filled values are left alone, nothing gets re-prompted.
 
 The wizard only runs when there's an actual terminal attached (so it won't
 hang a non-interactive/scripted install) — pass `SKIP_WIZARD=1` to skip it
@@ -105,7 +108,8 @@ next.
 | Command | Who | Does |
 |---|---|---|
 | `!sr <query>` / `!songrequest <query>` | anyone | Resolves a search or URL and queues it |
-| `!skip` | moderators (broadcaster included automatically) | Skips the currently playing track |
+| `!skip` | moderators (broadcaster included automatically), or anyone skipping their *own* currently-playing song | Skips the currently playing track |
+| `!remove` / `!cancel` / `!unqueue` | anyone | Pulls your own most-recently-queued (not-yet-playing) request back out |
 | `!queue` | anyone | Shows how many requests are queued |
 | `!nowplaying` / `!np` | anyone | Shows the current track and who requested it |
 
@@ -158,6 +162,27 @@ its JIT compiler, which is exactly what this directive blocks. Tested
 directly: Deno panics immediately, on a trivial one-line script, under this
 restriction. Enabling it would break song requests outright, not as a narrow
 edge case, so it's deliberately left out.
+
+## A note on `YTDLP_COOKIES_FILE`
+
+Leave it unset. Ordinary public YouTube searches/URLs don't need cookies at
+all, and yt-dlp has a known, recurring failure mode — `ERROR: [youtube] ...:
+The page needs to be reloaded.` — that shows up specifically on
+cookie-authenticated requests (see
+[yt-dlp#16212](https://github.com/yt-dlp/yt-dlp/issues/16212) and
+[yt-dlp#17389](https://github.com/yt-dlp/yt-dlp/issues/17389)), so turning
+this on "just in case" can make resolves fail *more* often, not less. Only
+set it if you're actually hitting age-restricted or region-gated content,
+and then use a real `cookies.txt` exported from a logged-in browser session —
+an empty or placeholder file is worse than none. If you do set it, it must
+be a path under `data/` (e.g. `YTDLP_COOKIES_FILE=data/cookies.txt`): that's
+the only directory this service's systemd sandbox can write to, and yt-dlp
+tries to save this file back on every single `!sr`, not just when it
+changes — pointing it anywhere else (including a bare `cookies.txt`, which
+resolves to the repo root) fails every request with a read-only-filesystem
+error. `load_settings()` checks this at startup and refuses to start with a
+clear error if it's misconfigured, rather than failing deep inside yt-dlp
+later.
 
 ## Manual installation (without `setup.sh`)
 
