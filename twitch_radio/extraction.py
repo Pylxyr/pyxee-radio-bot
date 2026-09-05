@@ -65,7 +65,7 @@ class Resolver:
             # currently returns "The page needs to be reloaded".
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["default", "web_embedded"],
+                    "player_client": ["web_embedded"],
                 }
             },
         }
