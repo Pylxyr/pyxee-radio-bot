@@ -117,7 +117,24 @@ class Resolver:
             return None
 
         stream_url = item.get("url")
-        webpage_url = item.get("webpage_url") or query
+        webpage_url = item.get("webpage_url")
+        if not webpage_url:
+            if _URL_RE.match(query.strip()):
+                # The query itself was already a stable URL — safe to reuse.
+                webpage_url = query
+            else:
+                # No stable URL to persist. Falling back to the raw search
+                # text here would silently turn into a *fresh* search the
+                # next time this gets re-resolved (relay._play_one_inner
+                # calls back into resolve() with whatever webpage_url we
+                # return) — meaning the song that plays could end up being
+                # different from the one confirmed to the requester in chat.
+                log.warning(
+                    "yt-dlp returned no webpage_url for %r and the query wasn't a URL either "
+                    "— refusing to queue it rather than risk a different track playing later.",
+                    query,
+                )
+                return None
         if not stream_url:
             return None
 
