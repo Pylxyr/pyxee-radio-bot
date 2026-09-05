@@ -66,8 +66,15 @@ class AdminServer:
 
     async def handle_nowplaying(self, request: web.Request) -> web.Response:
         np = self._relay.now_playing
+        # Title/requester only — deliberately not webpage_url or anything
+        # else per queued item, since this is a public, unauthenticated
+        # endpoint meant for an OBS overlay.
+        queue = [
+            {"title": item.title or "Unknown title", "requester_name": item.requester_name}
+            for item in self._relay.queued_items()
+        ]
         if np is None:
-            return web.json_response({"playing": False, "queue_size": self._relay.queue_size()})
+            return web.json_response({"playing": False, "queue_size": len(queue), "queue": queue})
         return web.json_response(
             {
                 "playing": True,
@@ -78,7 +85,8 @@ class AdminServer:
                 "webpage_url": np.webpage_url,
                 "elapsed_seconds": max(0.0, time.monotonic() - np.started_at),
                 "duration_seconds": np.duration,
-                "queue_size": self._relay.queue_size(),
+                "queue_size": len(queue),
+                "queue": queue,
             }
         )
 
