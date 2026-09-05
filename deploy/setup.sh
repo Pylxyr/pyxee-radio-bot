@@ -181,7 +181,7 @@ else
 fi
 
 echo "[3/7] Preparing app directories"
-mkdir -p "${APP_DIR}/data" "${APP_DIR}/logs"
+mkdir -p "${APP_DIR}/data" "${APP_DIR}/logs" "${APP_DIR}/data/deno-cache"
 
 echo "[4/7] Creating virtual environment"
 if [[ ! -d "${APP_DIR}/.venv" ]]; then
@@ -298,9 +298,23 @@ else
     "    under this service's systemd sandbox)."
   prompt_optional_field YTDLP_JS_RUNTIME_PATH "" 0 0 \
     "— Advanced: pin a specific JS runtime binary. Leave blank to auto-detect" \
-    "    the Deno install this script just did."
+    "    the Deno install this script just did." \
+    "    Switching YTDLP_JS_RUNTIME_NAME to node instead? It needs Node >=22 —" \
+    "    Ubuntu's own apt nodejs package is almost always older than that." \
+    "    Use https://github.com/nodesource/distributions or nvm, not apt."
   prompt_optional_field YTDLP_JS_RUNTIME_NAME "deno" 0 0 \
     "— Only matters if YTDLP_JS_RUNTIME_PATH above is set."
+  prompt_optional_field YTDLP_PLAYER_CLIENT "" 0 0 \
+    "— Advanced: comma-separated yt-dlp YouTube player_client override." \
+    "    Leave blank for the built-in default (web_embedded,web when" \
+    "    cookies are set, to dodge a currently-broken fallback client —" \
+    "    see the README's yt-dlp note — otherwise yt-dlp's own default)." \
+    "    YouTube changes what works here often; check" \
+    "    https://github.com/yt-dlp/yt-dlp/wiki/EJS if requests start failing."
+  prompt_optional_field YTDLP_CACHE_TTL_SECONDS "300" 0 1 \
+    "— Seconds a resolved song is reused instead of re-running yt-dlp (0-3600)." \
+    "    Cuts the usual double-extraction (once in chat, again right before" \
+    "    it plays) for anything near the front of the queue. 0 disables it."
   prompt_optional_field YTDLP_CONCURRENCY "2" 0 1 \
     "— Concurrent yt-dlp extractions (1-4). Raise if !sr gets busy."
   prompt_optional_field YTDLP_EXTRACT_TIMEOUT_SECONDS "45" 0 1 \

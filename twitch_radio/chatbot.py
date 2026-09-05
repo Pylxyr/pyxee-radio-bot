@@ -294,7 +294,28 @@ class TwitchChatBot(commands.Bot):
             await self.subscribe_websocket(payload=subscription)
             log.info("Subscribed to chat messages for broadcaster=%s bot=%s", self._owner_id, self._bot_id)
         except Exception as e:
-            log.warning("Skipping chat subscription due to missing tokens (expected on first run): %s", e)
+            if self._token_storage_path.exists():
+                # A token file already exists, so this isn't the expected
+                # first-run gap — something's actually broken (revoked
+                # token, changed scopes, Twitch-side hiccup) and !sr and
+                # friends won't work until it's fixed. Loud on purpose:
+                # a one-line warning here is easy to miss in the startup
+                # log, and the alternative is a bot that looks "up" in
+                # journalctl but silently never responds to chat at all.
+                log.error(
+                    "Chat subscription failed even though %s exists — chat commands won't work "
+                    "until this is fixed. Re-run the OAuth steps in README.md if the token was "
+                    "revoked or scopes changed. Error: %s",
+                    self._token_storage_path,
+                    e,
+                )
+            else:
+                log.warning(
+                    "Skipping chat subscription — no token file yet at %s (expected before the "
+                    "one-time OAuth steps in README.md are done): %s",
+                    self._token_storage_path,
+                    e,
+                )
 
     async def event_ready(self) -> None:
         log.info("Twitch chat bot ready (bot_id=%s).", self._bot_id)

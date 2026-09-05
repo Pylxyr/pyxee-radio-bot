@@ -112,6 +112,8 @@ class Settings:
     ytdlp_js_runtime_name: str
     ytdlp_concurrency: int
     ytdlp_extract_timeout_seconds: int
+    ytdlp_player_client: tuple[str, ...]
+    ytdlp_cache_ttl_seconds: int
 
     # Logging
     log_level: str
@@ -132,16 +134,52 @@ def load_settings() -> Settings:
             )
         return value
 
+    def _required_numeric_id(name: str) -> str:
+        # Real production failure this guards against: TWITCH_BOT_ID pasted
+        # as "Twitch ID:1536026185" (label included) instead of just the
+        # digits — Helix rejects that with a bare "Bad Identifiers" error
+        # that gives no hint what's actually wrong with it. Caught here,
+        # at startup, with a message that names the exact value so it's
+        # obvious what to fix.
+        value = _required(name)
+        if not value.isdigit():
+            raise RuntimeError(
+                f"{name}={value!r} isn't a plain numeric Twitch user ID. It must be digits "
+                f"only — no username, no label like 'Twitch ID:', nothing else. Look one up "
+                f"from a username at "
+                f"https://www.streamweasels.com/tools/convert-twitch-username-to-user-id/"
+            )
+        return value
+
     client_id = _required("TWITCH_CLIENT_ID")
     client_secret = _required("TWITCH_CLIENT_SECRET")
-    bot_id = _required("TWITCH_BOT_ID")
-    owner_id = _required("TWITCH_OWNER_ID")
+    bot_id = _required_numeric_id("TWITCH_BOT_ID")
+    owner_id = _required_numeric_id("TWITCH_OWNER_ID")
     stream_key = _required("TWITCH_STREAM_KEY")
 
     cookies_raw = os.getenv("YTDLP_COOKIES_FILE", "").strip()
     cookies_path = (BASE_DIR / cookies_raw) if cookies_raw else None
     if cookies_path is not None:
         _check_cookies_path_writable(cookies_raw, cookies_path)
+
+    player_client_raw = os.getenv("YTDLP_PLAYER_CLIENT", "").strip()
+    if not player_client_raw and cookies_path is not None:
+        # yt-dlp's own default client priority list when cookies are present
+        # (verified against the installed yt-dlp==2026.08.19 source —
+        # YoutubeIE._DEFAULT_AUTHED_CLIENTS) is
+        # ('web_embedded', 'tv_downgraded', 'web'), and tv_downgraded
+        # currently has a known, still-open breakage ("The page needs to be
+        # reloaded" — see yt-dlp#17389) that a cookie-authenticated request
+        # can fall through to. Pinning to the two *other* clients already in
+        # that same default list — never changing which clients are
+        # "trusted" for an authenticated session, just refusing to ever
+        # reach the broken one — avoids it without guessing at some
+        # unrelated client combination. Only applied as a default; an
+        # explicit YTDLP_PLAYER_CLIENT always wins, and this is skipped
+        # entirely when cookies aren't configured (yt-dlp's unauthenticated
+        # default doesn't involve tv_downgraded at all).
+        player_client_raw = "web_embedded,web"
+    ytdlp_player_client = tuple(c.strip() for c in player_client_raw.split(",") if c.strip())
 
     return Settings(
         client_id=client_id,
@@ -173,6 +211,20 @@ def load_settings() -> Settings:
         # cross-feature contention within one shared process).
         ytdlp_concurrency=max(1, min(4, _int_env("YTDLP_CONCURRENCY", 2))),
         ytdlp_extract_timeout_seconds=max(10, min(120, _int_env("YTDLP_EXTRACT_TIMEOUT_SECONDS", 45))),
+        ytdlp_player_client=ytdlp_player_client,
+        # How long a resolved track is reused instead of running a second
+        # full yt-dlp extraction. A !sr resolves once in chat (to confirm/
+        # queue it) and again in the relay right before it actually plays —
+        # identical work, ~15-20s each with a JS challenge solve involved,
+        # for what's the same request arriving twice. YouTube's direct
+        # media URLs are normally valid for hours, so this window is
+        # deliberately much shorter than that: long enough to skip the
+        # second extraction for a typical short queue, short enough that
+        # anything sitting in a longer queue still gets a genuine
+        # re-resolve (catching a video that went live/private/deleted in
+        # the meantime) rather than reusing a resolve that's actually gone
+        # stale. 0 disables caching entirely.
+        ytdlp_cache_ttl_seconds=max(0, min(3600, _int_env("YTDLP_CACHE_TTL_SECONDS", 300))),
         log_level=_log_level_env("LOG_LEVEL", "INFO"),
         log_to_file=_bool_env("LOG_TO_FILE", True),
         log_dir=LOG_DIR,

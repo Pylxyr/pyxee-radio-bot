@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -48,29 +50,40 @@ class Resolver:
         self._executor = ThreadPoolExecutor(
             max_workers=settings.ytdlp_concurrency + 2, thread_name_prefix="ytdlp"
         )
+        # A !sr resolves once in chat (to confirm/queue it) and again in the
+        # relay right before it actually plays — see resolve()'s docstring
+        # for why this cache is what makes the second one (usually) free.
+        # Keyed by resolved webpage_url, not the raw input query, since
+        # that's the only value both call sites are guaranteed to share.
+        self._cache: dict[str, tuple[Track, float]] = {}
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
-        
+
     def _build_options(self) -> dict[str, Any]:
+        # yt-dlp's own diagnostic verbosity follows this service's LOG_LEVEL
+        # rather than a separate always-on switch — quiet in normal
+        # operation, but `LOG_LEVEL=DEBUG` gets full -v output for free
+        # without a code change or a second setting to remember.
+        verbose = self._settings.log_level == "DEBUG"
         options: dict[str, Any] = {
-            "format": "best",
+            # Audio-only when available (this pipeline immediately decodes
+            # to raw PCM and throws away any video track anyway — pulling a
+            # combined format wastes bandwidth for nothing), falling back to
+            # the best available format if no audio-only one is offered.
+            "format": "bestaudio/best",
             "noplaylist": True,
-            "quiet": False,
-            "no_warnings": False,
-            "verbose": True,
-            "no_warnings": True,
+            "quiet": not verbose,
+            "no_warnings": not verbose,
+            "verbose": verbose,
             "default_search": "ytsearch",
             "socket_timeout": 15,
             "extract_flat": False,
-            # Avoid tv_downgraded (default when cookies are present), which
-            # currently returns "The page needs to be reloaded".
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["web_embedded"],
-                }
-            },
         }
+        if self._settings.ytdlp_player_client:
+            options["extractor_args"] = {
+                "youtube": {"player_client": list(self._settings.ytdlp_player_client)}
+            }
         if self._settings.ytdlp_cookies_file is not None:
             options["cookiefile"] = str(self._settings.ytdlp_cookies_file)
         if self._settings.ytdlp_js_runtime_path:
@@ -111,11 +124,38 @@ class Resolver:
             return raw
         return f"ytsearch1:{raw}"
 
+    def _prune_cache(self, now: float) -> None:
+        ttl = self._settings.ytdlp_cache_ttl_seconds
+        expired = [key for key, (_, cached_at) in self._cache.items() if now - cached_at >= ttl]
+        for key in expired:
+            del self._cache[key]
+
     async def resolve(self, query: str, requester_id: int) -> Track | None:
         """Resolves one query to one Track, or None if nothing playable was
         found (e.g. a search with zero results, or a private/deleted video).
         Never raises for "not found" — only for actual failures (timeout,
-        network error), which the caller is expected to catch."""
+        network error), which the caller is expected to catch.
+
+        Cached briefly (YTDLP_CACHE_TTL_SECONDS) so the relay's re-resolve
+        right before actual playback — which passes back exactly the
+        webpage_url this returned — reuses this result instead of running a
+        second full extraction for what's the same request arriving twice.
+        A cache hit still returns a fresh Track with the requested
+        requester_id, and callers that need a guaranteed live check (state
+        that could have changed since caching, like is_live) should treat a
+        cached result as informational, not gospel, for anything genuinely
+        safety-relevant.
+        """
+        now = time.monotonic()
+        ttl = self._settings.ytdlp_cache_ttl_seconds
+        if ttl > 0:
+            self._prune_cache(now)
+            cached = self._cache.get(query.strip())
+            if cached is not None:
+                track, cached_at = cached
+                if now - cached_at < ttl:
+                    return dataclasses.replace(track, requester_id=requester_id)
+
         info = await self._extract_info(self._query_for(query))
 
         # A bare "ytsearchN:" query wraps its one hit in an "entries" list;
@@ -147,7 +187,7 @@ class Resolver:
         if not stream_url:
             return None
 
-        return Track(
+        track = Track(
             title=item.get("title") or "Unknown title",
             webpage_url=webpage_url,
             stream_url=stream_url,
@@ -161,3 +201,6 @@ class Resolver:
             query=query,
             is_live=bool(item.get("is_live")),
         )
+        if ttl > 0:
+            self._cache[webpage_url] = (track, now)
+        return track

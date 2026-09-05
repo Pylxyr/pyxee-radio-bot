@@ -65,10 +65,14 @@ next.
      The Client ID is shown on the app's page immediately after creating it;
      click "New Secret" for the Client Secret (shown once — copy it then).
    - `TWITCH_BOT_ID` / `TWITCH_OWNER_ID` — numeric Twitch user IDs, **not
-     usernames**, for the chatting account (`BOT_ID`) and the broadcaster
-     account (`OWNER_ID`). A dedicated account made a moderator in your
-     channel is recommended for the bot. Twitch's own UI doesn't show
-     numeric IDs — look one up from a username at
+     usernames, and digits only** (not "Twitch ID:1536026185" — just
+     "1536026185"; Helix rejects the labelled form with a bare "Bad
+     Identifiers" error that doesn't say which field is wrong, so this is
+     validated at startup with a clearer message than that), for the
+     chatting account (`BOT_ID`) and the broadcaster account (`OWNER_ID`). A
+     dedicated account made a moderator in your channel is recommended for
+     the bot. Twitch's own UI doesn't show numeric IDs — look one up from a
+     username at
      [streamweasels.com's converter](https://www.streamweasels.com/tools/convert-twitch-username-to-user-id/).
    - `TWITCH_STREAM_KEY` — [dashboard.twitch.tv/settings/stream](https://dashboard.twitch.tv/settings/stream),
      under "Primary Stream key", click "Show" then copy it. Treat this like
@@ -152,16 +156,38 @@ twitch-radio-bot/
     └── bot.py                     # wires everything together, owns shutdown
 ```
 
-## A note on `MemoryDenyWriteExecute=yes`
+## A note on `MemoryDenyWriteExecute` and `SystemCallFilter`
 
-You'll notice it's absent from `deploy/twitch-radio.service`'s hardening
-directives, even though it's normally a reasonable default. yt-dlp needs an
-external JS runtime (Deno by default) to fully support YouTube, and Deno —
-like Node, like any V8-based runtime — needs writable+executable memory for
-its JIT compiler, which is exactly what this directive blocks. Tested
-directly: Deno panics immediately, on a trivial one-line script, under this
-restriction. Enabling it would break song requests outright, not as a narrow
-edge case, so it's deliberately left out.
+You'll notice both are absent from `deploy/twitch-radio.service`'s hardening
+directives, even though they're normally reasonable defaults. yt-dlp needs a
+working V8-based JS runtime (Deno by default — see `deploy/setup.sh`; Node
+is also supported) to fully support YouTube, and JIT compilation is
+fundamentally incompatible with what both directives restrict:
+
+- `MemoryDenyWriteExecute=yes` — tested directly (native Linux MDWE, the
+  same enforcement mechanism this directive uses): Deno panics on ENOMEM on
+  the very first script it runs under it, not just under heavy load —
+  trivial one-liners crash it immediately.
+- `SystemCallFilter=@system-service` — confirmed directly under this exact
+  unit: Deno's JS-challenge solver died with returncode **-31 (SIGSYS)**
+  specifically under this directive, which surfaces several layers away
+  from the real cause — yt-dlp just reports it as formats being unavailable
+  (`Requested format is not available`, or only image formats left), giving
+  no hint that a subprocess got killed by the sandbox. The identical
+  extraction worked outside systemd entirely, and under a partial
+  `systemd-run` sandbox *without* this directive, isolating it as the
+  cause. `@system-service` is a broad allowlist, not a minimal one, but it
+  still doesn't cover whatever syscalls a V8 JIT needs.
+
+Enabling either would break song requests outright, not as a narrow edge
+case, so both are deliberately left out. Every other hardening directive in
+the unit stays in place. If you'd rather keep `SystemCallFilter` and switch
+to Node instead of Deno (also supported — set `YTDLP_JS_RUNTIME_NAME=node`
+and point `YTDLP_JS_RUNTIME_PATH` at it), it needs to be **Node ≥22**
+([yt-dlp-ejs's stated minimum](https://github.com/7tikar/ejs)) — Ubuntu's
+own `apt install nodejs` is almost always older than that, so use
+[NodeSource's setup script](https://github.com/nodesource/distributions) or
+`nvm` instead of a bare `apt install`.
 
 ## A note on `YTDLP_COOKIES_FILE`
 
@@ -170,19 +196,45 @@ all, and yt-dlp has a known, recurring failure mode — `ERROR: [youtube] ...:
 The page needs to be reloaded.` — that shows up specifically on
 cookie-authenticated requests (see
 [yt-dlp#16212](https://github.com/yt-dlp/yt-dlp/issues/16212) and
-[yt-dlp#17389](https://github.com/yt-dlp/yt-dlp/issues/17389)), so turning
-this on "just in case" can make resolves fail *more* often, not less. Only
-set it if you're actually hitting age-restricted or region-gated content,
-and then use a real `cookies.txt` exported from a logged-in browser session —
-an empty or placeholder file is worse than none. If you do set it, it must
-be a path under `data/` (e.g. `YTDLP_COOKIES_FILE=data/cookies.txt`): that's
-the only directory this service's systemd sandbox can write to, and yt-dlp
-tries to save this file back on every single `!sr`, not just when it
-changes — pointing it anywhere else (including a bare `cookies.txt`, which
-resolves to the repo root) fails every request with a read-only-filesystem
-error. `load_settings()` checks this at startup and refuses to start with a
-clear error if it's misconfigured, rather than failing deep inside yt-dlp
-later.
+[yt-dlp#17389](https://github.com/yt-dlp/yt-dlp/issues/17389), the latter
+still open at time of writing), so turning this on "just in case" can make
+resolves fail *more* often, not less. Only set it if you're actually
+hitting age-restricted or region-gated content, and then use a real
+`cookies.txt` exported from a logged-in browser session — an empty or
+placeholder file is worse than none. If you do set it, it must be a path
+under `data/` (e.g. `YTDLP_COOKIES_FILE=data/cookies.txt`): that's the only
+directory this service's systemd sandbox can write to, and yt-dlp tries to
+save this file back on every single `!sr`, not just when it changes —
+pointing it anywhere else (including a bare `cookies.txt`, which resolves
+to the repo root) fails every request with a read-only-filesystem error.
+`load_settings()` checks this at startup and refuses to start with a clear
+error if it's misconfigured, rather than failing deep inside yt-dlp later.
+
+Turning cookies on also changes which YouTube "client" yt-dlp presents
+itself as — one of the candidates in yt-dlp's own default list for that
+case (`tv_downgraded`) is the specific thing behind issue #17389 above.
+`YTDLP_PLAYER_CLIENT` defaults to skipping it (`web_embedded,web`, both
+already yt-dlp's own top picks for an authenticated session) whenever
+cookies are configured, and is left alone otherwise. See the comment next
+to it in `.env.example` if requests start failing again after a yt-dlp
+update — YouTube changes what works here often enough that today's fix
+isn't guaranteed to still be the right one in a few months; check
+[the EJS wiki](https://github.com/yt-dlp/yt-dlp/wiki/EJS) for what's
+currently recommended.
+
+## Performance: why the first request after a restart feels slower
+
+Every extraction needs a real network round trip plus, for YouTube, solving
+a JS challenge — roughly 15-20s cold. A `!sr` triggers this twice by
+design: once in chat (to confirm it and queue it) and again in the relay
+right before it actually plays (stream URLs expire, and content can change
+state between queue and play time, so playback never trusts a resolve
+that's gotten old). `YTDLP_CACHE_TTL_SECONDS` (default 300) makes the
+second of those two nearly free for anything near the front of the queue —
+same request, same result, reused instead of re-extracted — while still
+forcing a real re-resolve for anything that sits in a longer queue long
+enough to fall outside that window. Set it to `0` to disable caching
+outright and always re-resolve.
 
 ## Manual installation (without `setup.sh`)
 
