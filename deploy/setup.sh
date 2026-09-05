@@ -91,6 +91,46 @@ prompt_env_field() {
   success "${key} saved."
 }
 
+prompt_optional_field() {
+  # prompt_optional_field KEY DEFAULT SECRET(0/1) NUMERIC(0/1) description-line...
+  # Unlike prompt_env_field, Enter here means "keep the default" (written
+  # explicitly into .env), not "leave blank" — every one of these already
+  # has a sane default the service runs fine with.
+  local key="$1" default="$2" secret="$3" numeric="$4"
+  shift 4
+  if [[ -n "$(get_env_var "${key}" "${ENV_PATH}")" ]]; then
+    info "${key} is already set — leaving it alone."
+    return
+  fi
+  local shown_default="${default}"
+  [[ -z "${shown_default}" ]] && shown_default="disabled"
+  echo ""
+  echo "${CYAN}${key}${RESET}"
+  local line
+  for line in "$@"; do
+    echo "  ${line}"
+  done
+  local value=""
+  if [[ "${secret}" == "1" ]]; then
+    read -r -s -p "  Value (input hidden, Enter for ${shown_default}): " value || true
+    echo ""
+  else
+    read -r -p "  Value [${shown_default}]: " value || true
+  fi
+  value="$(trim "${value}")"
+  if [[ -z "${value}" ]]; then
+    value="${default}"
+  elif [[ "${numeric}" == "1" && ! "${value}" =~ ^[0-9]+$ ]]; then
+    warn "That doesn't look like a number — using the default (${shown_default}) instead."
+    value="${default}"
+  fi
+  if [[ -z "${value}" ]]; then
+    return  # blank default (e.g. no settings password) — nothing to write, absence IS the default
+  fi
+  set_env_var "${key}" "${value}" "${ENV_PATH}"
+  success "${key} = ${value}"
+}
+
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVICE_USER="${SUDO_USER:-$(whoami)}"
 SERVICE_NAME="twitch-radio"
@@ -211,6 +251,67 @@ else
     "1. https://dashboard.twitch.tv/settings/stream" \
     "2. Under 'Primary Stream key', click 'Show' then copy it." \
     "Treat this like a password — anyone with it can stream to your channel."
+  echo ""
+  echo "─────────────────────────────────────────────────────────────"
+  echo " Optional settings — every one below already has a working"
+  echo " default. Enter accepts it; only type something if you want"
+  echo " to change it. All of these can also be edited by hand later"
+  echo " in ${ENV_PATH} (or live, for the four under /settings)."
+  echo "─────────────────────────────────────────────────────────────"
+
+  echo ""
+  echo "${CYAN}-- Chat & video track --${RESET}"
+  prompt_optional_field TWITCH_INGEST_URL "rtmp://live.twitch.tv/app" 0 0 \
+    "— Twitch's RTMP ingest endpoint. Advanced; almost never needs changing."
+  prompt_optional_field TWITCH_PREFIX "!" 0 0 \
+    "— Command prefix in chat (!sr, !skip, ...)."
+  prompt_optional_field TWITCH_BACKGROUND_IMAGE "deploy/background.png" 0 0 \
+    "— Looping background image ffmpeg streams under the audio."
+  prompt_optional_field TWITCH_VIDEO_BITRATE_KBPS "800" 0 1 \
+    "— Video bitrate in kbps (300-3000). Higher = sharper but more bandwidth/CPU."
+  prompt_optional_field TWITCH_VIDEO_FPS "2" 0 1 \
+    "— Frames/sec for the static image (1-10). Low is fine — it never moves."
+
+  echo ""
+  echo "${CYAN}-- Local HTTP surface (/nowplaying.json, /settings) --${RESET}"
+  prompt_optional_field TWITCH_NOWPLAYING_HOST "127.0.0.1" 0 0 \
+    "— Keep at 127.0.0.1 unless you understand exposing this beyond localhost."
+  prompt_optional_field TWITCH_NOWPLAYING_PORT "8098" 0 1 \
+    "— Port for the local HTTP surface (1024-65535)."
+  prompt_optional_field TWITCH_SETTINGS_PASSWORD "" 1 0 \
+    "— Basic Auth password for /settings. Leave blank to disable auth on it entirely."
+
+  echo ""
+  echo "${CYAN}-- Advanced: state filenames (only for multiple instances) --${RESET}"
+  prompt_optional_field TWITCH_TOKEN_FILE "twitch_tokens.json" 0 0 \
+    "— Under data/. No reason to change unless running >1 instance from one data/."
+  prompt_optional_field TWITCH_TUNABLES_FILE "tunables.json" 0 0 \
+    "— Same as above, for the /settings tunables."
+
+  echo ""
+  echo "${CYAN}-- yt-dlp --${RESET}"
+  prompt_optional_field YTDLP_COOKIES_FILE "" 0 0 \
+    "— ONLY for age-restricted/region-gated content; leave blank otherwise." \
+    "    Enabling this with an empty/placeholder file causes MORE resolve" \
+    "    failures, not fewer. If set, MUST be a path under data/ (e.g." \
+    "    data/cookies.txt) — anywhere else crashes every !sr (read-only fs" \
+    "    under this service's systemd sandbox)."
+  prompt_optional_field YTDLP_JS_RUNTIME_PATH "" 0 0 \
+    "— Advanced: pin a specific JS runtime binary. Leave blank to auto-detect" \
+    "    the Deno install this script just did."
+  prompt_optional_field YTDLP_JS_RUNTIME_NAME "deno" 0 0 \
+    "— Only matters if YTDLP_JS_RUNTIME_PATH above is set."
+  prompt_optional_field YTDLP_CONCURRENCY "2" 0 1 \
+    "— Concurrent yt-dlp extractions (1-4). Raise if !sr gets busy."
+  prompt_optional_field YTDLP_EXTRACT_TIMEOUT_SECONDS "45" 0 1 \
+    "— Seconds before giving up on a single resolve (10-120)."
+
+  echo ""
+  echo "${CYAN}-- Logging --${RESET}"
+  prompt_optional_field LOG_LEVEL "INFO" 0 0 \
+    "— DEBUG/INFO/WARNING/ERROR/CRITICAL."
+  prompt_optional_field LOG_TO_FILE "true" 0 0 \
+    "— Also write logs/twitch-radio.log (rotated weekly) alongside journalctl."
   echo ""
 fi
 
