@@ -47,6 +47,39 @@ def _log_level_env(name: str, default: str) -> str:
     return raw
 
 
+def _check_cookies_path_writable(raw: str, path: Path) -> None:
+    # yt-dlp only *reads* a configured cookiefile lazily, but it always
+    # tries to *save* it back on every single extraction (every !sr) once
+    # one is configured at all — see yt_dlp.YoutubeDL.close()/save_cookies().
+    # Under the systemd unit's hardening (ProtectSystem=full), only
+    # data/ and logs/ are writable; anything else — including the app's own
+    # root directory, which is what a bare "cookies.txt" resolves to —
+    # fails with a bare OSError deep inside yt-dlp on every request, which
+    # is a confusing way to discover a one-line config mistake. Checked
+    # once, up front, so it fails loudly at startup instead.
+    cookies_dir = path.parent
+    try:
+        cookies_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(
+            f"YTDLP_COOKIES_FILE={raw!r} resolves to {path}, but its directory ({cookies_dir}) "
+            f"couldn't be created: {exc}. Point it at a path under data/ instead, e.g. "
+            f"YTDLP_COOKIES_FILE=data/cookies.txt — that's the only directory this service's "
+            f"systemd sandbox (see deploy/twitch-radio.service's ReadWritePaths) allows it to "
+            f"write to. Leave YTDLP_COOKIES_FILE unset entirely unless you actually need "
+            f"age-restricted or region-gated content — most requests don't."
+        ) from exc
+    if not os.access(cookies_dir, os.W_OK):
+        raise RuntimeError(
+            f"YTDLP_COOKIES_FILE={raw!r} resolves to {path}, but {cookies_dir} isn't writable by "
+            f"this process. Point it at a path under data/ instead, e.g. "
+            f"YTDLP_COOKIES_FILE=data/cookies.txt — that's the only directory this service's "
+            f"systemd sandbox (see deploy/twitch-radio.service's ReadWritePaths) allows it to "
+            f"write to. Leave YTDLP_COOKIES_FILE unset entirely unless you actually need "
+            f"age-restricted or region-gated content — most requests don't."
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     # Twitch app credentials — from https://dev.twitch.tv/console/apps
@@ -107,6 +140,8 @@ def load_settings() -> Settings:
 
     cookies_raw = os.getenv("YTDLP_COOKIES_FILE", "").strip()
     cookies_path = (BASE_DIR / cookies_raw) if cookies_raw else None
+    if cookies_path is not None:
+        _check_cookies_path_writable(cookies_raw, cookies_path)
 
     return Settings(
         client_id=client_id,
