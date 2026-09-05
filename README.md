@@ -24,30 +24,52 @@ talks to Twitch and to yt-dlp, and that's it.
 ## Installation
 
 ```bash
-git clone https://github.com/Pylxyr/pyxee-radio-bot.git twitch-radio-bot
+git clone <this-repo> twitch-radio-bot
 cd twitch-radio-bot
-bash ./deploy/setup.sh
+./deploy/setup.sh
 ```
 
 This installs system packages (`ffmpeg`, `python3-venv`, etc.), installs
 [Deno](https://deno.com) system-wide (yt-dlp needs an external JS runtime for
 full YouTube support — see the note near the bottom of this file), sets up a
-virtualenv, writes `.env` from the template, and installs (but does not
-start) a systemd unit.
+virtualenv, and installs (but does not start) a systemd unit.
 
-It does **not** fill in `.env` for you, and it does **not** complete Twitch's
-OAuth authorization — both are manual steps, covered next.
+It also walks you through `.env` interactively — when it gets to that step it
+prompts for each of the five required credentials one at a time, with
+instructions for where to get each one printed right above the prompt (the
+same instructions are under step 1 below, if you'd rather read them all
+first). Secrets (Client Secret, Stream Key) are hidden as you type. Press
+Enter on any prompt to skip it and fill that one in by hand later — the
+service just won't start until all five are set. Safe to stop and re-run:
+already-filled values are left alone, only blanks get re-prompted.
+
+The wizard only runs when there's an actual terminal attached (so it won't
+hang a non-interactive/scripted install) — pass `SKIP_WIZARD=1` to skip it
+outright and fill in `.env` by hand instead. Either way, it does **not**
+complete Twitch's OAuth authorization — that's still a manual step, covered
+next.
 
 ## Configuration and one-time Twitch authorization
 
-1. **Fill in `.env`.** Every `TWITCH_*` value is required — see the comments
-   in `.env.example` for where each one comes from. In short:
-   - `TWITCH_CLIENT_ID` / `TWITCH_CLIENT_SECRET` — from your app's page at
-     dev.twitch.tv/console/apps (OAuth Redirect URL:
-     `http://localhost:4343/oauth/callback`)
-   - `TWITCH_BOT_ID` / `TWITCH_OWNER_ID` — numeric Twitch user IDs (not
-     usernames) for the chatting account and the broadcaster account
-   - `TWITCH_STREAM_KEY` — from Creator Dashboard → Settings → Stream
+1. **Fill in `.env`** — done automatically by `setup.sh`'s wizard above,
+   unless you skipped it or left something blank. Where each value comes
+   from, if you're doing it by hand (also in `.env.example`'s comments):
+   - `TWITCH_CLIENT_ID` / `TWITCH_CLIENT_SECRET` — go to
+     [dev.twitch.tv/console/apps](https://dev.twitch.tv/console/apps), log
+     in, and click "Register Your Application". Name: anything unique to
+     your account. Category: "Chat Bot". OAuth Redirect URLs: add exactly
+     `http://localhost:4343/oauth/callback`. Client Type: "Confidential".
+     The Client ID is shown on the app's page immediately after creating it;
+     click "New Secret" for the Client Secret (shown once — copy it then).
+   - `TWITCH_BOT_ID` / `TWITCH_OWNER_ID` — numeric Twitch user IDs, **not
+     usernames**, for the chatting account (`BOT_ID`) and the broadcaster
+     account (`OWNER_ID`). A dedicated account made a moderator in your
+     channel is recommended for the bot. Twitch's own UI doesn't show
+     numeric IDs — look one up from a username at
+     [streamweasels.com's converter](https://www.streamweasels.com/tools/convert-twitch-username-to-user-id/).
+   - `TWITCH_STREAM_KEY` — [dashboard.twitch.tv/settings/stream](https://dashboard.twitch.tv/settings/stream),
+     under "Primary Stream key", click "Show" then copy it. Treat this like
+     a password — anyone with it can stream to your channel.
 
 2. **Start the service once** with those set:
    ```bash
