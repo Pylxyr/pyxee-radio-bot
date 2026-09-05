@@ -22,6 +22,13 @@ _SILENCE_CHUNK = b"\x00" * _CHUNK_BYTES
 
 _MIN_BACKOFF = 5.0
 _MAX_BACKOFF = 300.0
+# A muxer session must stay up this long before we trust it enough to reset
+# backoff back to the minimum. Without this, a muxer that spawns fine but
+# then immediately dies (bad stream key, RTMP ingest down, corrupt
+# background image) resets backoff every single cycle — since *spawning*
+# always succeeds even when the ffmpeg process itself is about to fail —
+# turning what should be an exponential backoff into a ~5s restart loop.
+_STABLE_UPTIME_SECONDS = 30.0
 
 # How long to wait for the decoder to produce its first chunk of audio once
 # it's spawned. There's no -timeout on the decoder's network input, so
@@ -39,6 +46,16 @@ class QueuedRequest:
     webpage_url: str
     requester_id: int
     requester_name: str
+    # Title at request time, purely informational (e.g. for a "removed: X"
+    # confirmation or a future queue listing) — never used to decide what
+    # plays; the relay always re-resolves webpage_url at play time.
+    title: str = ""
+    # Set by cancel_pending_for() when a requester removes their own
+    # not-yet-playing request. _feed_loop drops it silently instead of
+    # playing it. Reservation release (on_start) happens immediately at
+    # cancel time, not when this is eventually dequeued — see
+    # cancel_pending_for().
+    cancelled: bool = False
     # Called once this request leaves the queue (successfully played, failed
     # to re-resolve, or skipped) — not on enqueue. Lets the chat bot track
     # "how many of this chatter's requests are still pending" without the
@@ -52,6 +69,7 @@ class NowPlaying:
     uploader: str
     thumbnail_url: str | None
     requester_name: str
+    requester_id: int
     webpage_url: str
     started_at: float
     duration: int
@@ -92,8 +110,16 @@ class TwitchRadioRelay:
         # so the cap is enforced by the caller (checking queue_size() against
         # the current tunable value before calling enqueue()), not here.
         self._queue: asyncio.Queue[QueuedRequest] = asyncio.Queue()
+        # Mirrors the queue's contents in order, purely so cancel_pending_for()
+        # and queued_items() can look/iterate without reaching into
+        # asyncio.Queue's private internals. Kept in sync in enqueue() and
+        # _feed_loop().
+        self._pending: list[QueuedRequest] = []
         self._task: asyncio.Task[None] | None = None
         self._muxer: asyncio.subprocess.Process | None = None
+        self._muxer_spawned_at: float = 0.0
+        self._backoff = _MIN_BACKOFF
+        self._backoff_reset_done = False
         self._current_decoder: asyncio.subprocess.Process | None = None
         self._now_playing: NowPlaying | None = None
         self._stopping = False
@@ -104,8 +130,15 @@ class TwitchRadioRelay:
         self._skip_pending = False
         # Optional: lets the chat bot hear about tracks that get silently
         # dropped (failed re-resolve, stalled decoder, turned out to be
-        # live) so it can say something in chat instead of just a log line.
+        # live, now over the duration cap) so it can say something in chat
+        # instead of just a log line.
         self._notify_failure: Callable[[str], Awaitable[None]] | None = None
+        # Optional: re-checked against the *current* now-playing track once
+        # it's actually resolved, since the duration cap can change (via
+        # /settings) while a request sits in the queue, or a re-resolve can
+        # land on different content than what was queued. 0/None means "no
+        # limit". See set_duration_limit_getter.
+        self._duration_limit_getter: Callable[[], Awaitable[int]] | None = None
 
     # -- public interface used by the chat bot / admin server ------------
 
@@ -116,11 +149,39 @@ class TwitchRadioRelay:
     def queue_size(self) -> int:
         return self._queue.qsize()
 
+    def queued_items(self) -> list[QueuedRequest]:
+        """A snapshot of what's currently waiting, in play order. Safe to
+        expose read-only (e.g. for a queue overlay) — mutating the returned
+        list has no effect on playback."""
+        return list(self._pending)
+
     def enqueue(self, request: QueuedRequest) -> None:
         self._queue.put_nowait(request)
+        self._pending.append(request)
 
     def set_track_failure_notifier(self, notifier: Callable[[str], Awaitable[None]] | None) -> None:
         self._notify_failure = notifier
+
+    def set_duration_limit_getter(self, getter: Callable[[], Awaitable[int]] | None) -> None:
+        self._duration_limit_getter = getter
+
+    def cancel_pending_for(self, requester_id: int) -> QueuedRequest | None:
+        """Removes this chatter's most-recently-queued request that hasn't
+        started playing yet, releasing their reservation immediately rather
+        than waiting for it to reach the front of the queue. Returns the
+        cancelled request (so the caller can report what was removed), or
+        None if they had nothing waiting."""
+        for request in reversed(self._pending):
+            if request.requester_id == requester_id and not request.cancelled:
+                request.cancelled = True
+                with contextlib.suppress(ValueError):
+                    self._pending.remove(request)
+                if request.on_start is not None:
+                    with contextlib.suppress(Exception):
+                        request.on_start()
+                    request.on_start = None
+                return request
+        return None
 
     def skip_current(self) -> bool:
         if self._current_decoder is not None:
@@ -174,22 +235,23 @@ class TwitchRadioRelay:
             self._muxer = None
 
     async def _run_forever(self) -> None:
-        backoff = _MIN_BACKOFF
+        self._backoff = _MIN_BACKOFF
         while not self._stopping:
             try:
                 await self._spawn_muxer()
-                backoff = _MIN_BACKOFF  # reset once a muxer session actually starts cleanly
+                self._muxer_spawned_at = time.monotonic()
+                self._backoff_reset_done = False
                 await self._feed_loop()
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("Twitch relay muxer died unexpectedly — restarting in %.0fs", backoff)
+                log.exception("Twitch relay muxer died unexpectedly — restarting in %.0fs", self._backoff)
             finally:
                 await self._kill_muxer()
             if self._stopping:
                 return
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, _MAX_BACKOFF)
+            await asyncio.sleep(self._backoff)
+            self._backoff = min(self._backoff * 2, _MAX_BACKOFF)
 
     async def _spawn_muxer(self) -> None:
         keyframe_interval = max(1, self._video_fps * 2)  # Twitch wants a keyframe at least every 2s
@@ -250,11 +312,23 @@ class TwitchRadioRelay:
         while not self._stopping:
             if self._muxer.returncode is not None:
                 raise RuntimeError(f"Muxer exited with code {self._muxer.returncode}")
+            if not self._backoff_reset_done and time.monotonic() - self._muxer_spawned_at >= _STABLE_UPTIME_SECONDS:
+                # This session has proven itself, not just spawned — safe to
+                # trust it and let the next failure start backoff from
+                # scratch again.
+                self._backoff = _MIN_BACKOFF
+                self._backoff_reset_done = True
             try:
                 request = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 await self._write_silence_chunk(muxer_stdin)
                 await asyncio.sleep(_CHUNK_DURATION)
+                continue
+            with contextlib.suppress(ValueError):
+                self._pending.remove(request)
+            if request.cancelled:
+                # Reservation was already released in cancel_pending_for() —
+                # just drop it, no on_start call here.
                 continue
             if request.on_start is not None:
                 with contextlib.suppress(Exception):
@@ -285,6 +359,13 @@ class TwitchRadioRelay:
         except Exception:
             log.exception("Error playing queued request: %s", request.webpage_url)
 
+    async def _current_duration_limit(self) -> int:
+        if self._duration_limit_getter is None:
+            return 0
+        with contextlib.suppress(Exception):
+            return await self._duration_limit_getter()
+        return 0
+
     async def _play_one_inner(self, request: QueuedRequest, muxer_stdin: asyncio.StreamWriter) -> None:
         self._skip_pending = False  # a stale flag from a previous track must never carry over
         silence_task = asyncio.create_task(
@@ -312,6 +393,15 @@ class TwitchRadioRelay:
                 log.warning("Re-resolve found %s is now live — skipping", request.webpage_url)
                 await self._notify(f"Skipped {request.requester_name}'s song — it's a livestream now.")
                 return
+            duration_limit = await self._current_duration_limit()
+            if 0 < duration_limit < track.duration:
+                # Re-checked here (not just at request time) because the cap
+                # is live-adjustable via /settings, and a re-resolve can in
+                # rare cases land on different content than what was
+                # originally queued.
+                log.warning("Re-resolve found %s now exceeds the duration cap — skipping", request.webpage_url)
+                await self._notify(f"Skipped {request.requester_name}'s song — it's too long to play now.")
+                return
             if self._skip_pending:
                 self._skip_pending = False
                 log.info("Skipped %s before it started playing (mid-resolve skip).", track.title)
@@ -322,6 +412,7 @@ class TwitchRadioRelay:
                 uploader=track.uploader,
                 thumbnail_url=track.thumbnail_url,
                 requester_name=request.requester_name,
+                requester_id=request.requester_id,
                 webpage_url=track.webpage_url,
                 started_at=time.monotonic(),
                 duration=track.duration,
@@ -346,6 +437,22 @@ class TwitchRadioRelay:
                 stdout=asyncio.subprocess.PIPE,
             )
             self._current_decoder = decoder
+            if self._skip_pending:
+                # A skip landed in the narrow window between the decoder
+                # subprocess's fork/exec (an await, not instant) and this
+                # line — without this second check, that flag would go
+                # unnoticed here and incorrectly carry over to skip the
+                # *next* track instead (it's cleared at the top of every
+                # _play_one_inner call).
+                self._skip_pending = False
+                log.info("Skipped %s right after its decoder started (mid-spawn skip).", track.title)
+                with contextlib.suppress(ProcessLookupError):
+                    decoder.kill()
+                await decoder.wait()
+                self._current_decoder = None
+                self._now_playing = None
+                decoder = None
+                return
             assert decoder.stdout is not None
             stdout = decoder.stdout  # local binding — see note below on why this matters to mypy
             try:
