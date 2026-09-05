@@ -54,7 +54,7 @@ class Resolver:
         
     def _build_options(self) -> dict[str, Any]:
         options: dict[str, Any] = {
-            "format": "bestaudio*[ext=m4a]/bestaudio/best",
+            "format": "best",
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
