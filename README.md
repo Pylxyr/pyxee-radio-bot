@@ -24,9 +24,9 @@ talks to Twitch and to yt-dlp, and that's it.
 ## Installation
 
 ```bash
-git clone <this-repo> twitch-radio-bot
+git clone https://github.com/Pylxyr/pyxee-radio-bot.git twitch-radio-bot
 cd twitch-radio-bot
-./deploy/setup.sh
+bash ./deploy/setup.sh
 ```
 
 This installs system packages (`ffmpeg`, `python3-venv`, etc.), installs
