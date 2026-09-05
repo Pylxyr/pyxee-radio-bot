@@ -51,7 +51,7 @@ class Resolver:
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
-
+        
     def _build_options(self) -> dict[str, Any]:
         options: dict[str, Any] = {
             "format": "bestaudio/best",
@@ -61,6 +61,13 @@ class Resolver:
             "default_search": "ytsearch",
             "socket_timeout": 15,
             "extract_flat": False,
+            # Avoid tv_downgraded (default when cookies are present), which
+            # currently returns "The page needs to be reloaded".
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["default", "web_embedded"],
+                }
+            },
         }
         if self._settings.ytdlp_cookies_file is not None:
             options["cookiefile"] = str(self._settings.ytdlp_cookies_file)
