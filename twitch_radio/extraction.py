@@ -56,7 +56,9 @@ class Resolver:
         options: dict[str, Any] = {
             "format": "best",
             "noplaylist": True,
-            "quiet": True,
+            "quiet": False,
+            "no_warnings": False,
+            "verbose": True,
             "no_warnings": True,
             "default_search": "ytsearch",
             "socket_timeout": 15,
