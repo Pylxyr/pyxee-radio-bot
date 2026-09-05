@@ -9,6 +9,88 @@ success() { echo "${GREEN}✓${RESET} $*"; }
 warn()    { echo "${YELLOW}!${RESET} $*"; }
 error()   { echo "${RED}✗${RESET} $*"; }
 
+# ---- .env helpers -----------------------------------------------------
+# Deliberately NOT sed-based: a pasted Client Secret or Stream Key can
+# contain '/', '&', or '\', any of which corrupts (or silently
+# mis-substitutes) a sed replacement. Plain string comparison + printf
+# sidesteps that entirely — safe with any value that doesn't itself
+# contain a literal newline, which a single `read` line never will.
+
+get_env_var() {  # get_env_var KEY FILE — prints current value, "" if unset/missing
+  local key="$1" file="$2" line
+  [[ -f "${file}" ]] || return 0
+  line="$(grep -m1 "^${key}=" "${file}" 2>/dev/null || true)"
+  printf '%s' "${line#"${key}"=}"
+}
+
+set_env_var() {  # set_env_var KEY VALUE FILE — replaces KEY=... in place, appends if absent
+  local key="$1" value="$2" file="$3" tmp line found=0
+  tmp="$(mktemp)"
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${line}" == "${key}="* ]]; then
+      printf '%s=%s\n' "${key}" "${value}" >>"${tmp}"
+      found=1
+    else
+      printf '%s\n' "${line}" >>"${tmp}"
+    fi
+  done <"${file}"
+  [[ "${found}" -eq 0 ]] && printf '%s=%s\n' "${key}" "${value}" >>"${tmp}"
+  mv "${tmp}" "${file}"
+}
+
+trim() {  # pure-bash whitespace trim — no external command, safe with any content
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "${s}"
+}
+
+REQUIRED_ENV_KEYS=(TWITCH_CLIENT_ID TWITCH_CLIENT_SECRET TWITCH_BOT_ID TWITCH_OWNER_ID TWITCH_STREAM_KEY)
+
+missing_required_env() {  # prints each still-blank required key, one per line
+  local key
+  for key in "${REQUIRED_ENV_KEYS[@]}"; do
+    [[ -z "$(get_env_var "${key}" "${ENV_PATH}")" ]] && echo "${key}"
+  done
+}
+
+prompt_env_field() {
+  # prompt_env_field KEY SECRET(0/1) NUMERIC(0/1) instruction-lines...
+  local key="$1" secret="$2" numeric="$3"
+  shift 3
+  if [[ -n "$(get_env_var "${key}" "${ENV_PATH}")" ]]; then
+    info "${key} is already set — leaving it alone."
+    return
+  fi
+  echo ""
+  echo "${CYAN}${key}${RESET}"
+  local line
+  for line in "$@"; do
+    echo "  ${line}"
+  done
+  local value=""
+  # `|| true` on each read: under set -e, Ctrl+D/EOF mid-prompt would
+  # otherwise abort the whole install partway through (packages and venv
+  # already installed by this point) instead of just skipping this field.
+  if [[ "${secret}" == "1" ]]; then
+    read -r -s -p "  Paste value (input hidden, Enter to skip): " value || true
+    echo ""
+  else
+    read -r -p "  Paste value (Enter to skip): " value || true
+  fi
+  value="$(trim "${value}")"
+  if [[ -z "${value}" ]]; then
+    warn "${key} left blank — set it by hand later in ${ENV_PATH}."
+    return
+  fi
+  if [[ "${numeric}" == "1" && ! "${value}" =~ ^[0-9]+$ ]]; then
+    warn "That doesn't look like a numeric ID — ${key} needs the numeric Twitch user ID,"
+    warn "not a username. Saving it anyway; fix it by hand if the bot doesn't come online."
+  fi
+  set_env_var "${key}" "${value}" "${ENV_PATH}"
+  success "${key} saved."
+}
+
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVICE_USER="${SUDO_USER:-$(whoami)}"
 SERVICE_NAME="twitch-radio"
@@ -70,12 +152,66 @@ echo "[5/7] Installing Python dependencies"
 "${APP_DIR}/.venv/bin/pip" install --upgrade pip -q
 "${APP_DIR}/.venv/bin/pip" install -r "${APP_DIR}/requirements.txt" -q
 
-echo "[6/7] Writing environment file"
+echo "[6/7] Environment file"
 if [[ -f "${ENV_PATH}" ]]; then
-  info "Kept the existing .env unchanged."
+  info "Found an existing ${ENV_PATH} — keeping it, only filling in anything still blank below."
+  chmod 600 "${ENV_PATH}" 2>/dev/null || true
 else
   cp "${APP_DIR}/deploy/.env.example" "${ENV_PATH}"
-  success "Wrote ${ENV_PATH} from the template — every value needs filling in by hand."
+  chmod 600 "${ENV_PATH}"
+  success "Wrote ${ENV_PATH} from the template."
+fi
+
+if [[ -z "$(missing_required_env)" ]]; then
+  success "All required credentials are already set in ${ENV_PATH}."
+elif [[ ! -t 0 || ! -t 1 ]]; then
+  warn "Not running interactively (no TTY) — skipping the credential wizard."
+  warn "Fill in ${ENV_PATH} by hand before starting the service; see the README for where each value comes from."
+elif [[ "${SKIP_WIZARD:-}" == "1" ]]; then
+  info "SKIP_WIZARD=1 — skipping the credential wizard."
+else
+  echo ""
+  echo "─────────────────────────────────────────────────────────────"
+  echo " Credential setup — Enter to skip any of these and fill it in"
+  echo " by hand later (${ENV_PATH}). The service just won't start"
+  echo " until all five are set."
+  echo "─────────────────────────────────────────────────────────────"
+  # Note: if the connection this is running over (e.g. an SSH session) dies
+  # entirely mid-prompt — not a plain Ctrl+D, the whole pty going away — bash's
+  # own terminal-attribute handling for `read -s` can abort the script outright
+  # in a way that isn't a normal command failure `|| true` catches, and isn't
+  # a signal a `trap` catches either. If that happens: nothing already
+  # installed is harmed, and re-running this script picks up exactly where it
+  # left off (already-set values are kept, only blanks get re-prompted).
+
+  prompt_env_field TWITCH_CLIENT_ID 0 0 \
+    "1. Go to https://dev.twitch.tv/console/apps and log in." \
+    "2. Click 'Register Your Application'." \
+    "3. Name: anything unique to your account. Category: 'Chat Bot'." \
+    "4. OAuth Redirect URLs — add exactly:  http://localhost:4343/oauth/callback" \
+    "5. Client Type: 'Confidential'. Click Create." \
+    "6. The Client ID is shown right on the app's page."
+
+  prompt_env_field TWITCH_CLIENT_SECRET 1 0 \
+    "On that same app page, click 'New Secret'." \
+    "It's shown once — copy it now. (Lost it? Generate a new one any time;" \
+    "the old one just stops working.)"
+
+  prompt_env_field TWITCH_BOT_ID 0 1 \
+    "The numeric Twitch user ID of the account the BOT chats as — not a" \
+    "username. Recommended: a separate account, made a moderator in your" \
+    "channel. Look up a username's numeric ID at:" \
+    "  https://www.streamweasels.com/tools/convert-twitch-username-to-user-id/"
+
+  prompt_env_field TWITCH_OWNER_ID 0 1 \
+    "The numeric Twitch user ID of YOUR (broadcaster) account — not a" \
+    "username. Same lookup tool as above, your own username this time."
+
+  prompt_env_field TWITCH_STREAM_KEY 1 0 \
+    "1. https://dashboard.twitch.tv/settings/stream" \
+    "2. Under 'Primary Stream key', click 'Show' then copy it." \
+    "Treat this like a password — anyone with it can stream to your channel."
+  echo ""
 fi
 
 echo "[7/7] Installing logrotate config and systemd unit"
@@ -96,8 +232,20 @@ echo ""
 echo "─────────────────────────────────────────────────────────────"
 echo "Next steps:"
 echo ""
-echo "1. Edit ${ENV_PATH} — every TWITCH_* value is required (see comments"
-echo "   in the file, or the README, for where each one comes from)."
+still_missing="$(missing_required_env)"
+if [[ -n "${still_missing}" ]]; then
+  echo "1. Still need to fill in, in ${ENV_PATH}:"
+  while IFS= read -r key; do
+    echo "     - ${key}"
+  done <<<"${still_missing}"
+  echo "   (see the comments in the file, or the README, for where each comes from —"
+  echo "   or just re-run this script interactively to pick up where you left off.)"
+else
+  echo "1. All required credentials are set in ${ENV_PATH}."
+  echo "   Worth a look before starting: TWITCH_SETTINGS_PASSWORD (protects the"
+  echo "   /settings page) and TWITCH_BACKGROUND_IMAGE — both optional, both in the"
+  echo "   same file."
+fi
 echo ""
 echo "2. Start the service:"
 echo "     sudo systemctl enable --now ${SERVICE_NAME}"
