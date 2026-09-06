@@ -72,21 +72,25 @@ prompt_env_field() {
   # `|| true` on each read: under set -e, Ctrl+D/EOF mid-prompt would
   # otherwise abort the whole install partway through (packages and venv
   # already installed by this point) instead of just skipping this field.
-  if [[ "${secret}" == "1" ]]; then
-    read -r -s -p "  Paste value (input hidden, Enter to skip): " value || true
-    echo ""
-  else
-    read -r -p "  Paste value (Enter to skip): " value || true
-  fi
-  value="$(trim "${value}")"
-  if [[ -z "${value}" ]]; then
-    warn "${key} left blank — set it by hand later in ${ENV_PATH}."
-    return
-  fi
-  if [[ "${numeric}" == "1" && ! "${value}" =~ ^[0-9]+$ ]]; then
-    warn "That doesn't look like a numeric ID — ${key} needs the numeric Twitch user ID,"
-    warn "not a username. Saving it anyway; fix it by hand if the bot doesn't come online."
-  fi
+  while true; do
+    if [[ "${secret}" == "1" ]]; then
+      read -r -s -p "  Paste value (input hidden, Enter to skip): " value || true
+      echo ""
+    else
+      read -r -p "  Paste value (Enter to skip): " value || true
+    fi
+    value="$(trim "${value}")"
+    if [[ -z "${value}" ]]; then
+      warn "${key} left blank — set it by hand later in ${ENV_PATH}."
+      return
+    fi
+    if [[ "${numeric}" == "1" && ! "${value}" =~ ^[0-9]+$ ]]; then
+      warn "Not a plain numeric ID (digits only — no username, no label like 'Twitch ID:')."
+      warn "The service refuses to start with this. Try again, or leave blank to skip."
+      continue
+    fi
+    break
+  done
   set_env_var "${key}" "${value}" "${ENV_PATH}"
   success "${key} saved."
 }
@@ -214,7 +218,7 @@ else
   echo "─────────────────────────────────────────────────────────────"
   echo " Credential setup — Enter to skip any of these and fill it in"
   echo " by hand later (${ENV_PATH}). The service just won't start"
-  echo " until all five are set."
+  echo " until all four are set."
   echo "─────────────────────────────────────────────────────────────"
   # Note: if the connection this is running over (e.g. an SSH session) dies
   # entirely mid-prompt — not a plain Ctrl+D, the whole pty going away — bash's
