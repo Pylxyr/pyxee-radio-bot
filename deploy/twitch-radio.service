@@ -23,39 +23,20 @@ TimeoutStopSec=30
 OOMScoreAdjust=-100
 LimitNOFILE=65536
 
-# Hardening. Deliberately does NOT include MemoryDenyWriteExecute=yes, and
-# does NOT set SystemCallFilter — both for the same underlying reason: this
-# service needs a working V8-based JS runtime (Deno by default — see
-# deploy/setup.sh; Node is also supported, see YTDLP_JS_RUNTIME_NAME in
-# .env.example) for yt-dlp to fully support YouTube, and JIT compilation is
-# fundamentally incompatible with the kind of restriction both directives
-# apply:
-#   - MemoryDenyWriteExecute=yes: tested directly (native Linux MDWE, the
-#     same enforcement mechanism this directive uses) — Deno panics on
-#     ENOMEM on the very first script it runs under it, not just under
-#     heavy load. Trivial one-liners crash it immediately.
-#   - SystemCallFilter=@system-service: confirmed directly under this exact
-#     unit — Deno's JS-challenge solver died with returncode -31 (SIGSYS)
-#     specifically under this directive, producing symptoms that look
-#     unrelated at first (yt-dlp falling back to image-only formats,
-#     "Requested format is not available"), since the actual failure (a
-#     killed subprocess) happens several layers below the error yt-dlp
-#     surfaces. The exact same extraction worked outside systemd entirely,
-#     and under a partial systemd-run sandbox *without* this directive —
-#     isolating it as the cause. @system-service is a broad allowlist, not
-#     a minimal one, but it still doesn't cover whatever syscalls a V8
-#     JIT needs (mmap/mprotect sequences for RWX transitions being the
-#     likely candidates, though this wasn't narrowed further).
-# Enabling either would break song requests outright, not as a narrow edge
-# case, so both are deliberately left out. Every other hardening directive
-# below stays in place.
+# No MemoryDenyWriteExecute and no SystemCallFilter: yt-dlp needs a working
+# V8 JS runtime (Deno by default) for YouTube, and both directives break it.
+# MDWE: Deno panics on ENOMEM on its very first script under it.
+# SystemCallFilter=@system-service: confirmed directly under this exact unit
+# — Deno's JS-challenge solver died with SIGSYS (-31) under it, surfacing as
+# an unrelated-looking yt-dlp error ("Requested format is not available").
+# Worked outside systemd, and under systemd-run without this directive.
+# Both would break song requests outright, so both stay off.
 ProtectSystem=full
 PrivateTmp=yes
 NoNewPrivileges=yes
 ProtectHome=read-only
-# Only data/ and logs/ are writable — the OAuth token file and tunables.json
-# both live under data/ (see twitch_radio/config.py's DATA_DIR) specifically
-# so this one entry covers everything the process needs to persist.
+# Only data/ and logs/ are writable — everything this process persists
+# (tokens, tunables) lives under data/.
 ReadWritePaths=/home/ubuntu/twitch-radio-bot/data /home/ubuntu/twitch-radio-bot/logs
 CapabilityBoundingSet=
 AmbientCapabilities=

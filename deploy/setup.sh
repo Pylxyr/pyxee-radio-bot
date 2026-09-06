@@ -45,7 +45,7 @@ trim() {  # pure-bash whitespace trim — no external command, safe with any con
   printf '%s' "${s}"
 }
 
-REQUIRED_ENV_KEYS=(TWITCH_CLIENT_ID TWITCH_CLIENT_SECRET TWITCH_BOT_ID TWITCH_OWNER_ID TWITCH_STREAM_KEY)
+REQUIRED_ENV_KEYS=(TWITCH_CLIENT_ID TWITCH_CLIENT_SECRET TWITCH_BOT_ID TWITCH_OWNER_ID)
 
 missing_required_env() {  # prints each still-blank required key, one per line
   local key
@@ -246,11 +246,6 @@ else
   prompt_env_field TWITCH_OWNER_ID 0 1 \
     "The numeric Twitch user ID of YOUR (broadcaster) account — not a" \
     "username. Same lookup tool as above, your own username this time."
-
-  prompt_env_field TWITCH_STREAM_KEY 1 0 \
-    "1. https://dashboard.twitch.tv/settings/stream" \
-    "2. Under 'Primary Stream key', click 'Show' then copy it." \
-    "Treat this like a password — anyone with it can stream to your channel."
   echo ""
   echo "─────────────────────────────────────────────────────────────"
   echo " Optional settings — every one below already has a working"
@@ -260,26 +255,27 @@ else
   echo "─────────────────────────────────────────────────────────────"
 
   echo ""
-  echo "${CYAN}-- Chat & video track --${RESET}"
-  prompt_optional_field TWITCH_INGEST_URL "rtmp://live.twitch.tv/app" 0 0 \
-    "— Twitch's RTMP ingest endpoint. Advanced; almost never needs changing."
+  echo "${CYAN}-- Chat & audio --${RESET}"
   prompt_optional_field TWITCH_PREFIX "!" 0 0 \
     "— Command prefix in chat (!sr, !skip, ...)."
-  prompt_optional_field TWITCH_BACKGROUND_IMAGE "deploy/background.png" 0 0 \
-    "— Looping background image ffmpeg streams under the audio."
-  prompt_optional_field TWITCH_VIDEO_BITRATE_KBPS "800" 0 1 \
-    "— Video bitrate in kbps (300-3000). Higher = sharper but more bandwidth/CPU."
-  prompt_optional_field TWITCH_VIDEO_FPS "2" 0 1 \
-    "— Frames/sec for the static image (1-10). Low is fine — it never moves."
+  prompt_optional_field AUDIO_BITRATE_KBPS "128" 0 1 \
+    "— MP3 bitrate for /stream.mp3 (64-320). Raise it if it sounds thin."
 
   echo ""
-  echo "${CYAN}-- Local HTTP surface (/nowplaying.json, /settings) --${RESET}"
+  echo "${CYAN}-- Local HTTP surface (/stream.mp3, /overlay, /settings) --${RESET}"
   prompt_optional_field TWITCH_NOWPLAYING_HOST "127.0.0.1" 0 0 \
-    "— Keep at 127.0.0.1 unless you understand exposing this beyond localhost."
+    "— This bot doesn't stream to Twitch itself; OBS pulls audio+overlay from" \
+    "    here instead. Keep at 127.0.0.1 if OBS runs on THIS machine. If OBS" \
+    "    is on a different machine (e.g. this is a cloud VM), set 0.0.0.0" \
+    "    and open the port in your cloud firewall — on Oracle Cloud that's" \
+    "    both the Security List/NSG rule AND the VM's own iptables. See" \
+    "    README.md for the OBS setup and firewall steps either way."
   prompt_optional_field TWITCH_NOWPLAYING_PORT "8098" 0 1 \
     "— Port for the local HTTP surface (1024-65535)."
   prompt_optional_field TWITCH_SETTINGS_PASSWORD "" 1 0 \
-    "— Basic Auth password for /settings. Leave blank to disable auth on it entirely."
+    "— Basic Auth password for /settings. Strongly recommended if the host" \
+    "    above isn't 127.0.0.1 — otherwise anyone who finds the port can" \
+    "    change your queue/cooldown settings."
 
   echo ""
   echo "${CYAN}-- Advanced: state filenames (only for multiple instances) --${RESET}"
@@ -357,9 +353,8 @@ if [[ -n "${still_missing}" ]]; then
   echo "   or just re-run this script interactively to pick up where you left off.)"
 else
   echo "1. All required credentials are set in ${ENV_PATH}."
-  echo "   Worth a look before starting: TWITCH_SETTINGS_PASSWORD (protects the"
-  echo "   /settings page) and TWITCH_BACKGROUND_IMAGE — both optional, both in the"
-  echo "   same file."
+  echo "   If OBS is on a different machine than this one, double-check"
+  echo "   TWITCH_NOWPLAYING_HOST and TWITCH_SETTINGS_PASSWORD in the same file."
 fi
 echo ""
 echo "2. Start the service:"
@@ -375,5 +370,8 @@ echo "       http://localhost:4343/oauth?scopes=user:read:chat+user:write:chat+u
 echo "     - as the BROADCASTER account:"
 echo "       http://localhost:4343/oauth?scopes=channel:bot"
 echo ""
-echo "4. journalctl -u ${SERVICE_NAME} -f -o cat    — watch it come up"
+echo "4. In OBS, add a Media Source pointed at /stream.mp3 and (optionally) a"
+echo "   Browser Source pointed at /overlay — see README.md."
+echo ""
+echo "5. journalctl -u ${SERVICE_NAME} -f -o cat    — watch it come up"
 echo "─────────────────────────────────────────────────────────────"
