@@ -34,7 +34,9 @@ set_env_var() {  # set_env_var KEY VALUE FILE — replaces KEY=... in place, app
       printf '%s\n' "${line}" >>"${tmp}"
     fi
   done <"${file}"
-  [[ "${found}" -eq 0 ]] && printf '%s=%s\n' "${key}" "${value}" >>"${tmp}"
+  if [[ "${found}" -eq 0 ]]; then
+    printf '%s=%s\n' "${key}" "${value}" >>"${tmp}"
+  fi
   mv "${tmp}" "${file}"
 }
 
@@ -50,7 +52,9 @@ REQUIRED_ENV_KEYS=(TWITCH_CLIENT_ID TWITCH_CLIENT_SECRET TWITCH_BOT_ID TWITCH_OW
 missing_required_env() {  # prints each still-blank required key, one per line
   local key
   for key in "${REQUIRED_ENV_KEYS[@]}"; do
-    [[ -z "$(get_env_var "${key}" "${ENV_PATH}")" ]] && echo "${key}"
+    if [[ -z "$(get_env_var "${key}" "${ENV_PATH}")" ]]; then
+      echo "${key}"
+    fi
   done
 }
 
@@ -107,7 +111,9 @@ prompt_optional_field() {
     return
   fi
   local shown_default="${default}"
-  [[ -z "${shown_default}" ]] && shown_default="disabled"
+  if [[ -z "${shown_default}" ]]; then
+    shown_default="disabled"
+  fi
   echo ""
   echo "${CYAN}${key}${RESET}"
   local line
