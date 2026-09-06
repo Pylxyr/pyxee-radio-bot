@@ -6,10 +6,10 @@ import logging
 import signal
 
 from twitch_radio.admin_server import run_admin_server
+from twitch_radio.player import RadioPlayer
 from twitch_radio.chatbot import TwitchChatBot
 from twitch_radio.config import Settings, load_settings
 from twitch_radio.extraction import Resolver
-from twitch_radio.relay import TwitchRadioRelay
 from twitch_radio.store import JsonStore
 from twitch_radio.tunables import TwitchTunables
 
@@ -28,8 +28,6 @@ def configure_logging(settings: Settings) -> None:
     for h in handlers:
         root.addHandler(h)
     root.setLevel(settings.log_level)
-    # twitchio and yt-dlp are both fairly chatty at INFO; this service's own
-    # logging carries the signal that actually matters day to day.
     logging.getLogger("twitchio").setLevel(logging.WARNING)
     logging.getLogger("yt_dlp").setLevel(logging.WARNING)
     logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
@@ -43,31 +41,21 @@ async def _async_run() -> None:
     resolver = Resolver(settings)
     tunables_store = JsonStore(settings.tunables_path)
 
-    relay = TwitchRadioRelay(
-        ingest_url=settings.ingest_url,
-        stream_key=settings.stream_key,
-        background_image=settings.background_image,
-        resolver=resolver.resolve,
-        video_bitrate_kbps=settings.video_bitrate_kbps,
-        video_fps=settings.video_fps,
-    )
-    # relay.start() spawns a persistent background task (and, once running, a
-    # live ffmpeg RTMP push) before anything else here exists. Everything
-    # from here down is nested try/finally, one per resource — not one big
-    # try around just the chat bot — specifically so a failure acquiring any
-    # *later* resource (the admin server's port, the chat bot itself) still
-    # tears down everything already acquired instead of leaking it.
-    relay.start()
+    player = RadioPlayer(resolver=resolver.resolve, audio_bitrate_kbps=settings.audio_bitrate_kbps)
+    # player.start() spawns a persistent background task before anything
+    # else here exists — nested try/finally per resource, not one big try
+    # around just the chat bot, so a failure acquiring a *later* resource
+    # still tears down everything already acquired.
+    player.start()
     try:
         admin_runner = await run_admin_server(
-            relay=relay,
+            player=player,
             tunables_store=tunables_store,
             settings_password=settings.settings_password,
             broadcast_info={
-                "Ingest URL": settings.ingest_url,
-                "Video bitrate": f"{settings.video_bitrate_kbps} kbps",
-                "Video framerate": f"{settings.video_fps} fps",
-                "Background image": str(settings.background_image),
+                "Audio stream": "/stream.mp3",
+                "Overlay": "/overlay",
+                "Audio bitrate": f"{settings.audio_bitrate_kbps} kbps",
                 "Chat command prefix": settings.prefix,
             },
             host=settings.nowplaying_host,
@@ -81,17 +69,17 @@ async def _async_run() -> None:
                 owner_id=settings.owner_id,
                 prefix=settings.prefix,
                 resolver=resolver,
-                relay=relay,
+                player=player,
                 tunables_store=tunables_store,
                 token_storage_path=settings.token_path,
             )
-            relay.set_track_failure_notifier(bot.announce)
+            player.set_track_failure_notifier(bot.announce)
 
             async def _duration_limit() -> int:
                 tunables = TwitchTunables.from_dict(await tunables_store.read())
                 return tunables.max_request_duration_seconds
 
-            relay.set_duration_limit_getter(_duration_limit)
+            player.set_duration_limit_getter(_duration_limit)
 
             loop = asyncio.get_running_loop()
 
@@ -101,12 +89,6 @@ async def _async_run() -> None:
                 _bg_tasks.add(task)
                 task.add_done_callback(_bg_tasks.discard)
 
-            # SIGTERM is what systemd sends on `systemctl stop` — the path
-            # that matters in production. SIGINT (Ctrl+C) gets the same
-            # explicit handler so a manual `python bot.py` during dev shuts
-            # down just as cleanly (killing the muxer/decoder subprocesses)
-            # instead of relying on asyncio.run()'s implicit
-            # cancel-everything-on-KeyboardInterrupt fallback.
             for sig in (signal.SIGTERM, signal.SIGINT):
                 with contextlib.suppress(NotImplementedError):
                     loop.add_signal_handler(sig, _handle_shutdown_signal, sig)
@@ -116,7 +98,7 @@ async def _async_run() -> None:
         finally:
             await admin_runner.cleanup()
     finally:
-        await relay.stop()
+        await player.stop()
         resolver.close()
 
 

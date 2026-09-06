@@ -1,4 +1,4 @@
-"""Twitch chat bot — handles !sr <query> and hands resolved requests to the relay.
+"""Twitch chat bot — handles !sr <query> and hands resolved requests to the radio player.
 
 Built against twitchio 3.x's EventSub-based Bot (verified against the actual
 installed twitchio==3.3.2 API by inspecting the library directly, not just
@@ -29,7 +29,7 @@ ONE-TIME SETUP — this part doesn't happen automatically and isn't optional:
     why this class does). To complete it:
 
       1. Start the bot once with valid TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET
-         / TWITCH_BOT_ID / TWITCH_OWNER_ID / TWITCH_STREAM_KEY set.
+         / TWITCH_BOT_ID / TWITCH_OWNER_ID set.
       2. The adapter binds to localhost only, so on a remote VPS you'll need
          an SSH tunnel to reach it: `ssh -L 4343:localhost:4343 <user>@<host>`
          from your own machine, kept open while you do steps 3-4.
@@ -60,7 +60,7 @@ from typing import TYPE_CHECKING
 from twitchio import Chatter, eventsub
 from twitchio.ext import commands
 
-from twitch_radio.relay import QueuedRequest, TwitchRadioRelay
+from twitch_radio.player import QueuedRequest, RadioPlayer
 from twitch_radio.store import JsonStore
 from twitch_radio.tunables import TwitchTunables
 
@@ -85,15 +85,9 @@ class SongRequestComponent(commands.Component):
         tunables = TwitchTunables.from_dict(await self.bot.tunables_store.read())
         now = time.monotonic()
 
-        # Everything from here down to the reservation below is synchronous —
-        # no `await` — specifically so the check-and-reserve is one atomic
-        # step. The resolver call further down is a real network request that
-        # can take seconds; checking these limits *before* it but only
-        # recording the request *after* it (the original ordering) lets a
-        # chatter fire off several !sr before any of them land, bypassing
-        # cooldown/pending/queue limits and racing a lost update into
-        # pending_by_chatter. Reserving the slot now, before the await,
-        # closes that window; a rejection later just releases it again.
+        # No `await` between checking limits and reserving the slot below —
+        # keeps check-and-reserve atomic so rapid-fire !sr can't race past
+        # the cooldown/pending/queue caps before the resolver's network call.
         last = self.bot.last_request_at.get(chatter_key, 0.0)
         if tunables.request_cooldown_seconds > 0 and (now - last) < tunables.request_cooldown_seconds:
             remaining = tunables.request_cooldown_seconds - (now - last)
@@ -105,7 +99,7 @@ class SongRequestComponent(commands.Component):
             await ctx.reply(f"You already have {pending} request(s) queued — wait for one to play first.")
             return
 
-        if self.bot.relay.queue_size() >= tunables.queue_cap:
+        if self.bot.player.queue_size() >= tunables.queue_cap:
             await ctx.reply("Queue's full right now — try again in a bit.")
             return
 
@@ -143,7 +137,7 @@ class SongRequestComponent(commands.Component):
             # check and enqueue() below, so this half is race-free too) — the
             # resolve above may have taken long enough for the queue to have
             # filled up in the meantime.
-            if self.bot.relay.queue_size() >= tunables.queue_cap:
+            if self.bot.player.queue_size() >= tunables.queue_cap:
                 await ctx.reply("Queue's full right now — try again in a bit.")
                 return
 
@@ -154,7 +148,7 @@ class SongRequestComponent(commands.Component):
                 else:
                     self.bot.pending_by_chatter[key] = remaining_pending
 
-            self.bot.relay.enqueue(
+            self.bot.player.enqueue(
                 QueuedRequest(
                     webpage_url=track.webpage_url,
                     requester_id=requester_id,
@@ -164,7 +158,7 @@ class SongRequestComponent(commands.Component):
                 )
             )
             reserved = False  # ownership of the reservation now belongs to on_start's eventual decrement
-            await ctx.reply(f"Queued: {track.title} (#{self.bot.relay.queue_size()} in queue)")
+            await ctx.reply(f"Queued: {track.title} (#{self.bot.player.queue_size()} in queue)")
         finally:
             if reserved:
                 remaining_pending = self.bot.pending_by_chatter.get(chatter_key, 1) - 1
@@ -174,23 +168,15 @@ class SongRequestComponent(commands.Component):
                     self.bot.pending_by_chatter[chatter_key] = remaining_pending
 
     @commands.command(name="skip")
-    # Deliberately no @commands.is_moderator() guard — mods/the broadcaster
-    # can always skip (checked manually below via ctx.chatter.moderator,
-    # whose actual property, verified against the installed twitchio==3.3.2
-    # source, is `_is_moderator or _is_lead_moderator or self.broadcaster` —
-    # so the broadcaster already passes without needing mod status on their
-    # own channel), but a regular chatter is also allowed to skip *their own*
-    # currently-playing request without needing mod at all.
+    # No @commands.is_moderator() guard — mods/broadcaster can always skip
+    # (checked manually below), but a chatter can also skip their own
+    # currently-playing request without mod status.
     async def skip(self, ctx: commands.Context) -> None:
         chatter = ctx.chatter
-        # ctx.chatter is typed Chatter | PartialUser (the PartialUser case is
-        # only for reward-redemption contexts, which this bot never gets —
-        # it only subscribes to ChatMessageSubscription) — narrowed
-        # explicitly here since .moderator only exists on Chatter, and a
-        # non-Chatter caller should just fall through to "not a mod".
+        # ctx.chatter is Chatter | PartialUser; only Chatter has .moderator.
         is_mod = isinstance(chatter, Chatter) and chatter.moderator
         if not is_mod:
-            np = self.bot.relay.now_playing
+            np = self.bot.player.now_playing
             if np is None:
                 await ctx.reply("Nothing's playing right now.")
                 return
@@ -201,7 +187,7 @@ class SongRequestComponent(commands.Component):
             if requester_id != np.requester_id:
                 await ctx.reply("You can only skip your own song — mods can skip anything.")
                 return
-        if self.bot.relay.skip_current():
+        if self.bot.player.skip_current():
             await ctx.reply("Skipped.")
         else:
             await ctx.reply("Nothing's playing right now.")
@@ -216,7 +202,7 @@ class SongRequestComponent(commands.Component):
         except (TypeError, ValueError):
             await ctx.reply("Couldn't identify you — try again.")
             return
-        removed = self.bot.relay.cancel_pending_for(requester_id)
+        removed = self.bot.player.cancel_pending_for(requester_id)
         if removed is None:
             await ctx.reply("You don't have anything waiting in the queue.")
             return
@@ -225,12 +211,12 @@ class SongRequestComponent(commands.Component):
 
     @commands.command(name="queue")
     async def queue_cmd(self, ctx: commands.Context) -> None:
-        size = self.bot.relay.queue_size()
+        size = self.bot.player.queue_size()
         await ctx.reply("Queue is empty." if size == 0 else f"{size} request(s) queued.")
 
     @commands.command(name="nowplaying", aliases=["np"])
     async def now_playing(self, ctx: commands.Context) -> None:
-        np = self.bot.relay.now_playing
+        np = self.bot.player.now_playing
         if np is None:
             await ctx.reply("Nothing's playing right now.")
             return
@@ -248,7 +234,7 @@ class TwitchChatBot(commands.Bot):
         owner_id: str,
         prefix: str,
         resolver: Resolver,
-        relay: TwitchRadioRelay,
+        player: RadioPlayer,
         tunables_store: JsonStore,
         token_storage_path: Path,
     ) -> None:
@@ -260,7 +246,7 @@ class TwitchChatBot(commands.Bot):
             prefix=prefix,
         )
         self.resolver = resolver.resolve
-        self.relay = relay
+        self.player = player
         self.tunables_store = tunables_store
         self._owner_id = owner_id
         self._bot_id = bot_id
@@ -273,10 +259,7 @@ class TwitchChatBot(commands.Bot):
         self.pending_by_chatter: Counter[str] = Counter()
 
     async def load_tokens(self, path: str | None = None, /) -> None:
-        # Overridden to redirect TwitchIO's default token file (".tio.tokens.json"
-        # in the process's working directory) into DATA_DIR instead, where
-        # it's a predictable, single place this whole service already keeps
-        # its other state (tunables.json).
+        # Redirects TwitchIO's default token file into DATA_DIR instead.
         self._token_storage_path.parent.mkdir(parents=True, exist_ok=True)
         await super().load_tokens(path or str(self._token_storage_path))
 
@@ -295,13 +278,8 @@ class TwitchChatBot(commands.Bot):
             log.info("Subscribed to chat messages for broadcaster=%s bot=%s", self._owner_id, self._bot_id)
         except Exception as e:
             if self._token_storage_path.exists():
-                # A token file already exists, so this isn't the expected
-                # first-run gap — something's actually broken (revoked
-                # token, changed scopes, Twitch-side hiccup) and !sr and
-                # friends won't work until it's fixed. Loud on purpose:
-                # a one-line warning here is easy to miss in the startup
-                # log, and the alternative is a bot that looks "up" in
-                # journalctl but silently never responds to chat at all.
+                # Token file exists — not the expected first-run gap, so
+                # something's actually broken. Loud on purpose.
                 log.error(
                     "Chat subscription failed even though %s exists — chat commands won't work "
                     "until this is fixed. Re-run the OAuth steps in README.md if the token was "
@@ -321,12 +299,9 @@ class TwitchChatBot(commands.Bot):
         log.info("Twitch chat bot ready (bot_id=%s).", self._bot_id)
 
     async def announce(self, message: str) -> None:
-        """Proactively sends a message to the broadcaster's channel — used by
-        the relay to tell chat about a track it had to drop (failed
-        re-resolve, stalled decoder, etc). Not tied to a command Context,
-        so this goes through PartialUser.send_message directly rather than
-        ctx.reply. Best-effort: the caller (TwitchRadioRelay._notify)
-        already swallows exceptions from this."""
+        """Sends a message to the broadcaster's channel — used by RadioPlayer
+        to tell chat about a track it had to drop. Not tied to a command
+        Context, so this goes through PartialUser.send_message directly."""
         # commands.Bot types _owner_id/_bot_id as `str | None` since the base
         # class allows constructing without them — this subclass's __init__
         # requires both (they come from load_settings()'s _required()), so
