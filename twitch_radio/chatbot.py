@@ -34,13 +34,23 @@ ONE-TIME SETUP — this part doesn't happen automatically and isn't optional:
          an SSH tunnel to reach it: `ssh -L 4343:localhost:4343 <user>@<host>`
          from your own machine, kept open while you do steps 3-4.
       3. In a browser, logged in as the BOT's own Twitch account, visit:
-         http://localhost:4343/oauth?scopes=user:read:chat+user:write:chat+user:bot
+         http://localhost:4343/oauth?scopes=user:read:chat+user:write:chat+user:bot&force_verify=true
       4. In a browser, logged in as the BROADCASTER's account (i.e. the
          channel this bot will post in), visit:
-         http://localhost:4343/oauth?scopes=channel:bot
+         http://localhost:4343/oauth?scopes=channel:bot&force_verify=true
          (Optional if the bot account is already a moderator in that channel
          — see the auth-model paragraph above — but costs nothing to do
          anyway and removes the "is it still a mod" dependency.)
+
+      Use two SEPARATE browser sessions for steps 3 and 4 (e.g. a normal
+      window + a private/incognito one) — reusing the same already-logged-in
+      session for both is the most common way this goes wrong: Twitch just
+      authorizes whichever account is currently logged in, `force_verify`
+      or not, so it's easy to end up with both tokens saved under the same
+      (wrong) account without any error at all. Chat subscription then
+      fails with no token on file for the *other* ID; see
+      `_log_token_diagnostics` below, which checks for exactly this at
+      startup.
 
     Once both are done, the tokens are saved to TWITCH_TOKEN_FILE (default:
     data/twitch_tokens.json) and reloaded automatically on every future
@@ -51,6 +61,7 @@ ONE-TIME SETUP — this part doesn't happen automatically and isn't optional:
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import time
 from collections import Counter
@@ -269,6 +280,7 @@ class TwitchChatBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.add_component(SongRequestComponent(self))
+        self._log_token_diagnostics()
         subscription = eventsub.ChatMessageSubscription(
             broadcaster_user_id=self._owner_id,
             user_id=self._bot_id,
@@ -278,12 +290,11 @@ class TwitchChatBot(commands.Bot):
             log.info("Subscribed to chat messages for broadcaster=%s bot=%s", self._owner_id, self._bot_id)
         except Exception as e:
             if self._token_storage_path.exists():
-                # Token file exists — not the expected first-run gap, so
-                # something's actually broken. Loud on purpose.
                 log.error(
                     "Chat subscription failed even though %s exists — chat commands won't work "
-                    "until this is fixed. Re-run the OAuth steps in README.md if the token was "
-                    "revoked or scopes changed. Error: %s",
+                    "until this is fixed. See the token diagnostics logged above, or redo the "
+                    "OAuth steps in README.md with &force_verify=true if a token was revoked or "
+                    "scopes changed. Error: %s",
                     self._token_storage_path,
                     e,
                 )
@@ -294,6 +305,43 @@ class TwitchChatBot(commands.Bot):
                     self._token_storage_path,
                     e,
                 )
+
+    def _log_token_diagnostics(self) -> None:
+        # Catches the single most common cause of "OAuth said success but
+        # chat still doesn't work": the saved token belongs to a different
+        # Twitch account than TWITCH_BOT_ID/TWITCH_OWNER_ID — easy to do by
+        # accident if the same already-logged-in browser was used for both
+        # the bot and broadcaster authorization steps. The OAuth flow has
+        # no way to know that happened; it saves whatever account was
+        # actually logged in and reports success regardless. Checked
+        # directly against the token file's on-disk keys (verified against
+        # twitchio's actual save/load implementation —
+        # {"<user_id>": {"token": ..., "refresh": ...}, ...}) rather than
+        # any private in-memory attribute.
+        if not self._token_storage_path.exists():
+            return
+        try:
+            saved_ids = set(json.loads(self._token_storage_path.read_text(encoding="utf-8")))
+        except Exception as e:
+            log.warning("Couldn't read %s to check saved tokens: %s", self._token_storage_path, e)
+            return
+        if self._bot_id not in saved_ids:
+            log.error(
+                "No saved token for TWITCH_BOT_ID=%s in %s (tokens on file: %s). Chat commands "
+                "won't work. Redo the bot-account OAuth step — make sure the browser is actually "
+                "logged into THAT account, not your broadcaster account (a private/incognito "
+                "window avoids reusing whatever session is already active).",
+                self._bot_id,
+                self._token_storage_path,
+                sorted(saved_ids) or "none",
+            )
+        if self._owner_id not in saved_ids:
+            log.info(
+                "No saved token for TWITCH_OWNER_ID=%s — fine if the bot account is already a "
+                "moderator in your channel (that alone satisfies the chat subscription), "
+                "otherwise redo the broadcaster-account OAuth step.",
+                self._owner_id,
+            )
 
     async def event_ready(self) -> None:
         log.info("Twitch chat bot ready (bot_id=%s).", self._bot_id)

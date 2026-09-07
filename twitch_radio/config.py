@@ -65,6 +65,38 @@ def _check_cookies_path_writable(raw: str, path: Path) -> None:
         )
 
 
+# YouTube player_client names and whether each accepts cookie auth, per
+# yt_dlp.extractor.youtube._base.INNERTUBE_CLIENTS[*]["SUPPORTS_COOKIES"] —
+# hardcoded rather than imported since that's a private yt-dlp module that
+# can change shape across versions; re-verify against the pinned yt-dlp
+# version in requirements.txt if this ever needs updating.
+# Checked against yt-dlp==2026.08.19.
+_VALID_PLAYER_CLIENTS = {
+    "web": True, "web_safari": True, "web_embedded": True, "web_music": True,
+    "web_creator": True, "android": False, "android_vr": False, "ios": False,
+    "visionos": False, "mweb": True, "tv": True, "tv_downgraded": True, "tv_simply": False,
+}
+
+
+def _check_player_clients(raw_clients: tuple[str, ...], cookies_configured: bool) -> None:
+    unknown = [c for c in raw_clients if c not in _VALID_PLAYER_CLIENTS]
+    if unknown:
+        print(
+            f"WARNING: YTDLP_PLAYER_CLIENT has unrecognized client name(s) {unknown} — yt-dlp "
+            f"will just skip them with a warning. Valid names: {sorted(_VALID_PLAYER_CLIENTS)}"
+        )
+    if cookies_configured and raw_clients:
+        cookie_ok = [c for c in raw_clients if _VALID_PLAYER_CLIENTS.get(c)]
+        if not cookie_ok:
+            raise RuntimeError(
+                f"YTDLP_PLAYER_CLIENT={','.join(raw_clients)!r} has no client that supports "
+                f"cookie auth, but YTDLP_COOKIES_FILE is set — every client gets skipped and "
+                f"every request fails. android/android_vr/ios/visionos/tv_simply all reject "
+                f"cookies outright; mix in at least one of web/web_safari/web_embedded/"
+                f"web_music/web_creator/mweb/tv/tv_downgraded, or unset YTDLP_COOKIES_FILE."
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     # Twitch app credentials — from https://dev.twitch.tv/console/apps
@@ -95,6 +127,7 @@ class Settings:
     ytdlp_extract_timeout_seconds: int
     ytdlp_player_client: tuple[str, ...]
     ytdlp_cache_ttl_seconds: int
+    ytdlp_pot_provider_url: str | None
 
     # Logging
     log_level: str
@@ -144,6 +177,7 @@ def load_settings() -> Settings:
         # Pinning to the other two already-default clients avoids it.
         player_client_raw = "web_embedded,web"
     ytdlp_player_client = tuple(c.strip() for c in player_client_raw.split(",") if c.strip())
+    _check_player_clients(ytdlp_player_client, cookies_configured=cookies_path is not None)
 
     nowplaying_host = os.getenv("TWITCH_NOWPLAYING_HOST", "127.0.0.1").strip() or "127.0.0.1"
     settings_password = os.getenv("TWITCH_SETTINGS_PASSWORD", "").strip() or None
@@ -176,6 +210,10 @@ def load_settings() -> Settings:
         # then it re-resolves right before playing) for anything near the
         # front of the queue. 0 disables caching.
         ytdlp_cache_ttl_seconds=max(0, min(3600, _int_env("YTDLP_CACHE_TTL_SECONDS", 300))),
+        # Only used if you've separately set up a bgutil-ytdlp-pot-provider
+        # instance (see README) — points yt-dlp's PO-token plugin at it.
+        # None means "no PO token provider configured", not an error.
+        ytdlp_pot_provider_url=os.getenv("YTDLP_POT_PROVIDER_URL", "").strip() or None,
         log_level=_log_level_env("LOG_LEVEL", "INFO"),
         log_to_file=_bool_env("LOG_TO_FILE", True),
         log_dir=LOG_DIR,

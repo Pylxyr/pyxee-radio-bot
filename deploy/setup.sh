@@ -169,7 +169,7 @@ fi
 
 echo "[1/7] Installing system packages"
 sudo apt update
-sudo apt install -y python3 python3-venv ffmpeg logrotate curl unzip
+sudo apt install -y python3 python3-venv ffmpeg logrotate curl unzip openssl
 
 echo "[2/7] Installing a JS runtime for yt-dlp (Deno)"
 # yt-dlp needs an external JS runtime to solve YouTube's JS challenges as of
@@ -273,19 +273,96 @@ else
 
   echo ""
   echo "${CYAN}-- Local HTTP surface (/stream.mp3, /overlay, /settings) --${RESET}"
-  prompt_optional_field TWITCH_NOWPLAYING_HOST "127.0.0.1" 0 0 \
-    "— This bot doesn't stream to Twitch itself; OBS pulls audio+overlay from" \
-    "    here instead. Keep at 127.0.0.1 if OBS runs on THIS machine. If OBS" \
-    "    is on a different machine (e.g. this is a cloud VM), set 0.0.0.0" \
-    "    and open the port in your cloud firewall — on Oracle Cloud that's" \
-    "    both the Security List/NSG rule AND the VM's own iptables. See" \
-    "    README.md for the OBS setup and firewall steps either way."
-  prompt_optional_field TWITCH_NOWPLAYING_PORT "8098" 0 1 \
-    "— Port for the local HTTP surface (1024-65535)."
-  prompt_optional_field TWITCH_SETTINGS_PASSWORD "" 1 0 \
-    "— Basic Auth password for /settings. Strongly recommended if the host" \
-    "    above isn't 127.0.0.1 — otherwise anyone who finds the port can" \
-    "    change your queue/cooldown settings."
+  if [[ -n "$(get_env_var "TWITCH_NOWPLAYING_HOST" "${ENV_PATH}")" ]]; then
+    info "TWITCH_NOWPLAYING_HOST is already set — leaving it alone."
+    prompt_optional_field TWITCH_NOWPLAYING_PORT "8098" 0 1 \
+      "— Port for the local HTTP surface (1024-65535)."
+    prompt_optional_field TWITCH_SETTINGS_PASSWORD "" 1 0 \
+      "— Basic Auth password for /settings. Strongly recommended if the host" \
+      "    above isn't 127.0.0.1 — otherwise anyone who finds the port can" \
+      "    change your queue/cooldown settings."
+  else
+    echo ""
+    echo "${CYAN}TWITCH_NOWPLAYING_HOST${RESET}"
+    echo "  This bot doesn't stream to Twitch itself — OBS pulls the audio"
+    echo "  stream and overlay from here over plain HTTP instead."
+    same_machine=""
+    read -r -p "  Does OBS run on THIS machine? [Y/n]: " same_machine || true
+    same_machine="$(trim "${same_machine}")"
+    remote_obs=0
+    if [[ "${same_machine}" =~ ^[Nn] ]]; then
+      remote_obs=1
+      set_env_var "TWITCH_NOWPLAYING_HOST" "0.0.0.0" "${ENV_PATH}"
+      success "TWITCH_NOWPLAYING_HOST = 0.0.0.0 (reachable from other machines)"
+    else
+      set_env_var "TWITCH_NOWPLAYING_HOST" "127.0.0.1" "${ENV_PATH}"
+      success "TWITCH_NOWPLAYING_HOST = 127.0.0.1"
+    fi
+
+    prompt_optional_field TWITCH_NOWPLAYING_PORT "8098" 0 1 \
+      "— Port for the local HTTP surface (1024-65535)."
+
+    if [[ "${remote_obs}" -eq 1 ]]; then
+      echo ""
+      echo "  A settings password is required when OBS is on another machine —"
+      echo "  this surface is now reachable off this box, and /settings changes"
+      echo "  your queue/cooldown limits."
+      echo ""
+      echo "${CYAN}TWITCH_SETTINGS_PASSWORD${RESET}"
+      pw=""
+      read -r -s -p "  Value (input hidden, Enter to auto-generate one): " pw || true
+      echo ""
+      pw="$(trim "${pw}")"
+      if [[ -z "${pw}" ]]; then
+        pw="$(openssl rand -hex 12 2>/dev/null || head -c16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c20)"
+        echo "  Generated: ${pw}"
+        echo "  (also saved in .env, so you don't need to remember it)"
+      fi
+      set_env_var "TWITCH_SETTINGS_PASSWORD" "${pw}" "${ENV_PATH}"
+      success "TWITCH_SETTINGS_PASSWORD saved."
+
+      port="$(get_env_var "TWITCH_NOWPLAYING_PORT" "${ENV_PATH}")"
+      echo ""
+      echo "  Detecting this machine's public IP..."
+      public_ip=""
+      for ip_svc in "https://ifconfig.me" "https://api.ipify.org" "https://icanhazip.com"; do
+        public_ip="$(curl -fsS --max-time 4 "${ip_svc}" 2>/dev/null | tr -d '[:space:]' || true)"
+        if [[ -n "${public_ip}" ]]; then
+          break
+        fi
+      done
+      if [[ -z "${public_ip}" ]]; then
+        warn "Couldn't auto-detect it (no outbound network, or it timed out)."
+        warn "Find it with: curl ifconfig.me — or your cloud provider's console."
+        public_ip="<your-public-ip>"
+      else
+        success "Public IP: ${public_ip}"
+      fi
+      echo ""
+      echo "─────────────────────────────────────────────────────────────"
+      echo " Open port ${port} so OBS can reach it — in TWO places:"
+      echo ""
+      echo " 1. Your cloud provider's firewall/security rule (ingress, TCP,"
+      echo "    port ${port}, source 0.0.0.0/0). On Oracle Cloud: the VCN's"
+      echo "    Security List or NSG, in the OCI console."
+      echo ""
+      echo " 2. This VM's own OS firewall — commonly ALSO blocks it even"
+      echo "    after step 1. On Oracle's Ubuntu images specifically:"
+      echo "      sudo cp /etc/iptables/rules.v4 /etc/iptables/rules.v4.bak"
+      echo "      sudo sed -i '/--dport 22 -j ACCEPT/a -A INPUT -p tcp -m state --state NEW -m tcp --dport ${port} -j ACCEPT' /etc/iptables/rules.v4"
+      echo "      sudo iptables-restore < /etc/iptables/rules.v4"
+      echo "      sudo netfilter-persistent save"
+      echo "    Double-check the SSH (port 22) rule is still there afterward:"
+      echo "      sudo iptables -L INPUT -n --line-numbers"
+      echo ""
+      echo " Then in OBS: http://${public_ip}:${port}/stream.mp3 and .../overlay"
+      echo "─────────────────────────────────────────────────────────────"
+    else
+      prompt_optional_field TWITCH_SETTINGS_PASSWORD "" 1 0 \
+        "— Basic Auth password for /settings. Only matters if you later" \
+        "    change TWITCH_NOWPLAYING_HOST away from 127.0.0.1."
+    fi
+  fi
 
   echo ""
   echo "${CYAN}-- Advanced: state filenames (only for multiple instances) --${RESET}"
@@ -376,9 +453,12 @@ echo "   the module docstring in twitch_radio/chatbot.py. Short version:"
 echo "     ssh -L 4343:localhost:4343 ${SERVICE_USER}@<this-host>"
 echo "   then, in a browser:"
 echo "     - as the BOT account:"
-echo "       http://localhost:4343/oauth?scopes=user:read:chat+user:write:chat+user:bot"
+echo "       http://localhost:4343/oauth?scopes=user:read:chat+user:write:chat+user:bot&force_verify=true"
 echo "     - as the BROADCASTER account:"
-echo "       http://localhost:4343/oauth?scopes=channel:bot"
+echo "       http://localhost:4343/oauth?scopes=channel:bot&force_verify=true"
+echo "   Use two SEPARATE browser sessions for these two — reusing one"
+echo "   logged-in session for both silently authorizes the same account"
+echo "   twice. Watch step 5's logs right after starting to catch that."
 echo ""
 echo "4. In OBS, add a Media Source pointed at /stream.mp3 and (optionally) a"
 echo "   Browser Source pointed at /overlay — see README.md."

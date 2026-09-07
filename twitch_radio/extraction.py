@@ -80,10 +80,16 @@ class Resolver:
             "socket_timeout": 15,
             "extract_flat": False,
         }
+        extractor_args: dict[str, dict[str, list[str]]] = {}
         if self._settings.ytdlp_player_client:
-            options["extractor_args"] = {
-                "youtube": {"player_client": list(self._settings.ytdlp_player_client)}
-            }
+            extractor_args["youtube"] = {"player_client": list(self._settings.ytdlp_player_client)}
+        if self._settings.ytdlp_pot_provider_url:
+            # Passed straight through to the bgutil-ytdlp-pot-provider
+            # plugin, if installed — see README's cookies/PO-token note.
+            # A no-op if that plugin isn't present.
+            extractor_args["youtubepot-bgutilhttp"] = {"base_url": [self._settings.ytdlp_pot_provider_url]}
+        if extractor_args:
+            options["extractor_args"] = extractor_args
         if self._settings.ytdlp_cookies_file is not None:
             options["cookiefile"] = str(self._settings.ytdlp_cookies_file)
         if self._settings.ytdlp_js_runtime_path:

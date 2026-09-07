@@ -62,11 +62,18 @@ left alone. `SKIP_WIZARD=1` skips the whole thing for a scripted install.
    ```
    Then, in a browser:
    - As the **bot account**:
-     `http://localhost:4343/oauth?scopes=user:read:chat+user:write:chat+user:bot`
+     `http://localhost:4343/oauth?scopes=user:read:chat+user:write:chat+user:bot&force_verify=true`
    - As the **broadcaster account**:
-     `http://localhost:4343/oauth?scopes=channel:bot`
+     `http://localhost:4343/oauth?scopes=channel:bot&force_verify=true`
      (Optional if the bot is already a mod in your channel, but doing it
      anyway removes the "is it still a mod" dependency.)
+
+   **Use two separate browser sessions** (e.g. a normal window + a private/
+   incognito one) — reusing the same logged-in session for both authorizes
+   the SAME account twice with no error, and chat just silently doesn't
+   work afterward. The bot checks for exactly this at startup and logs
+   which account, if either, is missing a token — check `journalctl -u
+   twitch-radio -f -o cat` right after starting if `!sr` doesn't respond.
 
    Tokens save to `data/twitch_tokens.json`, reloaded on every future start.
 
@@ -89,8 +96,11 @@ machine** (a cloud VM, as below), keep reading.
 
 ## Running the bot on a separate machine from OBS
 
-Your case: a cloud VM (Oracle Cloud E2 Micro) running the bot, OBS on your
-own PC. OBS needs to reach the VM's HTTP surface over the network:
+Common case: a cloud VM running the bot, OBS on your own PC. `setup.sh`'s
+wizard asks about this directly (host, port, a settings password, your
+public IP, and the exact firewall commands to run) — this section is the
+manual/reference version of the same steps, for editing `.env` by hand or
+if the wizard's auto-detected IP didn't work out.
 
 1. In `.env`, set `TWITCH_NOWPLAYING_HOST=0.0.0.0` and set
    `TWITCH_SETTINGS_PASSWORD` to something (a startup warning fires if you
@@ -98,14 +108,14 @@ own PC. OBS needs to reach the VM's HTTP surface over the network:
    queue/cooldown limits, and this makes it internet-reachable).
 2. Open `TWITCH_NOWPLAYING_PORT` (default 8098) in **two** places — missing
    either one still blocks the connection:
-   - **OCI Security List or NSG**: your VCN's Default Security List (or the
-     NSG attached to the instance) → Ingress Rules → add TCP, source
-     `0.0.0.0/0`, destination port `8098`.
-   - **The VM's own iptables** — Oracle's Ubuntu images firewall almost
-     everything at the OS level regardless of what the console allows.
-     `ufw` is disabled by default and won't help; edit `/etc/iptables/rules.v4`
-     directly instead, copying the existing line that allows SSH (port 22)
-     and changing the port:
+   - **Your cloud provider's firewall/security rule** — ingress, TCP, that
+     port, source `0.0.0.0/0`. On Oracle Cloud: the VCN's Default Security
+     List (or the NSG attached to the instance).
+   - **The VM's own OS firewall** — commonly blocks it too, even after the
+     rule above. On Oracle's Ubuntu images specifically: `ufw` is disabled
+     by default and won't help; edit `/etc/iptables/rules.v4` directly,
+     copying the existing line that allows SSH (port 22) and changing the
+     port:
      ```bash
      sudo cp /etc/iptables/rules.v4 /etc/iptables/rules.v4.bak
      sudo sed -i '/--dport 22 -j ACCEPT/a -A INPUT -p tcp -m state --state NEW -m tcp --dport 8098 -j ACCEPT' /etc/iptables/rules.v4
@@ -115,7 +125,9 @@ own PC. OBS needs to reach the VM's HTTP surface over the network:
      Double-check the SSH rule is still there before disconnecting — a
      mistake here can lock you out. `sudo iptables -L INPUT -n --line-numbers`
      to inspect the live rules.
-3. Restart the service, then point OBS at
+3. Find your public IP if you need it: `curl ifconfig.me`, or your cloud
+   console.
+4. Restart the service, then point OBS at
    `http://<VM's public IP>:8098/stream.mp3` and `.../overlay`.
 
 This surface has no TLS. Fine for audio/overlay; if you'd rather not send
@@ -195,24 +207,65 @@ own `apt install nodejs` is almost always older than that; use
 [NodeSource's setup script](https://github.com/nodesource/distributions) or
 `nvm`.
 
-## A note on `YTDLP_COOKIES_FILE`
+## A note on `YTDLP_COOKIES_FILE` — and YouTube blocking cloud IPs
 
-Leave it unset. Ordinary public YouTube searches/URLs don't need cookies,
-and yt-dlp has a known, recurring failure — `The page needs to be
-reloaded.` — that shows up specifically on cookie-authenticated requests
-(see [yt-dlp#16212](https://github.com/yt-dlp/yt-dlp/issues/16212),
+**On a residential/home connection:** leave it unset. Ordinary public
+YouTube searches/URLs don't need cookies, and yt-dlp has a known, recurring
+failure — `The page needs to be reloaded.` — that shows up specifically on
+cookie-authenticated requests (see
+[yt-dlp#16212](https://github.com/yt-dlp/yt-dlp/issues/16212),
 [yt-dlp#17389](https://github.com/yt-dlp/yt-dlp/issues/17389)), so turning
-this on "just in case" can make things worse. Only set it for
-age-restricted/region-gated content, with a real `cookies.txt` from a
-logged-in browser session. Must be a path under `data/` (e.g.
-`YTDLP_COOKIES_FILE=data/cookies.txt`) — the only directory this service's
-systemd sandbox can write to; yt-dlp saves this file back on every `!sr`.
-Checked at startup with a clear error if misconfigured.
+this on "just in case" can make things worse.
+
+**On a cloud VM (Oracle, AWS, GCP, DigitalOcean, ...): this is different.**
+YouTube actively blocks known datacenter IP ranges more aggressively than
+residential ones, and anonymous (no-cookie) requests from a flagged IP get
+`Sign in to confirm you're not a bot` even for a completely ordinary
+search. Two ways to deal with it, roughly simplest-first:
+
+1. **Cookies from a real logged-in browser session.** Export a real
+   `cookies.txt` (private/incognito window, log into YouTube, export with a
+   browser extension, close the window), point `YTDLP_COOKIES_FILE` at it
+   under `data/` (e.g. `data/cookies.txt` — see below for why it must be
+   there). Simple, zero new processes, but the export needs periodic
+   refreshing as the session ages, and an empty/placeholder file makes
+   things *worse*, not better.
+2. **A local PO-token provider** — a small companion process that proves
+   requests are legitimate without needing a browser session at all, so
+   nothing to ever refresh. [bgutil-ytdlp-pot-provider-rs](https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs)
+   is a single pre-built binary (no Node/Docker/build step), documented at
+   <50MB RAM in practice — realistic even on a free-tier VM:
+   ```bash
+   wget https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs/releases/latest/download/bgutil-pot-linux-x86_64
+   chmod +x bgutil-pot-linux-x86_64
+   sudo mv bgutil-pot-linux-x86_64 /usr/local/bin/bgutil-pot
+   # then run it persistently, e.g. as its own tiny systemd unit:
+   #   ExecStart=/usr/local/bin/bgutil-pot server --host 127.0.0.1 --port 4416
+   ```
+   Then install its yt-dlp plugin (a release zip extracted into a yt-dlp
+   plugin directory — see that repo's README for the current exact steps,
+   since plugin packaging details do shift between releases) and set
+   `YTDLP_POT_PROVIDER_URL=http://127.0.0.1:4416` in `.env` — this service
+   passes it straight through as yt-dlp's `youtubepot-bgutilhttp:base_url`
+   extractor-arg. Not set up by `setup.sh` (it's a separate process this
+   service doesn't own or supervise), and — its own maintainers' words, not
+   just ours — **not a guaranteed fix**: "providing a POT token does not
+   guarantee bypassing 403 errors or bot checks, but it may help your
+   traffic seem more legitimate."
+
+Either way: if `YTDLP_COOKIES_FILE` is set, it must be a path under `data/`
+(e.g. `YTDLP_COOKIES_FILE=data/cookies.txt`) — the only directory this
+service's systemd sandbox can write to; yt-dlp saves this file back on
+every `!sr`. Checked at startup with a clear error if misconfigured.
 
 Cookies also change which YouTube client yt-dlp presents as — one default
-candidate (`tv_downgraded`) is the thing behind issue #17389 above.
-`YTDLP_PLAYER_CLIENT` defaults to skipping it whenever cookies are
-configured. Check [the EJS wiki](https://github.com/yt-dlp/yt-dlp/wiki/EJS)
+candidate (`tv_downgraded`) is the thing behind issue #17389 above, and a
+mobile client (android/ios/etc.) combined with cookies fails outright,
+since those clients reject cookie auth entirely. `YTDLP_PLAYER_CLIENT`
+defaults to a cookie-compatible pair whenever cookies are configured, and
+this service validates it at startup either way — an incompatible
+combination refuses to start with a specific error instead of silently
+failing every `!sr`. Check [the EJS wiki](https://github.com/yt-dlp/yt-dlp/wiki/EJS)
 if requests start failing again after a yt-dlp update — YouTube changes
 what works here often.
 

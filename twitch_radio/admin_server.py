@@ -43,12 +43,14 @@ _OVERLAY_HTML = """<!doctype html>
     border-radius: 16px;
     backdrop-filter: blur(6px);
     box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+    --accent: #E8A33D;
   }
   .now { display: flex; gap: 12px; align-items: center; }
   .thumb {
     width: 56px; height: 56px; border-radius: 10px; flex-shrink: 0;
     background: rgba(255,255,255,0.08) center/cover no-repeat;
-    box-shadow: 0 0 0 1px rgba(255,255,255,0.10);
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.10), 0 0 16px -4px var(--accent);
+    transition: box-shadow 0.4s ease;
   }
   .info { min-width: 0; flex: 1; }
   .title {
@@ -61,7 +63,7 @@ _OVERLAY_HTML = """<!doctype html>
   .time { font-size: 11px; color: #9B9FB3; width: 34px; flex-shrink: 0; }
   .time.right { text-align: right; }
   .bar { flex: 1; height: 4px; border-radius: 2px; background: rgba(255,255,255,0.12); overflow: hidden; }
-  .fill { height: 100%; width: 0%; background: #E8A33D; border-radius: 2px; }
+  .fill { height: 100%; width: 0%; background: var(--accent); border-radius: 2px; transition: background 0.4s ease; }
   .idle { font-size: 13px; color: #9B9FB3; padding: 6px 2px; }
   .next { margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.10); }
   .next-label { font-size: 11px; color: #9B9FB3; margin-bottom: 4px; }
@@ -73,17 +75,60 @@ _OVERLAY_HTML = """<!doctype html>
 <body><div class="panel" id="panel"></div>
 <script>
 const panel = document.getElementById('panel');
-let last = null, lastFetchedAt = 0;
+let last = null, lastFetchedAt = 0, lastThumb = null;
 
 function fmt(s) {
   s = Math.max(0, Math.floor(s));
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
 }
 
+const DEFAULT_ACCENT = '#E8A33D';
+
+function applyAccent(url) {
+  if (!url) {
+    panel.style.setProperty('--accent', DEFAULT_ACCENT);
+    return;
+  }
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.onload = () => {
+    try {
+      const c = document.createElement('canvas');
+      c.width = 16; c.height = 16;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(img, 0, 0, 16, 16);
+      const px = ctx.getImageData(0, 0, 16, 16).data;
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let i = 0; i < px.length; i += 4) {
+        r += px[i]; g += px[i + 1]; b += px[i + 2]; n++;
+      }
+      r = Math.round(r / n); g = Math.round(g / n); b = Math.round(b / n);
+      // Boost toward legible against the dark panel — thumbnail averages
+      // skew muddy otherwise.
+      const max = Math.max(r, g, b) || 1;
+      const boost = 255 / max * 0.75;
+      r = Math.min(255, Math.round(r * boost + 40));
+      g = Math.min(255, Math.round(g * boost + 40));
+      b = Math.min(255, Math.round(b * boost + 40));
+      panel.style.setProperty('--accent', `rgb(${r},${g},${b})`);
+    } catch (e) {
+      // Tainted canvas (CDN didn't send permissive CORS headers) — keep
+      // whatever accent is already set rather than breaking the overlay.
+    }
+  };
+  img.onerror = () => {};
+  img.src = url;
+}
+
 function render(data, elapsed) {
   if (!data.playing) {
     panel.innerHTML = '<div class="idle">Radio\\'s quiet right now</div>';
+    lastThumb = null;
     return;
+  }
+  if (data.thumbnail_url !== lastThumb) {
+    lastThumb = data.thumbnail_url;
+    applyAccent(data.thumbnail_url);
   }
   const pct = data.duration_seconds > 0 ? Math.min(100, (elapsed / data.duration_seconds) * 100) : 0;
   const thumb = data.thumbnail_url ? `style="background-image:url('${data.thumbnail_url}')"` : '';
