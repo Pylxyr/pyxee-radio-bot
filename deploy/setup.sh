@@ -374,11 +374,16 @@ else
   echo ""
   echo "${CYAN}-- yt-dlp --${RESET}"
   prompt_optional_field YTDLP_COOKIES_FILE "" 0 0 \
-    "— ONLY for age-restricted/region-gated content; leave blank otherwise." \
-    "    Enabling this with an empty/placeholder file causes MORE resolve" \
-    "    failures, not fewer. If set, MUST be a path under data/ (e.g." \
-    "    data/cookies.txt) — anywhere else crashes every !sr (read-only fs" \
-    "    under this service's systemd sandbox)."
+    "— Leave blank on a residential connection. On a cloud VM, YouTube" \
+    "    often blocks anonymous requests ('Sign in to confirm you're not a" \
+    "    bot') and this is the simplest fix — a REAL cookies.txt from a" \
+    "    logged-in browser session (empty/placeholder makes it worse). MUST" \
+    "    be a path under data/ (e.g. data/cookies.txt) — anywhere else" \
+    "    crashes every !sr (read-only fs under this service's sandbox)."
+  prompt_optional_field YTDLP_POT_PROVIDER_URL "" 0 0 \
+    "— Advanced, cloud-VM alternative to cookies: URL of a local bgutil-" \
+    "    ytdlp-pot-provider instance (see README) if you've set one up." \
+    "    Leave blank if you haven't — not required."
   prompt_optional_field YTDLP_JS_RUNTIME_PATH "" 0 0 \
     "— Advanced: pin a specific JS runtime binary. Leave blank to auto-detect" \
     "    the Deno install this script just did." \

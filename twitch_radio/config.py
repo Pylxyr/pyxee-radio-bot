@@ -206,7 +206,7 @@ def load_settings() -> Settings:
         ytdlp_concurrency=max(1, min(4, _int_env("YTDLP_CONCURRENCY", 2))),
         ytdlp_extract_timeout_seconds=max(10, min(120, _int_env("YTDLP_EXTRACT_TIMEOUT_SECONDS", 45))),
         ytdlp_player_client=ytdlp_player_client,
-        # Skips the relay's second extraction (chat resolves once to queue,
+        # Skips the player's second extraction (chat resolves once to queue,
         # then it re-resolves right before playing) for anything near the
         # front of the queue. 0 disables caching.
         ytdlp_cache_ttl_seconds=max(0, min(3600, _int_env("YTDLP_CACHE_TTL_SECONDS", 300))),

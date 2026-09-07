@@ -6,8 +6,9 @@ from dataclasses import dataclass
 @dataclass(slots=True)
 class Track:
     """A resolved, playable track. stream_url is a direct, time-limited media
-    URL from yt-dlp — always re-resolve close to actual playback time rather
-    than caching this across a long queue wait, since these URLs expire."""
+    URL from yt-dlp — cached briefly by Resolver.resolve() (YTDLP_CACHE_TTL_SECONDS)
+    but not indefinitely, since it expires; don't hold onto one across a long
+    queue wait outside that cache."""
 
     title: str
     webpage_url: str

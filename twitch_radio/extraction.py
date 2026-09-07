@@ -51,7 +51,7 @@ class Resolver:
             max_workers=settings.ytdlp_concurrency + 2, thread_name_prefix="ytdlp"
         )
         # A !sr resolves once in chat (to confirm/queue it) and again in the
-        # relay right before it actually plays — see resolve()'s docstring
+        # player right before it actually plays — see resolve()'s docstring
         # for why this cache is what makes the second one (usually) free.
         # Keyed by resolved webpage_url, not the raw input query, since
         # that's the only value both call sites are guaranteed to share.
@@ -142,7 +142,7 @@ class Resolver:
         Never raises for "not found" — only for actual failures (timeout,
         network error), which the caller is expected to catch.
 
-        Cached briefly (YTDLP_CACHE_TTL_SECONDS) so the relay's re-resolve
+        Cached briefly (YTDLP_CACHE_TTL_SECONDS) so the player's re-resolve
         right before actual playback — which passes back exactly the
         webpage_url this returned — reuses this result instead of running a
         second full extraction for what's the same request arriving twice.
@@ -180,7 +180,7 @@ class Resolver:
             else:
                 # No stable URL to persist. Falling back to the raw search
                 # text here would silently turn into a *fresh* search the
-                # next time this gets re-resolved (relay._play_one_inner
+                # next time this gets re-resolved (player._play_one_inner
                 # calls back into resolve() with whatever webpage_url we
                 # return) — meaning the song that plays could end up being
                 # different from the one confirmed to the requester in chat.

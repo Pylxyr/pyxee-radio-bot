@@ -75,7 +75,7 @@ _OVERLAY_HTML = """<!doctype html>
 <body><div class="panel" id="panel"></div>
 <script>
 const panel = document.getElementById('panel');
-let last = null, lastFetchedAt = 0, lastThumb = null;
+let last = null, lastFetchedAt = 0, lastThumb = null, lastTrackKey = null;
 
 function fmt(s) {
   s = Math.max(0, Math.floor(s));
@@ -122,33 +122,55 @@ function applyAccent(url) {
 
 function render(data, elapsed) {
   if (!data.playing) {
-    panel.innerHTML = '<div class="idle">Radio\\'s quiet right now</div>';
-    lastThumb = null;
+    if (lastTrackKey !== null) {
+      panel.innerHTML = '<div class="idle">Radio\\'s quiet right now</div>';
+      lastTrackKey = null;
+      lastThumb = null;
+    }
     return;
   }
-  if (data.thumbnail_url !== lastThumb) {
-    lastThumb = data.thumbnail_url;
-    applyAccent(data.thumbnail_url);
-  }
-  const pct = data.duration_seconds > 0 ? Math.min(100, (elapsed / data.duration_seconds) * 100) : 0;
-  const thumb = data.thumbnail_url ? `style="background-image:url('${data.thumbnail_url}')"` : '';
-  const next = (data.queue || []).slice(0, 2)
-    .map(q => `<div class="next-item">${escapeHtml(q.title)}</div>`).join('');
-  panel.innerHTML = `
-    <div class="now">
-      <div class="thumb" ${thumb}></div>
-      <div class="info">
-        <div class="title">${escapeHtml(data.title)}</div>
-        <div class="meta">requested by ${escapeHtml(data.requester_name)}</div>
-        <div class="bar-row">
-          <span class="time">${fmt(elapsed)}</span>
-          <div class="bar"><div class="fill" style="width:${pct}%"></div></div>
-          <span class="time right">${fmt(data.duration_seconds)}</span>
+
+  const trackKey = data.webpage_url || data.title;
+  if (trackKey !== lastTrackKey) {
+    lastTrackKey = trackKey;
+    if (data.thumbnail_url !== lastThumb) {
+      lastThumb = data.thumbnail_url;
+      applyAccent(data.thumbnail_url);
+    }
+    const thumb = data.thumbnail_url ? `style="background-image:url('${data.thumbnail_url}')"` : '';
+    const next = (data.queue || []).slice(0, 2)
+      .map(q => `<div class="next-item">${escapeHtml(q.title)}</div>`).join('');
+    panel.innerHTML = `
+      <div class="now">
+        <div class="thumb" ${thumb}></div>
+        <div class="info">
+          <div class="title" id="t-title" style="opacity:0">${escapeHtml(data.title)}</div>
+          <div class="meta">requested by ${escapeHtml(data.requester_name)}</div>
+          <div class="bar-row">
+            <span class="time" id="t-elapsed">0:00</span>
+            <div class="bar"><div class="fill" id="t-fill"></div></div>
+            <span class="time right">${fmt(data.duration_seconds)}</span>
+          </div>
         </div>
       </div>
-    </div>
-    ${next ? `<div class="next"><div class="next-label">Up next</div>${next}</div>` : ''}
-  `;
+      ${next ? `<div class="next"><div class="next-label">Up next</div>${next}</div>` : ''}
+    `;
+    // Rebuilt fresh above, so opacity starts at 0 — nudge it to 1 on the
+    // next frame so the CSS transition actually has something to animate.
+    requestAnimationFrame(() => {
+      const t = document.getElementById('t-title');
+      if (t) t.style.opacity = '1';
+    });
+  }
+
+  // Runs every frame (~60/sec via tick()) — only touch the two nodes that
+  // actually change per-frame, not a full innerHTML rebuild, which would
+  // wipe out the thumbnail/title/fade-in above 60 times a second.
+  const pct = data.duration_seconds > 0 ? Math.min(100, (elapsed / data.duration_seconds) * 100) : 0;
+  const fillEl = document.getElementById('t-fill');
+  const elapsedEl = document.getElementById('t-elapsed');
+  if (fillEl) fillEl.style.width = pct + '%';
+  if (elapsedEl) elapsedEl.textContent = fmt(elapsed);
 }
 
 function escapeHtml(s) {
@@ -254,6 +276,11 @@ class AdminServer:
         try:
             while True:
                 chunk = await queue.get()
+                if not chunk:
+                    # Empty-bytes sentinel from RadioPlayer._pump_encoder_output
+                    # — this subscriber was dropped for falling behind;
+                    # nothing more will ever arrive on this queue.
+                    break
                 await response.write(chunk)
         except (ConnectionResetError, asyncio.CancelledError):
             pass

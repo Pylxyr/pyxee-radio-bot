@@ -230,7 +230,19 @@ class RadioPlayer:
                 try:
                     q.put_nowait(chunk)
                 except asyncio.QueueFull:
+                    # Dropping this subscriber — but its handle_stream()
+                    # HTTP handler is still `await queue.get()`-ing, and
+                    # nothing will ever be pushed to this queue again once
+                    # it's out of self._subscribers. Without waking it, that
+                    # coroutine (and its socket) hangs forever instead of
+                    # closing. Evict one old chunk to make room, then queue
+                    # an empty-bytes sentinel — never produced by a real
+                    # read here — that handle_stream() treats as "stop".
                     self._subscribers.discard(q)
+                    with contextlib.suppress(asyncio.QueueEmpty):
+                        q.get_nowait()
+                    with contextlib.suppress(asyncio.QueueFull):
+                        q.put_nowait(b"")
 
     async def _feed_loop(self) -> None:
         assert self._encoder is not None and self._encoder.stdin is not None
