@@ -290,7 +290,7 @@ class TwitchChatBot(commands.Bot):
             log.info("Subscribed to chat messages for broadcaster=%s bot=%s", self._owner_id, self._bot_id)
         except Exception as e:
             if self._token_storage_path.exists():
-                log.error(
+                log.exception(
                     "Chat subscription failed even though %s exists — chat commands won't work "
                     "until this is fixed. See the token diagnostics logged above, or redo the "
                     "OAuth steps in README.md with &force_verify=true if a token was revoked or "
