@@ -167,7 +167,12 @@ class Resolver:
         # A bare "ytsearchN:" query wraps its one hit in an "entries" list;
         # a direct URL resolves straight to the item itself.
         entries = info.get("entries") if isinstance(info, dict) else None
-        item = next((e for e in entries if e), None) if entries else info
+        # entries is None (key absent) for a direct URL resolve — the item
+        # IS info itself. entries == [] (key present, empty) is a genuine
+        # zero-results search and must NOT fall back to using info as the
+        # item — those are different things, but both are falsy in Python,
+        # so this has to check "is None" specifically rather than truthiness.
+        item = next((e for e in entries if e), None) if entries is not None else info
         if not item:
             return None
 
