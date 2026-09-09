@@ -74,6 +74,15 @@ class RadioPlayer:
         self._backoff_reset_done = False
         self._current_decoder: asyncio.subprocess.Process | None = None
         self._now_playing: NowPlaying | None = None
+        # The request currently occupying the player's one "slot" — set the
+        # instant it's dequeued, cleared when it's done playing (or fails).
+        # now_playing alone isn't enough to identify it: it stays None for
+        # the whole resolve/decoder-startup window (which the README notes
+        # can be 15-20s cold, up to YTDLP_EXTRACT_TIMEOUT_SECONDS on a slow
+        # one) — active_requester_id below covers that gap too, so a
+        # chatter can !skip their own song before it's technically
+        # "playing" yet, not just after.
+        self._active_request: QueuedRequest | None = None
         self._stopping = False
         self._resolving = False
         self._skip_pending = False
@@ -86,6 +95,18 @@ class RadioPlayer:
     @property
     def now_playing(self) -> NowPlaying | None:
         return self._now_playing
+
+    @property
+    def active_requester_id(self) -> int | None:
+        """Who the player's current "slot" belongs to — playing or still
+        resolving/loading — or None if it's idle. Lets the chat bot's !skip
+        allow a chatter to skip their own song during the resolve window
+        too, not just once now_playing is actually set."""
+        if self._now_playing is not None:
+            return self._now_playing.requester_id
+        if self._active_request is not None:
+            return self._active_request.requester_id
+        return None
 
     def queue_size(self) -> int:
         return self._queue.qsize()
@@ -225,7 +246,22 @@ class RadioPlayer:
         while True:
             chunk = await stdout.read(_STREAM_CHUNK_BYTES)
             if not chunk:
-                return
+                # EOF on the encoder's own stdout — the ffmpeg process
+                # itself has exited (crashed, OOM-killed, etc), not just a
+                # normal graceful shutdown: during stop(), this task gets
+                # cancelled directly by _run_one_session()'s finally block
+                # (see below) before a read like this would ever return
+                # empty, so reaching here at all means something killed the
+                # encoder out from under us. Raising — instead of returning
+                # cleanly — makes _run_one_session()/_run_forever() treat
+                # this the same as any other encoder failure: logged with
+                # exc_info and subject to the backoff/restart loop. Returning
+                # cleanly here (the previous behavior) meant a crashed
+                # encoder just silently respawned with no log line at all
+                # explaining why — indistinguishable in the logs from
+                # nothing having gone wrong.
+                returncode = self._encoder.returncode if self._encoder is not None else None
+                raise RuntimeError(f"Encoder stdout closed unexpectedly (exit code {returncode})")
             for q in list(self._subscribers):
                 try:
                     q.put_nowait(chunk)
@@ -281,12 +317,15 @@ class RadioPlayer:
             raise
 
     async def _play_one(self, request: QueuedRequest, encoder_stdin: asyncio.StreamWriter) -> None:
+        self._active_request = request
         try:
             await self._play_one_inner(request, encoder_stdin)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("Error playing queued request: %s", request.webpage_url)
+        finally:
+            self._active_request = None
 
     async def _current_duration_limit(self) -> int:
         if self._duration_limit_getter is None:
