@@ -30,6 +30,20 @@ def _bool_env(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _clamped_int_env(name: str, default: int, lo: int, hi: int) -> int:
+    # _int_env alone silently clamps out-of-range values with no trace of
+    # it anywhere — e.g. AUDIO_BITRATE_KBPS=999999 would just quietly
+    # become 320 with nothing in the logs explaining the mismatch between
+    # what's in .env and what the service actually runs with. Same
+    # print()-not-log rationale as _log_level_env above: this runs before
+    # configure_logging() exists.
+    value = _int_env(name, default)
+    clamped = max(lo, min(hi, value))
+    if clamped != value:
+        print(f"WARNING: {name}={value} is outside the allowed range {lo}-{hi} — using {clamped}.")
+    return clamped
+
+
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
 
@@ -194,22 +208,22 @@ def load_settings() -> Settings:
         bot_id=bot_id,
         owner_id=owner_id,
         prefix=os.getenv("TWITCH_PREFIX", "!").strip() or "!",
-        audio_bitrate_kbps=max(64, min(320, _int_env("AUDIO_BITRATE_KBPS", 128))),
+        audio_bitrate_kbps=_clamped_int_env("AUDIO_BITRATE_KBPS", 128, 64, 320),
         nowplaying_host=nowplaying_host,
-        nowplaying_port=max(1024, min(65535, _int_env("TWITCH_NOWPLAYING_PORT", 8098))),
+        nowplaying_port=_clamped_int_env("TWITCH_NOWPLAYING_PORT", 8098, 1024, 65535),
         settings_password=settings_password,
         token_path=DATA_DIR / os.getenv("TWITCH_TOKEN_FILE", "twitch_tokens.json").strip(),
         tunables_path=DATA_DIR / os.getenv("TWITCH_TUNABLES_FILE", "tunables.json").strip(),
         ytdlp_cookies_file=cookies_path,
         ytdlp_js_runtime_path=os.getenv("YTDLP_JS_RUNTIME_PATH", "").strip() or None,
         ytdlp_js_runtime_name=os.getenv("YTDLP_JS_RUNTIME_NAME", "deno").strip() or "deno",
-        ytdlp_concurrency=max(1, min(4, _int_env("YTDLP_CONCURRENCY", 2))),
-        ytdlp_extract_timeout_seconds=max(10, min(120, _int_env("YTDLP_EXTRACT_TIMEOUT_SECONDS", 45))),
+        ytdlp_concurrency=_clamped_int_env("YTDLP_CONCURRENCY", 2, 1, 4),
+        ytdlp_extract_timeout_seconds=_clamped_int_env("YTDLP_EXTRACT_TIMEOUT_SECONDS", 45, 10, 120),
         ytdlp_player_client=ytdlp_player_client,
         # Skips the player's second extraction (chat resolves once to queue,
         # then it re-resolves right before playing) for anything near the
         # front of the queue. 0 disables caching.
-        ytdlp_cache_ttl_seconds=max(0, min(3600, _int_env("YTDLP_CACHE_TTL_SECONDS", 300))),
+        ytdlp_cache_ttl_seconds=_clamped_int_env("YTDLP_CACHE_TTL_SECONDS", 300, 0, 3600),
         # Only used if you've separately set up a bgutil-ytdlp-pot-provider
         # instance (see README) — points yt-dlp's PO-token plugin at it.
         # None means "no PO token provider configured", not an error.
