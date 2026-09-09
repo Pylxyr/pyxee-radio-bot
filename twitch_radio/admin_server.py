@@ -12,17 +12,17 @@ from aiohttp import web
 
 from twitch_radio.player import RadioPlayer
 from twitch_radio.store import JsonStore
-from twitch_radio.tunables import TwitchTunables
+from twitch_radio.tunables import TUNABLE_BOUNDS, TwitchTunables
 
 log = logging.getLogger(__name__)
 
-# (form field name, attribute name, min, max)
-_FIELDS = [
-    ("max_pending_per_chatter", "max_pending_per_chatter", 1, 10),
-    ("request_cooldown_seconds", "request_cooldown_seconds", 0, 3600),
-    ("queue_cap", "queue_cap", 1, 200),
-    ("max_request_duration_seconds", "max_request_duration_seconds", 30, 3600),
-]
+# (form field name, attribute name, min, max) — field name and attribute
+# name are identical for every tunable today, so this is just TUNABLE_BOUNDS
+# reshaped into the (name, name, lo, hi) tuples the form-handling code
+# below wants. Derived from tunables.py's TUNABLE_BOUNDS rather than
+# hardcoded again here, so this and the chat !setlimit command can't drift
+# apart on what range is actually allowed.
+_FIELDS = [(name, name, lo, hi) for name, (lo, hi) in TUNABLE_BOUNDS.items()]
 
 _OVERLAY_HTML = """<!doctype html>
 <html><head><meta charset="utf-8">
@@ -137,7 +137,17 @@ function render(data, elapsed) {
       lastThumb = data.thumbnail_url;
       applyAccent(data.thumbnail_url);
     }
-    const thumb = data.thumbnail_url ? `style="background-image:url('${data.thumbnail_url}')"` : '';
+    // escapeHtml() here (not just on title/uploader/requester_name below)
+    // because this string gets spliced directly into an HTML attribute,
+    // not set via .textContent — an unescaped thumbnail_url containing a
+    // stray quote could break out of the style="..." attribute and inject
+    // markup. title/uploader/requester_name are effectively free-text
+    // (YouTube titles, Twitch display names); thumbnail_url is normally a
+    // YouTube-generated CDN URL, but !sr accepts arbitrary yt-dlp-supported
+    // URLs from any chatter, and some extractors pull thumbnail URLs from
+    // page metadata the target site's owner controls — escape it the same
+    // as everything else rather than trusting the source.
+    const thumb = data.thumbnail_url ? `style="background-image:url('${escapeHtml(data.thumbnail_url)}')"` : '';
     const next = (data.queue || []).slice(0, 2)
       .map(q => `<div class="next-item">${escapeHtml(q.title)}</div>`).join('');
     panel.innerHTML = `
