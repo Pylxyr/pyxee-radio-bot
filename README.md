@@ -14,7 +14,8 @@ the other down. No dependency on, or awareness of, any Discord bot.
 
 ## Requirements
 
-- A Linux server — Ubuntu/Debian assumed by `deploy/setup.sh`; any box works
+- A Linux server — Ubuntu/Debian assumed by `deploy/setup.sh`; any box works —
+  or an Android phone via Termux (`deploy/setup_termux.sh`; see below)
 - Python 3.11+, `ffmpeg`
 - A Twitch account for the bot to chat as (a dedicated account, made a
   moderator in your channel, is recommended over reusing your own), plus an
@@ -35,6 +36,52 @@ credentials first (Enter skips one to fill in by hand later — the service
 won't start until all four are set), then every other setting with its
 default shown (Enter keeps it). Safe to re-run; already-filled values are
 left alone. `SKIP_WIZARD=1` skips the whole thing for a scripted install.
+
+## Termux (Android) setup
+
+Runs directly on a phone — no VPS needed. Same service, same `.env`, same
+commands; the differences below are all this script handles for you.
+
+```bash
+pkg install git
+git clone https://github.com/Pylxyr/pyxee-radio-bot.git twitch-radio-bot
+cd twitch-radio-bot
+bash deploy/setup_termux.sh
+```
+
+Two real differences from the VPS install:
+
+- **Node instead of Deno** for yt-dlp's JS runtime. Deno doesn't reliably
+  run on Termux at all — it links against glibc, not Android's own Bionic
+  libc, and Termux's own package build for it has a long, still-unresolved
+  history of being added-then-disabled for exactly this reason (see
+  [termux-packages#17398](https://github.com/termux/termux-packages/issues/17398)
+  and linked issues). Termux's `nodejs` package is mature and built
+  natively for Bionic — [nodejs.org's own install
+  docs](https://nodejs.org/en/download/package-manager/all) point Android/
+  Termux users at it directly. `config.py` already supports
+  `YTDLP_JS_RUNTIME_NAME` for exactly this pairing — the Termux script just
+  points it at Node instead of Deno; nothing in the Python code needed to
+  change.
+- **No systemd.** The script offers `termux-services` (a real supervisor —
+  restarts the bot on crash) with a detached `tmux` session as the
+  fallback, instead of the systemd unit the VPS path installs.
+
+Everything else — the Python dependency install, `ffmpeg`, the `.env`
+wizard — is the same story as `setup.sh`, just without the systemd/apt/sudo
+assumptions baked in. One thing that genuinely doesn't translate from a
+VPS: OBS doesn't run on Android, so the phone is always the "OBS is on a
+different machine" case — the script skips asking and configures for that
+directly (see [Running the bot on a separate machine from
+OBS](#running-the-bot-on-a-separate-machine-from-obs) below for what that
+means in practice on a phone specifically, which is different from the
+cloud-VM version of that same section).
+
+One thing that's actually *simpler* on Termux: the one-time OAuth step
+below normally needs an SSH tunnel to reach `localhost:4343` from your own
+browser — on a phone, the bot and the browser are the same device, so
+there's no tunnel to set up; just open the two URLs directly in a browser
+app on the phone.
 
 ## Configuration and one-time Twitch authorization
 
@@ -60,6 +107,10 @@ left alone. `SKIP_WIZARD=1` skips the whole thing for a scripted install.
    ```bash
    ssh -L 4343:localhost:4343 <user>@<host>
    ```
+   (On Termux: skip this — the bot and your browser are the same phone, so
+   `localhost:4343` is already reachable with no tunnel. See [Termux
+   (Android) setup](#termux-android-setup).)
+
    Then, in a browser:
    - As the **bot account**:
      `http://localhost:4343/oauth?scopes=user:read:chat+user:write:chat+user:bot&force_verify=true`
@@ -101,6 +152,17 @@ wizard asks about this directly (host, port, a settings password, your
 public IP, and the exact firewall commands to run) — this section is the
 manual/reference version of the same steps, for editing `.env` by hand or
 if the wizard's auto-detected IP didn't work out.
+
+**On Termux, this section doesn't apply the same way.** There's no cloud
+firewall or public IP involved — `setup_termux.sh` detects the phone's
+*local network* IP instead, and the realistic setup is OBS on a computer
+on the same Wi-Fi as the phone (`http://<phone's-local-IP>:8098/stream.mp3`).
+Reaching it from outside that Wi-Fi network (cellular data instead of
+Wi-Fi, or an OBS box elsewhere on the internet) isn't the same problem as
+opening a cloud firewall port — most mobile carriers block inbound
+connections outright (CGNAT), so the steps below generally won't apply; a
+tunneling tool (e.g. Tailscale, or Cloudflare Tunnel) is the realistic
+option if you need that.
 
 1. In `.env`, set `TWITCH_NOWPLAYING_HOST=0.0.0.0` and set
    `TWITCH_SETTINGS_PASSWORD` to something (a startup warning fires if you
@@ -168,7 +230,8 @@ twitch-radio-bot/
 ├── pyproject.toml                # ruff/mypy config
 ├── deploy/
 │   ├── .env.example
-│   ├── setup.sh                  # installer
+│   ├── setup.sh                  # installer (Ubuntu/Debian VPS)
+│   ├── setup_termux.sh           # installer (Termux/Android — standalone, no systemd)
 │   ├── twitch-radio.service      # systemd unit
 │   └── twitch-radio-logrotate
 └── twitch_radio/
