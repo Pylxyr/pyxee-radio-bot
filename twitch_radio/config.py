@@ -122,6 +122,15 @@ class Settings:
 
     # Audio
     audio_bitrate_kbps: int
+    # When True, the player won't start a new track while nobody's
+    # subscribed to /stream.mp3 (0 active listeners) — it just holds at the
+    # current silence/track boundary and resumes normally once someone
+    # (re)connects. A track already playing when the last listener
+    # disconnects still finishes normally; this only holds off *starting*
+    # the next one. Off by default to match existing behavior (the queue
+    # has always run on a continuous real-time clock regardless of
+    # listeners) — opt in via PAUSE_QUEUE_WHEN_NO_LISTENERS=true.
+    pause_when_no_listeners: bool
 
     # Local HTTP surface — serves /stream.mp3, /overlay, /nowplaying.json, /settings
     nowplaying_host: str
@@ -132,6 +141,7 @@ class Settings:
     # the systemd unit covers everything this process needs to write.
     token_path: Path
     tunables_path: Path
+    blocklist_path: Path
 
     # yt-dlp
     ytdlp_cookies_file: Path | None
@@ -209,11 +219,13 @@ def load_settings() -> Settings:
         owner_id=owner_id,
         prefix=os.getenv("TWITCH_PREFIX", "!").strip() or "!",
         audio_bitrate_kbps=_clamped_int_env("AUDIO_BITRATE_KBPS", 128, 64, 320),
+        pause_when_no_listeners=_bool_env("PAUSE_QUEUE_WHEN_NO_LISTENERS", False),
         nowplaying_host=nowplaying_host,
         nowplaying_port=_clamped_int_env("TWITCH_NOWPLAYING_PORT", 8098, 1024, 65535),
         settings_password=settings_password,
         token_path=DATA_DIR / os.getenv("TWITCH_TOKEN_FILE", "twitch_tokens.json").strip(),
         tunables_path=DATA_DIR / os.getenv("TWITCH_TUNABLES_FILE", "tunables.json").strip(),
+        blocklist_path=DATA_DIR / os.getenv("TWITCH_BLOCKLIST_FILE", "blocklist.json").strip(),
         ytdlp_cookies_file=cookies_path,
         ytdlp_js_runtime_path=os.getenv("YTDLP_JS_RUNTIME_PATH", "").strip() or None,
         ytdlp_js_runtime_name=os.getenv("YTDLP_JS_RUNTIME_NAME", "deno").strip() or "deno",

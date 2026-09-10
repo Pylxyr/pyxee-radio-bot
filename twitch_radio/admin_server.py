@@ -7,6 +7,7 @@ import logging
 import time
 from html import escape
 from typing import Any
+from urllib.parse import urlsplit
 
 from aiohttp import web
 
@@ -190,11 +191,39 @@ function escapeHtml(s) {
 }
 
 async function poll() {
+  // Fallback path only — the WebSocket connection below is the primary
+  // source of truth and pushes a fresh snapshot on every change; this just
+  // keeps the overlay working if WebSocket is unavailable or its
+  // connection is currently down (skipped while it's open, so it's a
+  // once-per-2s no-op fetch the rest of the time, not real polling).
+  if (ws && ws.readyState === WebSocket.OPEN) return;
   try {
     const res = await fetch('/nowplaying.json');
     last = await res.json();
     lastFetchedAt = performance.now();
   } catch (e) { /* keep showing the last known state */ }
+}
+
+let ws = null;
+function connectWs() {
+  let socket;
+  try {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    socket = new WebSocket(`${proto}//${location.host}/ws/nowplaying`);
+  } catch (e) {
+    // No WebSocket support at all (unlikely, but some embedded browser
+    // sources are old) — poll() above just keeps running unattended.
+    return;
+  }
+  ws = socket;
+  socket.onmessage = (ev) => {
+    try {
+      last = JSON.parse(ev.data);
+      lastFetchedAt = performance.now();
+    } catch (e) { /* malformed frame — next one (or the poll() backstop) recovers */ }
+  };
+  socket.onclose = () => { if (ws === socket) ws = null; setTimeout(connectWs, 2000); };
+  socket.onerror = () => { try { socket.close(); } catch (e) {} };
 }
 
 function tick() {
@@ -205,11 +234,58 @@ function tick() {
   requestAnimationFrame(tick);
 }
 
+connectWs();
 poll();
 setInterval(poll, 2000);
 tick();
 </script>
 </body></html>"""
+
+
+class _AuthRateLimiter:
+    """Basic Auth has no built-in lockout — without this, /settings is
+    brute-forceable at whatever rate the network allows (the password is
+    normally a machine-generated random string, so this mostly matters if
+    someone's set a memorable custom one). Tracks failed attempts per client
+    IP in a sliding window; once a caller exceeds the threshold, further
+    attempts — even with the correct password — are rejected with 429 until
+    the window rolls over. In-memory only, resets on restart: fine for what
+    this defends against (a sustained guessing script), not meant to survive
+    a determined attacker who can just restart the service.
+
+    Caveat: keyed by request.remote, which is the direct TCP peer as aiohttp
+    sees it — behind a reverse proxy (README suggests one for TLS), every
+    request arrives from the proxy's own address, so this degrades to one
+    shared bucket for all callers rather than one per real client. Trusting
+    X-Forwarded-For instead would fix that but opens a spoofing vector of
+    its own unless paired with a proxy allowlist, which felt like more
+    surface than this warranted.
+    """
+
+    def __init__(self, max_attempts: int = 10, window_seconds: float = 300.0) -> None:
+        self._max_attempts = max_attempts
+        self._window = window_seconds
+        self._failures: dict[str, list[float]] = {}
+
+    def _prune(self, ip: str, now: float) -> list[float]:
+        attempts = [t for t in self._failures.get(ip, []) if now - t < self._window]
+        if attempts:
+            self._failures[ip] = attempts
+        else:
+            self._failures.pop(ip, None)
+        return attempts
+
+    def is_blocked(self, ip: str) -> bool:
+        return len(self._prune(ip, time.monotonic())) >= self._max_attempts
+
+    def record_failure(self, ip: str) -> None:
+        now = time.monotonic()
+        attempts = self._prune(ip, now)
+        attempts.append(now)
+        self._failures[ip] = attempts
+
+    def record_success(self, ip: str) -> None:
+        self._failures.pop(ip, None)
 
 
 class AdminServer:
@@ -229,6 +305,7 @@ class AdminServer:
         self._tunables_store = tunables_store
         self._settings_password = settings_password
         self._broadcast_info = broadcast_info
+        self._auth_limiter = _AuthRateLimiter()
 
     def _check_auth(self, request: web.Request) -> bool:
         if self._settings_password is None:
@@ -243,6 +320,53 @@ class AdminServer:
         _, _, password = decoded.partition(":")
         return hmac.compare_digest(password, self._settings_password)
 
+    def _authorize(self, request: web.Request) -> web.Response | None:
+        """Combines the password check above with the rate limiter — the
+        single thing every /settings handler should call. Returns None if
+        the request may proceed, otherwise the exact response to return
+        (401 for a bad/missing password, 429 if this IP's been locked out).
+        """
+        if self._settings_password is None:
+            return None
+        ip = request.remote or "unknown"
+        if self._auth_limiter.is_blocked(ip):
+            return web.Response(
+                status=429,
+                text="Too many failed attempts — try again later.",
+                headers={"Retry-After": "300"},
+            )
+        if self._check_auth(request):
+            self._auth_limiter.record_success(ip)
+            return None
+        self._auth_limiter.record_failure(ip)
+        return self._unauthorized()
+
+    def _check_origin(self, request: web.Request) -> bool:
+        """CSRF defense for POST /settings. Basic Auth credentials are
+        browser-cached per-origin and get attached automatically to a
+        cross-site form POST — unlike cookies, there's no SameSite-style
+        protection for Basic Auth — so without this, a malicious page could
+        submit settings changes on a logged-in admin's behalf just by
+        auto-submitting a hidden form. Verifies Origin (falling back to
+        Referer) matches the request's own Host: the standard
+        OWASP-recommended "Verifying Origin With Standard Headers" defense.
+        Only enforced when one of those headers is actually present, so
+        non-browser callers that don't send either (curl, a Stream Deck
+        script hitting this on purpose) aren't broken by it — every modern
+        browser sends Origin on a cross-site POST regardless, so this still
+        stops the actual attack.
+        """
+        source = request.headers.get("Origin")
+        if source is None:
+            referer = request.headers.get("Referer")
+            if referer:
+                parts = urlsplit(referer)
+                source = f"{parts.scheme}://{parts.netloc}"
+        if source is None:
+            return True
+        host = request.headers.get("Host", "")
+        return source in (f"http://{host}", f"https://{host}")
+
     def _unauthorized(self) -> web.Response:
         return web.Response(
             status=401,
@@ -250,28 +374,62 @@ class AdminServer:
             headers={"WWW-Authenticate": 'Basic realm="twitch-radio settings"'},
         )
 
-    async def handle_nowplaying(self, request: web.Request) -> web.Response:
+    def _nowplaying_payload(self) -> dict[str, Any]:
         np = self._player.now_playing
         queue = [
             {"title": item.title or "Unknown title", "requester_name": item.requester_name}
             for item in self._player.queued_items()
         ]
         if np is None:
-            return web.json_response({"playing": False, "queue_size": len(queue), "queue": queue})
-        return web.json_response(
-            {
-                "playing": True,
-                "title": np.title,
-                "uploader": np.uploader,
-                "thumbnail_url": np.thumbnail_url,
-                "requester_name": np.requester_name,
-                "webpage_url": np.webpage_url,
-                "elapsed_seconds": max(0.0, time.monotonic() - np.started_at),
-                "duration_seconds": np.duration,
-                "queue_size": len(queue),
-                "queue": queue,
-            }
-        )
+            return {"playing": False, "queue_size": len(queue), "queue": queue}
+        return {
+            "playing": True,
+            "title": np.title,
+            "uploader": np.uploader,
+            "thumbnail_url": np.thumbnail_url,
+            "requester_name": np.requester_name,
+            "webpage_url": np.webpage_url,
+            "elapsed_seconds": max(0.0, time.monotonic() - np.started_at),
+            "duration_seconds": np.duration,
+            "queue_size": len(queue),
+            "queue": queue,
+        }
+
+    async def handle_nowplaying(self, request: web.Request) -> web.Response:
+        return web.json_response(self._nowplaying_payload())
+
+    async def handle_ws_nowplaying(self, request: web.Request) -> web.WebSocketResponse:
+        """Push-based counterpart to /nowplaying.json — the overlay prefers
+        this (see _OVERLAY_HTML's connectWs()) and falls back to polling
+        /nowplaying.json if this connection is unavailable or drops. Sends
+        one full snapshot on connect, then another every time RadioPlayer
+        reports something changed (new track, track ended, queue edited) —
+        the client computes the smoothly-ticking elapsed-time display itself
+        from elapsed_seconds + a local clock, so this doesn't need to push
+        every second, only on actual state changes."""
+        ws = web.WebSocketResponse(heartbeat=30)
+        await ws.prepare(request)
+        state_queue = self._player.subscribe_state()
+        try:
+            await ws.send_json(self._nowplaying_payload())
+            while True:
+                try:
+                    await asyncio.wait_for(state_queue.get(), timeout=30)
+                except TimeoutError:
+                    # Nothing changed — just a periodic wakeup so a dead
+                    # connection (no clean close frame received) still gets
+                    # noticed via ws.closed below in reasonable time, not
+                    # only whenever the next real state change happens to
+                    # occur.
+                    pass
+                if ws.closed:
+                    break
+                await ws.send_json(self._nowplaying_payload())
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+        finally:
+            self._player.unsubscribe_state(state_queue)
+        return ws
 
     async def handle_overlay(self, request: web.Request) -> web.Response:
         return web.Response(text=_OVERLAY_HTML, content_type="text/html")
@@ -299,14 +457,24 @@ class AdminServer:
         return response
 
     async def handle_settings_get(self, request: web.Request) -> web.Response:
-        if not self._check_auth(request):
-            return self._unauthorized()
+        denied = self._authorize(request)
+        if denied is not None:
+            return denied
         tunables = TwitchTunables.from_dict(await self._tunables_store.read())
         return web.Response(text=self._render_page(tunables, message=None), content_type="text/html")
 
     async def handle_settings_post(self, request: web.Request) -> web.Response:
-        if not self._check_auth(request):
-            return self._unauthorized()
+        denied = self._authorize(request)
+        if denied is not None:
+            return denied
+        if not self._check_origin(request):
+            log.warning(
+                "Rejected /settings POST from %s — Origin/Referer didn't match Host "
+                "(possible CSRF, or a reverse proxy rewriting Host without matching "
+                "Origin/Referer — see README if this fires legitimately).",
+                request.remote,
+            )
+            return web.Response(status=403, text="Origin check failed — refusing to save.")
         form = await request.post()
         errors: list[str] = []
         preview: dict[str, Any] = {}
@@ -339,6 +507,7 @@ class AdminServer:
                 status=400,
             )
 
+        log.info("Settings updated via /settings from %s: %s", request.remote, result)
         tunables = TwitchTunables.from_dict(result)
         return web.Response(text=self._render_page(tunables, message="Saved."), content_type="text/html")
 
@@ -369,6 +538,8 @@ button {{ margin-top: 1rem; padding: 0.5rem 1rem; }}
 <input type="number" name="queue_cap" value="{tunables.queue_cap}"></label>
 <label>Max request duration (seconds)
 <input type="number" name="max_request_duration_seconds" value="{tunables.max_request_duration_seconds}"></label>
+<label>Vote-skip threshold (unique !voteskip votes needed)
+<input type="number" name="vote_skip_threshold" value="{tunables.vote_skip_threshold}"></label>
 <button type="submit">Save</button>
 </form>
 <table>{info_rows}</table>
@@ -390,6 +561,7 @@ async def run_admin_server(
     )
     app = web.Application()
     app.router.add_get("/nowplaying.json", server.handle_nowplaying)
+    app.router.add_get("/ws/nowplaying", server.handle_ws_nowplaying)
     app.router.add_get("/overlay", server.handle_overlay)
     app.router.add_get("/stream.mp3", server.handle_stream)
     app.router.add_get("/settings", server.handle_settings_get)
@@ -399,5 +571,9 @@ async def run_admin_server(
     await runner.setup()
     site = web.TCPSite(runner, host, port)
     await site.start()
-    log.info("Admin server listening on http://%s:%d (/stream.mp3, /overlay, /nowplaying.json, /settings)", host, port)
+    log.info(
+        "Admin server listening on http://%s:%d (/stream.mp3, /overlay, /nowplaying.json, "
+        "/ws/nowplaying, /settings)",
+        host, port,
+    )
     return runner

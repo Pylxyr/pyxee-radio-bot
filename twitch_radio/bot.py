@@ -40,8 +40,13 @@ async def _async_run() -> None:
 
     resolver = Resolver(settings)
     tunables_store = JsonStore(settings.tunables_path)
+    blocklist_store = JsonStore(settings.blocklist_path)
 
-    player = RadioPlayer(resolver=resolver.resolve, audio_bitrate_kbps=settings.audio_bitrate_kbps)
+    player = RadioPlayer(
+        resolver=resolver.resolve,
+        audio_bitrate_kbps=settings.audio_bitrate_kbps,
+        pause_when_no_listeners=settings.pause_when_no_listeners,
+    )
     # player.start() spawns a persistent background task before anything
     # else here exists — nested try/finally per resource, not one big try
     # around just the chat bot, so a failure acquiring a *later* resource
@@ -71,6 +76,7 @@ async def _async_run() -> None:
                 resolver=resolver,
                 player=player,
                 tunables_store=tunables_store,
+                blocklist_store=blocklist_store,
                 token_storage_path=settings.token_path,
             )
             player.set_track_failure_notifier(bot.announce)
@@ -103,4 +109,48 @@ async def _async_run() -> None:
 
 
 def run() -> None:
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(prog="twitch-radio-bot")
+    parser.add_argument(
+        "--check-config",
+        action="store_true",
+        help="Validate .env and exit — doesn't start the bot, spawn ffmpeg, or touch Twitch/yt-dlp.",
+    )
+    args = parser.parse_args()
+
+    if args.check_config:
+        sys.exit(_check_config())
     asyncio.run(_async_run())
+
+
+def _check_config() -> int:
+    import shutil
+
+    try:
+        settings = load_settings()
+    except RuntimeError as exc:
+        print(f"Config check FAILED: {exc}")
+        return 1
+
+    if shutil.which("ffmpeg") is None:
+        print("Config check FAILED: ffmpeg not found on PATH.")
+        return 1
+
+    # Deliberately doesn't print client_secret or settings_password.
+    print("Config OK:")
+    print(f"  Twitch: bot_id={settings.bot_id} owner_id={settings.owner_id} prefix={settings.prefix!r}")
+    print(f"  Audio: {settings.audio_bitrate_kbps} kbps, pause_when_no_listeners={settings.pause_when_no_listeners}")
+    print(
+        f"  HTTP: http://{settings.nowplaying_host}:{settings.nowplaying_port} "
+        f"(settings password {'set' if settings.settings_password else 'NOT set — /settings is open to anyone'})"
+    )
+    token_status = "found" if settings.token_path.exists() else "missing — run OAuth setup before starting"
+    print(f"  Token file: {settings.token_path} ({token_status})")
+    print(
+        f"  yt-dlp: concurrency={settings.ytdlp_concurrency} "
+        f"timeout={settings.ytdlp_extract_timeout_seconds}s "
+        f"cookies={'configured' if settings.ytdlp_cookies_file else 'none'}"
+    )
+    return 0

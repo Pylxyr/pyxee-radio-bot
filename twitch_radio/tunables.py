@@ -16,6 +16,7 @@ TUNABLE_BOUNDS: dict[str, tuple[int, int]] = {
     "request_cooldown_seconds": (0, 3600),
     "queue_cap": (1, 200),
     "max_request_duration_seconds": (30, 3600),
+    "vote_skip_threshold": (2, 20),
 }
 
 
@@ -29,6 +30,7 @@ class TwitchTunables:
     request_cooldown_seconds: int = 0
     queue_cap: int = 50
     max_request_duration_seconds: int = 600
+    vote_skip_threshold: int = 3
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TwitchTunables":
@@ -71,6 +73,7 @@ class TwitchTunables:
             max_request_duration_seconds=_field(
                 "max_request_duration_seconds", defaults.max_request_duration_seconds
             ),
+            vote_skip_threshold=_field("vote_skip_threshold", defaults.vote_skip_threshold),
         )
 
     def to_dict(self) -> dict[str, int]:
@@ -79,24 +82,5 @@ class TwitchTunables:
             "request_cooldown_seconds": self.request_cooldown_seconds,
             "queue_cap": self.queue_cap,
             "max_request_duration_seconds": self.max_request_duration_seconds,
-        }
-                return default
-
-        return cls(
-            max_pending_per_chatter=_field("max_pending_per_chatter", defaults.max_pending_per_chatter),
-            request_cooldown_seconds=_field(
-                "request_cooldown_seconds", defaults.request_cooldown_seconds
-            ),
-            queue_cap=_field("queue_cap", defaults.queue_cap),
-            max_request_duration_seconds=_field(
-                "max_request_duration_seconds", defaults.max_request_duration_seconds
-            ),
-        )
-
-    def to_dict(self) -> dict[str, int]:
-        return {
-            "max_pending_per_chatter": self.max_pending_per_chatter,
-            "request_cooldown_seconds": self.request_cooldown_seconds,
-            "queue_cap": self.queue_cap,
-            "max_request_duration_seconds": self.max_request_duration_seconds,
+            "vote_skip_threshold": self.vote_skip_threshold,
         }

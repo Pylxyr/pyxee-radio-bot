@@ -61,9 +61,12 @@ class RadioPlayer:
     own; playback only happens where something is actually listening.
     """
 
-    def __init__(self, *, resolver: TrackResolver, audio_bitrate_kbps: int) -> None:
+    def __init__(
+        self, *, resolver: TrackResolver, audio_bitrate_kbps: int, pause_when_no_listeners: bool = False
+    ) -> None:
         self._resolver = resolver
         self._audio_bitrate_kbps = audio_bitrate_kbps
+        self._pause_when_no_listeners = pause_when_no_listeners
 
         self._queue: asyncio.Queue[QueuedRequest] = asyncio.Queue()
         self._pending: list[QueuedRequest] = []
@@ -89,6 +92,16 @@ class RadioPlayer:
         self._notify_failure: Callable[[str], Awaitable[None]] | None = None
         self._duration_limit_getter: Callable[[], Awaitable[int]] | None = None
         self._subscribers: set[asyncio.Queue[bytes]] = set()
+        # Unique voter IDs for a !voteskip on whatever's currently active —
+        # cleared every time a new request becomes active (see _play_one),
+        # so votes never carry over from one song to the next.
+        self._skip_votes: set[int] = set()
+        # Pub-sub for "something about now-playing/queue changed" — mirrors
+        # the _subscribers pattern above but carries no payload (just a
+        # wakeup); consumers (the admin server's /ws/nowplaying) re-fetch
+        # full current state themselves rather than this class trying to
+        # track per-connection what's already been sent.
+        self._state_subscribers: set[asyncio.Queue[None]] = set()
 
     # -- public interface used by the chat bot / admin server ------------
 
@@ -114,9 +127,18 @@ class RadioPlayer:
     def queued_items(self) -> list[QueuedRequest]:
         return list(self._pending)
 
+    def positions_for(self, requester_id: int) -> list[int]:
+        """1-indexed queue positions, in play order, for every one of
+        requester_id's requests still waiting (not yet dequeued) — empty if
+        they have none waiting (whether because they have nothing queued,
+        or because their one request is the one currently active — check
+        active_requester_id for that case)."""
+        return [i + 1 for i, r in enumerate(self._pending) if r.requester_id == requester_id]
+
     def enqueue(self, request: QueuedRequest) -> None:
         self._queue.put_nowait(request)
         self._pending.append(request)
+        self._notify_state_changed()
 
     def set_track_failure_notifier(self, notifier: Callable[[str], Awaitable[None]] | None) -> None:
         self._notify_failure = notifier
@@ -132,6 +154,24 @@ class RadioPlayer:
     def unsubscribe(self, q: asyncio.Queue[bytes]) -> None:
         self._subscribers.discard(q)
 
+    def subscribe_state(self) -> asyncio.Queue[None]:
+        """A queue that receives a wakeup (no payload — just call
+        active_requester_id/now_playing/queued_items() again) every time
+        now-playing or the queue changes. Small maxsize is fine: consumers
+        only care that *something* changed, not how many times, and a full
+        queue just means a wakeup is already pending."""
+        q: asyncio.Queue[None] = asyncio.Queue(maxsize=4)
+        self._state_subscribers.add(q)
+        return q
+
+    def unsubscribe_state(self, q: asyncio.Queue[None]) -> None:
+        self._state_subscribers.discard(q)
+
+    def _notify_state_changed(self) -> None:
+        for q in list(self._state_subscribers):
+            with contextlib.suppress(asyncio.QueueFull):
+                q.put_nowait(None)
+
     def cancel_pending_for(self, requester_id: int) -> QueuedRequest | None:
         for request in reversed(self._pending):
             if request.requester_id == requester_id and not request.cancelled:
@@ -142,6 +182,7 @@ class RadioPlayer:
                     with contextlib.suppress(Exception):
                         request.on_start()
                     request.on_start = None
+                self._notify_state_changed()
                 return request
         return None
 
@@ -154,6 +195,26 @@ class RadioPlayer:
             self._skip_pending = True
             return True
         return False
+
+    def register_skip_vote(self, voter_id: int, threshold: int) -> tuple[bool, int, bool] | None:
+        """Registers one vote to skip whatever's currently active (playing
+        or still resolving). Returns (skipped, vote_count, is_new_vote), or
+        None if nothing's currently active to vote on. `skipped` is True if
+        this vote reached `threshold` and triggered an actual skip (votes
+        are cleared immediately in that case — same-track revoting starts
+        fresh). `is_new_vote` is False if this voter had already voted for
+        this same track (still reports the current count either way, so a
+        repeat !voteskip isn't a dead end for the caller)."""
+        if self.active_requester_id is None:
+            return None
+        is_new = voter_id not in self._skip_votes
+        self._skip_votes.add(voter_id)
+        count = len(self._skip_votes)
+        if count >= threshold:
+            self.skip_current()
+            self._skip_votes.clear()
+            return True, count, is_new
+        return False, count, is_new
 
     async def _notify(self, message: str) -> None:
         if self._notify_failure is None:
@@ -290,6 +351,21 @@ class RadioPlayer:
                 self._backoff = _MIN_BACKOFF
                 self._backoff_reset_done = True
             try:
+                if self._pause_when_no_listeners and not self._subscribers:
+                    # Track-boundary pause only — deliberately not trying to
+                    # pause mid-track (that would mean pausing the decoder
+                    # subprocess and the real-time write pacing in
+                    # _play_one_inner without leaving stream state
+                    # inconsistent, which is a lot more moving parts for a
+                    # narrow benefit). A track already playing when the last
+                    # listener disconnects always finishes normally; this
+                    # only holds off *starting the next one* until someone's
+                    # listening again — checked fresh every loop tick, so it
+                    # resumes on its own the moment a subscriber (re)connects,
+                    # no separate signal needed.
+                    await self._write_silence_chunk(encoder_stdin)
+                    await asyncio.sleep(_CHUNK_DURATION)
+                    continue
                 request = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 await self._write_silence_chunk(encoder_stdin)
@@ -318,6 +394,8 @@ class RadioPlayer:
 
     async def _play_one(self, request: QueuedRequest, encoder_stdin: asyncio.StreamWriter) -> None:
         self._active_request = request
+        self._skip_votes.clear()
+        self._notify_state_changed()
         try:
             await self._play_one_inner(request, encoder_stdin)
         except asyncio.CancelledError:
@@ -326,6 +404,7 @@ class RadioPlayer:
             log.exception("Error playing queued request: %s", request.webpage_url)
         finally:
             self._active_request = None
+            self._notify_state_changed()
 
     async def _current_duration_limit(self) -> int:
         if self._duration_limit_getter is None:
@@ -377,6 +456,7 @@ class RadioPlayer:
                 started_at=time.monotonic(),
                 duration=track.duration,
             )
+            self._notify_state_changed()
             log.info("Now playing: %s (requested by %s)", track.title, request.requester_name)
 
             decoder = await asyncio.create_subprocess_exec(

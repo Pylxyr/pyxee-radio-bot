@@ -7,6 +7,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
+from urllib.parse import urlsplit
 
 import yt_dlp
 
@@ -17,9 +18,47 @@ log = logging.getLogger(__name__)
 
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
+# Security posture: only YouTube and SoundCloud are accepted, not "anything
+# yt-dlp supports" (thousands of sites). Every extractor is more attack
+# surface — arbitrary sites can serve crafted metadata (title, uploader,
+# thumbnail) that flows into the overlay page and chat replies, and yt-dlp
+# itself has occasionally shipped extractor-specific bugs for less-trafficked
+# sites. Enforced twice, deliberately redundant: _ALLOWED_URL_HOSTS below
+# rejects a disallowed URL immediately, before any network call; the
+# `allowed_extractors` yt-dlp option in _build_options() is defense-in-depth
+# in case a URL matches an allowed host but a redirect or embed resolves it
+# through something else internally (e.g. the generic extractor).
+_ALLOWED_URL_HOSTS = {
+    "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be",
+    "soundcloud.com", "www.soundcloud.com", "m.soundcloud.com", "on.soundcloud.com",
+}
+# Matched with re.fullmatch against yt-dlp's lowercased IE_NAME for every
+# extractor it has (checked against yt-dlp==2026.08.19's actual matching
+# code, YoutubeDL.add_default_info_extractors / orderedSet_from_options) —
+# "youtube(:.*)?" covers every youtube:* variant (youtube:search for the
+# default text-search path, youtube:tab, youtube:clip, ...), same for
+# soundcloud. Deliberately does NOT include "generic" — that's yt-dlp's
+# scrape-any-webpage fallback, exactly what this restriction exists to keep
+# out.
+_ALLOWED_EXTRACTORS = ["youtube(:.*)?", "soundcloud(:.*)?"]
+
+
+def _is_allowed_url(url: str) -> bool:
+    try:
+        host = urlsplit(url).hostname or ""
+    except ValueError:
+        return False
+    return host.lower() in _ALLOWED_URL_HOSTS
+
 
 class DownloadError(Exception):
     """Raised when yt-dlp fails to resolve a query into a playable track."""
+
+
+class UnsupportedSourceError(DownloadError):
+    """Raised when a direct URL isn't from an allowed source (YouTube or
+    SoundCloud) — distinct from DownloadError so the chat bot can give a
+    specific, accurate reply instead of the generic "couldn't fetch that"."""
 
 
 class Resolver:
@@ -79,6 +118,12 @@ class Resolver:
             "default_search": "ytsearch",
             "socket_timeout": 15,
             "extract_flat": False,
+            # See _ALLOWED_EXTRACTORS above — restricts yt-dlp itself to
+            # YouTube/SoundCloud as a second layer behind the URL-host check
+            # in resolve(), not a substitute for it (that check runs before
+            # any network call at all; this only matters once yt-dlp is
+            # already resolving something).
+            "allowed_extractors": _ALLOWED_EXTRACTORS,
         }
         extractor_args: dict[str, dict[str, list[str]]] = {}
         if self._settings.ytdlp_player_client:
@@ -153,6 +198,10 @@ class Resolver:
         safety-relevant.
         """
         now = time.monotonic()
+        raw = query.strip()
+        if _URL_RE.match(raw) and not _is_allowed_url(raw):
+            raise UnsupportedSourceError("Only YouTube and SoundCloud links are supported.")
+
         ttl = self._settings.ytdlp_cache_ttl_seconds
         if ttl > 0:
             self._prune_cache(now)
