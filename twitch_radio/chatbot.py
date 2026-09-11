@@ -339,7 +339,7 @@ class SongRequestComponent(commands.Component):
         await ctx.reply(
             f"{p}sr <song/URL> — queue a song (YouTube/SoundCloud)  |  {p}skip / {p}voteskip — "
             f"skip it  |  {p}remove — pull back your request  |  {p}position — where you are in "
-            f"line  |  {p}queue  |  {p}nowplaying  |  mods: {p}setlimit, {p}block/{p}unblock"
+            f"line  |  {p}queue  |  {p}nowplaying  |  mods: {p}setlimit, {p}block/{p}unblock, {p}clearqueue"
         )
 
     @commands.is_moderator()
@@ -384,7 +384,10 @@ class SongRequestComponent(commands.Component):
     @commands.command(name="block")
     async def block(self, ctx: commands.Context, *, args: str) -> None:
         """Mod-only: blocks a track (by URL) or an uploader (by name) from
-        being requested again. Checked on every future !sr."""
+        being requested again, and pulls any already-queued copy of that
+        same track out of the queue too (an uploader block can't purge the
+        queue the same way — a queued request's uploader isn't known until
+        it's actually resolved)."""
         target = args.strip()
         if not target:
             await ctx.reply(_USAGE["block"])
@@ -398,7 +401,15 @@ class SongRequestComponent(commands.Component):
         log.info("Blocked %r via chat by %s (%s)", target, ctx.chatter.display_name, ctx.chatter.id)
         tracks, uploaders = blocklist_counts(result)
         kind = "track" if key else f"uploader {target!r}"
-        await ctx.reply(f"Blocked that {kind}. ({tracks} tracks, {uploaders} uploaders blocked)")
+        reply = f"Blocked that {kind}. ({tracks} tracks, {uploaders} uploaders blocked)"
+
+        if key:
+            purged = self.bot.player.purge_pending(lambda r: normalize_track_key(r.webpage_url) == key)
+            if purged:
+                noun = "copy" if len(purged) == 1 else "copies"
+                reply += f" Also removed {len(purged)} already-queued {noun} of it."
+
+        await ctx.reply(reply)
 
     @commands.is_moderator()
     @commands.command(name="unblock")
@@ -426,6 +437,17 @@ class SongRequestComponent(commands.Component):
         (not the full list — that can get long for chat)."""
         tracks, uploaders = blocklist_counts(await self.bot.blocklist_store.read())
         await ctx.reply(f"{tracks} track(s) and {uploaders} uploader(s) currently blocked.")
+
+    @commands.is_moderator()
+    @commands.command(name="clearqueue")
+    async def clear_queue(self, ctx: commands.Context) -> None:
+        """Mod-only: empties the queue. Doesn't touch whatever's currently
+        playing — use !skip for that."""
+        removed = self.bot.player.purge_pending(lambda r: True)
+        if not removed:
+            await ctx.reply("Queue's already empty.")
+            return
+        await ctx.reply(f"Cleared {len(removed)} queued request(s).")
 
 
 class TwitchChatBot(commands.Bot):

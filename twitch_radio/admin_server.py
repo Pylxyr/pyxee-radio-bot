@@ -11,6 +11,8 @@ from urllib.parse import urlsplit
 
 from aiohttp import web
 
+from twitch_radio.blocklist import clean_list
+from twitch_radio.blocklist import counts as blocklist_counts
 from twitch_radio.player import RadioPlayer
 from twitch_radio.store import JsonStore
 from twitch_radio.tunables import TUNABLE_BOUNDS, TwitchTunables
@@ -298,11 +300,13 @@ class AdminServer:
         *,
         player: RadioPlayer,
         tunables_store: JsonStore,
+        blocklist_store: JsonStore,
         settings_password: str | None,
         broadcast_info: dict[str, str],
     ) -> None:
         self._player = player
         self._tunables_store = tunables_store
+        self._blocklist_store = blocklist_store
         self._settings_password = settings_password
         self._broadcast_info = broadcast_info
         self._auth_limiter = _AuthRateLimiter()
@@ -431,6 +435,24 @@ class AdminServer:
             self._player.unsubscribe_state(state_queue)
         return ws
 
+    async def handle_blocklist(self, request: web.Request) -> web.Response:
+        """Full blocklist contents, gated the same as /settings — the
+        !blocklist chat command only gives counts (keeping chat short), so
+        this is where a mod actually reviews or audits what's blocked."""
+        denied = self._authorize(request)
+        if denied is not None:
+            return denied
+        data = await self._blocklist_store.read()
+        tracks, uploaders = blocklist_counts(data)
+        return web.json_response(
+            {
+                "tracks": clean_list(data.get("tracks")),
+                "uploaders": clean_list(data.get("uploaders")),
+                "track_count": tracks,
+                "uploader_count": uploaders,
+            }
+        )
+
     async def handle_overlay(self, request: web.Request) -> web.Response:
         return web.Response(text=_OVERLAY_HTML, content_type="text/html")
 
@@ -550,18 +572,20 @@ async def run_admin_server(
     *,
     player: RadioPlayer,
     tunables_store: JsonStore,
+    blocklist_store: JsonStore,
     settings_password: str | None,
     broadcast_info: dict[str, str],
     host: str,
     port: int,
 ) -> web.AppRunner:
     server = AdminServer(
-        player=player, tunables_store=tunables_store, settings_password=settings_password,
-        broadcast_info=broadcast_info,
+        player=player, tunables_store=tunables_store, blocklist_store=blocklist_store,
+        settings_password=settings_password, broadcast_info=broadcast_info,
     )
     app = web.Application()
     app.router.add_get("/nowplaying.json", server.handle_nowplaying)
     app.router.add_get("/ws/nowplaying", server.handle_ws_nowplaying)
+    app.router.add_get("/blocklist.json", server.handle_blocklist)
     app.router.add_get("/overlay", server.handle_overlay)
     app.router.add_get("/stream.mp3", server.handle_stream)
     app.router.add_get("/settings", server.handle_settings_get)
@@ -573,7 +597,7 @@ async def run_admin_server(
     await site.start()
     log.info(
         "Admin server listening on http://%s:%d (/stream.mp3, /overlay, /nowplaying.json, "
-        "/ws/nowplaying, /settings)",
+        "/ws/nowplaying, /blocklist.json, /settings)",
         host, port,
     )
     return runner

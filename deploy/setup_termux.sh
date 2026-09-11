@@ -332,6 +332,10 @@ else
   prompt_optional_field TWITCH_PREFIX "!" 0 0 "— Command prefix in chat (!sr, !skip, ...)."
   prompt_optional_field AUDIO_BITRATE_KBPS "128" 0 1 \
     "— MP3 bitrate for /stream.mp3 (64-320). Raise it if it sounds thin."
+  prompt_optional_field PAUSE_QUEUE_WHEN_NO_LISTENERS "false" 0 0 \
+    "— true/false. If true, holds off starting the next track while" \
+    "    nobody's connected to /stream.mp3, and resumes on its own once" \
+    "    someone (re)connects. A track already playing always finishes."
 
   echo ""
   echo "${CYAN}-- Local HTTP surface (/stream.mp3, /overlay, /settings) --${RESET}"

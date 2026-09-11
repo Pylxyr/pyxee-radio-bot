@@ -186,6 +186,29 @@ class RadioPlayer:
                 return request
         return None
 
+    def purge_pending(self, predicate: Callable[[QueuedRequest], bool]) -> list[QueuedRequest]:
+        """Removes every not-yet-playing request matching predicate —
+        used for mod tooling (!clearqueue, and !block pulling out an
+        already-queued copy of what it just blocked). Doesn't touch
+        whatever's currently playing/resolving; same on_start-firing
+        behavior as cancel_pending_for, so each removed requester's
+        pending count is released correctly."""
+        removed = []
+        for request in list(self._pending):
+            if not predicate(request):
+                continue
+            request.cancelled = True
+            with contextlib.suppress(ValueError):
+                self._pending.remove(request)
+            if request.on_start is not None:
+                with contextlib.suppress(Exception):
+                    request.on_start()
+                request.on_start = None
+            removed.append(request)
+        if removed:
+            self._notify_state_changed()
+        return removed
+
     def skip_current(self) -> bool:
         if self._current_decoder is not None:
             with contextlib.suppress(ProcessLookupError):

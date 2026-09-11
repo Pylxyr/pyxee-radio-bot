@@ -56,6 +56,7 @@ async def _async_run() -> None:
         admin_runner = await run_admin_server(
             player=player,
             tunables_store=tunables_store,
+            blocklist_store=blocklist_store,
             settings_password=settings.settings_password,
             broadcast_info={
                 "Audio stream": "/stream.mp3",

@@ -270,6 +270,10 @@ else
     "— Command prefix in chat (!sr, !skip, ...)."
   prompt_optional_field AUDIO_BITRATE_KBPS "128" 0 1 \
     "— MP3 bitrate for /stream.mp3 (64-320). Raise it if it sounds thin."
+  prompt_optional_field PAUSE_QUEUE_WHEN_NO_LISTENERS "false" 0 0 \
+    "— true/false. If true, holds off starting the next track while" \
+    "    nobody's connected to /stream.mp3, and resumes on its own once" \
+    "    someone (re)connects. A track already playing always finishes."
 
   echo ""
   echo "${CYAN}-- Local HTTP surface (/stream.mp3, /overlay, /settings) --${RESET}"
@@ -370,6 +374,8 @@ else
     "— Under data/. No reason to change unless running >1 instance from one data/."
   prompt_optional_field TWITCH_TUNABLES_FILE "tunables.json" 0 0 \
     "— Same as above, for the /settings tunables."
+  prompt_optional_field TWITCH_BLOCKLIST_FILE "blocklist.json" 0 0 \
+    "— Same as above, for the !block/!unblock moderation list."
 
   echo ""
   echo "${CYAN}-- yt-dlp --${RESET}"

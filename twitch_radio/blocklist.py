@@ -48,50 +48,56 @@ def normalize_track_key(url: str) -> str | None:
     return None
 
 
+def clean_list(value: Any) -> list[str]:
+    """Tolerates a hand-edited or corrupted blocklist.json — anything that
+    isn't a list of strings is treated as empty rather than crashing (or
+    silently doing something wrong, e.g. set() on a stray string blocking
+    it character-by-character) the command that touches it. Same
+    philosophy as tunables.py's from_dict degrading per-field instead of
+    raising."""
+    if not isinstance(value, list):
+        return []
+    return [v for v in value if isinstance(v, str)]
+
+
 def blocklist_reason(webpage_url: str, uploader: str, data: dict[str, Any]) -> str | None:
     """Returns a short human-readable reason the given track is blocked, or
     None if it isn't. `data` is whatever's currently in the blocklist
     JsonStore — {"tracks": [...normalize_track_key() keys...], "uploaders":
-    [...lowercased names...]}, tolerant of either key being absent (a fresh
-    store) or the wrong type (hand-edited file)."""
-    tracks = data.get("tracks")
-    uploaders = data.get("uploaders")
+    [...lowercased names...]}."""
+    tracks = clean_list(data.get("tracks"))
+    uploaders = clean_list(data.get("uploaders"))
     key = normalize_track_key(webpage_url)
-    if key is not None and isinstance(tracks, list) and key in tracks:
+    if key is not None and key in tracks:
         return "that track"
-    if isinstance(uploaders, list) and uploader.strip().lower() in uploaders:
+    if uploader.strip().lower() in uploaders:
         return f"uploader {uploader!r}"
     return None
 
 
 def add_track_block(data: dict[str, Any], key: str) -> dict[str, Any]:
-    tracks = set(data.get("tracks") or [])
+    tracks = set(clean_list(data.get("tracks")))
     tracks.add(key)
     return {**data, "tracks": sorted(tracks)}
 
 
 def remove_track_block(data: dict[str, Any], key: str) -> dict[str, Any]:
-    tracks = set(data.get("tracks") or [])
+    tracks = set(clean_list(data.get("tracks")))
     tracks.discard(key)
     return {**data, "tracks": sorted(tracks)}
 
 
 def add_uploader_block(data: dict[str, Any], name: str) -> dict[str, Any]:
-    uploaders = set(data.get("uploaders") or [])
+    uploaders = set(clean_list(data.get("uploaders")))
     uploaders.add(name.strip().lower())
     return {**data, "uploaders": sorted(uploaders)}
 
 
 def remove_uploader_block(data: dict[str, Any], name: str) -> dict[str, Any]:
-    uploaders = set(data.get("uploaders") or [])
+    uploaders = set(clean_list(data.get("uploaders")))
     uploaders.discard(name.strip().lower())
     return {**data, "uploaders": sorted(uploaders)}
 
 
 def counts(data: dict[str, Any]) -> tuple[int, int]:
-    tracks = data.get("tracks")
-    uploaders = data.get("uploaders")
-    return (
-        len(tracks) if isinstance(tracks, list) else 0,
-        len(uploaders) if isinstance(uploaders, list) else 0,
-    )
+    return len(clean_list(data.get("tracks"))), len(clean_list(data.get("uploaders")))

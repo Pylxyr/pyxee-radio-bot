@@ -220,9 +220,10 @@ line) in front instead of exposing the port directly.
 | `!nowplaying` / `!np` | anyone | Shows the current track and who requested it |
 | `!commands` / `!help` | anyone | Lists the commands above |
 | `!setlimit <key> <value>` | moderators | Adjusts one request-limit tunable live from chat — same keys/ranges as `/settings` below |
-| `!block <url or uploader>` | moderators | Blocks a specific track (by link) or every track from an uploader (by name) from being requested again |
+| `!block <url or uploader>` | moderators | Blocks a specific track (by link) or every track from an uploader (by name) from being requested again — a track block also pulls any already-queued copy of it out of the queue |
 | `!unblock <url or uploader>` | moderators | Reverses `!block` |
 | `!blocklist` | moderators | Shows how many tracks/uploaders are currently blocked |
+| `!clearqueue` | moderators | Empties the queue (doesn't touch whatever's currently playing — use `!skip` for that) |
 
 Request limits (max pending per chatter, cooldown, queue cap, max track
 length, vote-skip threshold) are live-adjustable from `/settings` without a
@@ -242,6 +243,9 @@ opening it up to a separate OBS machine.
 - `GET /ws/nowplaying` — WebSocket version of the above; the built-in
   overlay uses this and pushes on every change, falling back to polling
   `/nowplaying.json` if the connection is unavailable.
+- `GET /blocklist.json` — full contents of the moderation blocklist (the
+  `!blocklist` chat command only gives counts, to keep chat short). Gated
+  the same as `/settings` below.
 - `GET/POST /settings` — the tunables page. Gated by HTTP Basic Auth if
   `TWITCH_SETTINGS_PASSWORD` is set (any username, that password); see
   [Security](#security) for the protections around this endpoint.
