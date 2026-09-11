@@ -25,6 +25,19 @@ _MIN_BACKOFF = 5.0
 _MAX_BACKOFF = 300.0
 _STABLE_UPTIME_SECONDS = 30.0
 _DECODER_START_TIMEOUT = 20.0
+# Separate from _DECODER_START_TIMEOUT above: that one guards getting the
+# *first* chunk out of a freshly-spawned decoder; this one guards every
+# read for the rest of the track. Without it, a decoder that stops
+# producing output mid-track (source's connection drops, a CDN stalls,
+# ffmpeg itself hangs on a flaky socket) just sits in `await stdout.read()`
+# forever — no more audio is written to the encoder, !skip still works
+# (the decoder process is still there to kill), but nothing recovers on
+# its own and the stream just goes silent indefinitely until a mod
+# notices and skips it by hand. 20s is generous: normal chunks arrive
+# roughly every _CHUNK_DURATION thanks to ffmpeg's -re real-time pacing,
+# so a real 20s gap means the source is actually stuck, not just briefly
+# slow.
+_STALL_TIMEOUT_SECONDS = 20.0
 
 
 class TrackResolver(Protocol):
@@ -525,7 +538,15 @@ class RadioPlayer:
             while chunk:
                 encoder_stdin.write(chunk)
                 await encoder_stdin.drain()
-                chunk = await stdout.read(_CHUNK_BYTES)
+                try:
+                    chunk = await asyncio.wait_for(stdout.read(_CHUNK_BYTES), timeout=_STALL_TIMEOUT_SECONDS)
+                except TimeoutError:
+                    log.warning(
+                        "No audio from decoder for %.0fs (stalled source?) — skipping %s.",
+                        _STALL_TIMEOUT_SECONDS, request.webpage_url,
+                    )
+                    await self._notify(f"Skipped {request.requester_name}'s song — playback stalled.")
+                    break
         finally:
             with contextlib.suppress(ProcessLookupError):
                 decoder.kill()

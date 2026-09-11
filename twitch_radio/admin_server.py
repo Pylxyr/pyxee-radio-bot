@@ -187,9 +187,18 @@ function render(data, elapsed) {
 }
 
 function escapeHtml(s) {
-  const d = document.createElement('div');
-  d.textContent = s || '';
-  return d.innerHTML;
+  // Deliberately NOT the textContent/innerHTML round-trip trick — that
+  // only escapes &, <, > (correct for text-node content, which is most
+  // uses below) but leaves both quote characters untouched. thumbnail_url
+  // is spliced into an HTML *attribute* (style="...url('...')..."), where
+  // an un-escaped " can close the attribute early and inject a new one —
+  // e.g. a crafted thumbnail_url of `x" onmouseover="..."` would break out
+  // and run script. Escaping quotes here too makes this one function safe
+  // for both contexts, text and attribute, rather than silently depending
+  // on every call site happening to only ever use it as text.
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
 }
 
 async function poll() {

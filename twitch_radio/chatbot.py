@@ -102,6 +102,21 @@ _USAGE = {
     "unblock": "Usage: !unblock <YouTube/SoundCloud URL, or an uploader name>",
 }
 
+# Every @commands.is_moderator() below (and the manual `chatter.moderator`
+# check in skip()) also admits the broadcaster themselves, even though
+# is_moderator()'s own docstring reads as if it doesn't ("See also
+# is_elevated() to allow broadcaster, moderator, or VIP") — verified
+# directly against the actual pinned dependency: twitchio==3.3.2's
+# Chatter.moderator property is `_is_moderator or _is_lead_moderator or
+# self.broadcaster`, i.e. it already folds broadcaster status in. That
+# fallback isn't part of is_moderator()'s documented contract, so if a
+# future twitchio upgrade ever tightens .moderator to match its own
+# docstring, every mod-only command here would silently start rejecting
+# the broadcaster. If that ever happens, the fix is NOT
+# commands.is_elevated() (that also admits VIPs, a lower trust tier Twitch
+# doesn't grant moderation powers to) — it's a custom guard checking
+# `chatter.moderator or chatter.broadcaster` explicitly.
+
 
 class SongRequestComponent(commands.Component):
     def __init__(self, bot: TwitchChatBot) -> None:
@@ -144,7 +159,14 @@ class SongRequestComponent(commands.Component):
             try:
                 requester_id = int(ctx.chatter.id)
             except (TypeError, ValueError):
-                requester_id = 0
+                # Same "bail out, don't invent an identity" handling as
+                # !remove/!position/!voteskip below — falling back to a
+                # fixed sentinel (e.g. 0) here would let two different
+                # chatters who both hit this branch collide under the same
+                # fake requester_id, able to !skip/!remove each other's
+                # request.
+                await ctx.reply("Couldn't identify you — try again.")
+                return
 
             # Cheap pre-resolve check for a direct link to something already
             # blocked — skips the network round-trip entirely for the common
@@ -224,8 +246,9 @@ class SongRequestComponent(commands.Component):
 
     @commands.command(name="skip")
     # No @commands.is_moderator() guard — mods/broadcaster can always skip
-    # (checked manually below), but a chatter can also skip their own
-    # currently-playing request without mod status.
+    # (checked manually below; see the module-level comment above about
+    # .moderator already covering the broadcaster too), but a chatter can
+    # also skip their own currently-playing request without mod status.
     async def skip(self, ctx: commands.Context) -> None:
         chatter = ctx.chatter
         # ctx.chatter is Chatter | PartialUser; only Chatter has .moderator.
