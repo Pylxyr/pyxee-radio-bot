@@ -134,6 +134,16 @@ class RadioPlayer:
             return self._active_request.requester_id
         return None
 
+    @property
+    def active_webpage_url(self) -> str | None:
+        """Same idea as active_requester_id, but the URL — for duplicate-
+        request checks against whatever's currently playing or resolving."""
+        if self._now_playing is not None:
+            return self._now_playing.webpage_url
+        if self._active_request is not None:
+            return self._active_request.webpage_url
+        return None
+
     def queue_size(self) -> int:
         return self._queue.qsize()
 
@@ -547,6 +557,10 @@ class RadioPlayer:
                     )
                     await self._notify(f"Skipped {request.requester_name}'s song — playback stalled.")
                     break
+        except asyncio.CancelledError:
+            # now_playing is still set here; the finally below clears it.
+            await self._notify(f"{request.requester_name}'s song was cut off — reconnecting the stream.")
+            raise
         finally:
             with contextlib.suppress(ProcessLookupError):
                 decoder.kill()

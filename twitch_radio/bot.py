@@ -33,8 +33,7 @@ def configure_logging(settings: Settings) -> None:
     logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 
 
-async def _async_run() -> None:
-    settings = load_settings()
+async def _async_run(settings: Settings) -> None:
     configure_logging(settings)
     log = logging.getLogger(__name__)
 
@@ -109,6 +108,15 @@ async def _async_run() -> None:
         resolver.close()
 
 
+def _load_settings_or_exit() -> Settings:
+    import sys
+
+    try:
+        return load_settings()
+    except RuntimeError as exc:
+        sys.exit(f"Config check FAILED: {exc}")
+
+
 def run() -> None:
     import argparse
     import sys
@@ -123,7 +131,7 @@ def run() -> None:
 
     if args.check_config:
         sys.exit(_check_config())
-    asyncio.run(_async_run())
+    asyncio.run(_async_run(_load_settings_or_exit()))
 
 
 def _check_config() -> int:

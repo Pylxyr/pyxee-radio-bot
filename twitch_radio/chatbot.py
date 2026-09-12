@@ -76,6 +76,7 @@ from twitch_radio.blocklist import (
     add_uploader_block,
     blocklist_reason,
     counts as blocklist_counts,
+    looks_like_a_single_track,
     normalize_track_key,
     remove_track_block,
     remove_uploader_block,
@@ -208,6 +209,13 @@ class SongRequestComponent(commands.Component):
             reason = blocklist_reason(track.webpage_url, track.uploader, blocklist_data)
             if reason:
                 await ctx.reply(f"That's blocked by a moderator ({reason}).")
+                return
+
+            already_queued = track.webpage_url == self.bot.player.active_webpage_url or any(
+                item.webpage_url == track.webpage_url for item in self.bot.player.queued_items()
+            )
+            if already_queued:
+                await ctx.reply(f"{track.title} is already queued.")
                 return
 
             # Re-check the cap right before enqueuing (no await between this
@@ -344,8 +352,13 @@ class SongRequestComponent(commands.Component):
 
     @commands.command(name="queue")
     async def queue_cmd(self, ctx: commands.Context) -> None:
-        size = self.bot.player.queue_size()
-        await ctx.reply("Queue is empty." if size == 0 else f"{size} request(s) queued.")
+        items = self.bot.player.queued_items()
+        if not items:
+            await ctx.reply("Queue is empty.")
+            return
+        upcoming = ", ".join(item.title or "an unnamed track" for item in items[:3])
+        more = f" (+{len(items) - 3} more)" if len(items) > 3 else ""
+        await ctx.reply(f"{len(items)} queued: {upcoming}{more}")
 
     @commands.command(name="nowplaying", aliases=["np"])
     async def now_playing(self, ctx: commands.Context) -> None:
@@ -362,7 +375,8 @@ class SongRequestComponent(commands.Component):
         await ctx.reply(
             f"{p}sr <song/URL> — queue a song (YouTube/SoundCloud)  |  {p}skip / {p}voteskip — "
             f"skip it  |  {p}remove — pull back your request  |  {p}position — where you are in "
-            f"line  |  {p}queue  |  {p}nowplaying  |  mods: {p}setlimit, {p}block/{p}unblock, {p}clearqueue"
+            f"line  |  {p}queue  |  {p}nowplaying  |  mods: {p}setlimit, {p}block/{p}unblock, "
+            f"{p}blocklist, {p}clearqueue"
         )
 
     @commands.is_moderator()
@@ -425,6 +439,8 @@ class SongRequestComponent(commands.Component):
         tracks, uploaders = blocklist_counts(result)
         kind = "track" if key else f"uploader {target!r}"
         reply = f"Blocked that {kind}. ({tracks} tracks, {uploaders} uploaders blocked)"
+        if target.lower().startswith(("http://", "https://")) and not looks_like_a_single_track(target, key):
+            reply += " (Doesn't look like a single track link, so this won't match anything by URL.)"
 
         if key:
             purged = self.bot.player.purge_pending(lambda r: normalize_track_key(r.webpage_url) == key)

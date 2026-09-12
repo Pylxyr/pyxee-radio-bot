@@ -8,6 +8,13 @@ _YOUTUBE_ID_RE = re.compile(r"^[\w-]{11}$")
 
 _YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}
 _SOUNDCLOUD_HOSTS = {"soundcloud.com", "www.soundcloud.com", "m.soundcloud.com"}
+# SoundCloud profile tabs — /artist/<one of these> is 2 path segments too,
+# same shape as a real /artist/track-slug link, so the segment count alone
+# can't tell them apart.
+_SOUNDCLOUD_RESERVED_SEGMENTS = {
+    "tracks", "albums", "sets", "likes", "reposts", "comments",
+    "followers", "following", "popular-tracks",
+}
 
 
 def normalize_track_key(url: str) -> str | None:
@@ -46,6 +53,20 @@ def normalize_track_key(url: str) -> str | None:
         return f"sc:{path}" if path else None
 
     return None
+
+
+def looks_like_a_single_track(url: str, key: str | None) -> bool:
+    """False for a URL-shaped !block target that won't usefully match
+    anything: a YouTube playlist/channel link (key is None — no video ID
+    to extract) or a SoundCloud profile/set/tab link (key isn't None,
+    since normalize_track_key() keys SoundCloud by raw path regardless of
+    shape — a real track path is exactly two segments, /artist/track)."""
+    if key is None:
+        return False
+    if key.startswith("sc:"):
+        segments = [s for s in urlsplit(url.strip()).path.split("/") if s]
+        return len(segments) == 2 and segments[1].lower() not in _SOUNDCLOUD_RESERVED_SEGMENTS
+    return True
 
 
 def clean_list(value: Any) -> list[str]:
