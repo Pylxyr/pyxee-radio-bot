@@ -83,6 +83,7 @@ from twitch_radio.blocklist import (
 )
 from twitch_radio.extraction import UnsupportedSourceError
 from twitch_radio.player import QueuedRequest, RadioPlayer
+from twitch_radio.specs import PCSpecs, Peripherals
 from twitch_radio.store import JsonStore
 from twitch_radio.tunables import TUNABLE_BOUNDS, TwitchTunables
 
@@ -133,24 +134,18 @@ class SongRequestComponent(commands.Component):
         chatter_key = str(ctx.chatter.id)
         tunables = TwitchTunables.from_dict(await self.bot.tunables_store.read())
         now = time.monotonic()
-        # .moderator already covers the broadcaster too (see the guard note
-        # further down in this file) — mods/broadcaster skip the cooldown
-        # and per-chatter pending cap below, everyone still shares the same
-        # queue_cap and duration cap (those protect shared airtime/memory,
-        # not just spam).
-        is_elevated = isinstance(ctx.chatter, Chatter) and ctx.chatter.moderator
 
         # No `await` between checking limits and reserving the slot below —
         # keeps check-and-reserve atomic so rapid-fire !sr can't race past
         # the cooldown/pending/queue caps before the resolver's network call.
         last = self.bot.last_request_at.get(chatter_key, 0.0)
-        if not is_elevated and tunables.request_cooldown_seconds > 0 and (now - last) < tunables.request_cooldown_seconds:
+        if tunables.request_cooldown_seconds > 0 and (now - last) < tunables.request_cooldown_seconds:
             remaining = tunables.request_cooldown_seconds - (now - last)
             await ctx.reply(f"Slow down — try again in {remaining:.0f}s.")
             return
 
         pending = self.bot.pending_by_chatter.get(chatter_key, 0)
-        if not is_elevated and pending >= tunables.max_pending_per_chatter:
+        if pending >= tunables.max_pending_per_chatter:
             await ctx.reply(f"You already have {pending} request(s) queued — wait for one to play first.")
             return
 
@@ -375,14 +370,35 @@ class SongRequestComponent(commands.Component):
         elapsed = max(0, int(time.monotonic() - np.started_at))
         await ctx.reply(f"Now playing: {np.title} — requested by {np.requester_name} ({elapsed}s in)")
 
+    @commands.command(name="specs")
+    async def specs_cmd(self, ctx: commands.Context) -> None:
+        """Shows the streamer's PC specs — set from the /settings page,
+        not from chat (there's nothing to type here beyond !specs itself)."""
+        specs = PCSpecs.from_dict(await self.bot.specs_store.read())
+        lines = specs.display_lines()
+        if not lines:
+            await ctx.reply("Specs haven't been set up yet.")
+            return
+        await ctx.reply(" | ".join(lines))
+
+    @commands.command(name="peripherals", aliases=["periphs"])
+    async def peripherals_cmd(self, ctx: commands.Context) -> None:
+        """Shows the streamer's peripherals — same deal as !specs above."""
+        peripherals = Peripherals.from_dict(await self.bot.specs_store.read())
+        lines = peripherals.display_lines()
+        if not lines:
+            await ctx.reply("Peripherals haven't been set up yet.")
+            return
+        await ctx.reply(" | ".join(lines))
+
     @commands.command(name="commands", aliases=["help"])
     async def commands_list(self, ctx: commands.Context) -> None:
         p = self.bot.prefix
         await ctx.reply(
             f"{p}sr <song/URL> — queue a song (YouTube/SoundCloud)  |  {p}skip / {p}voteskip — "
             f"skip it  |  {p}remove — pull back your request  |  {p}position — where you are in "
-            f"line  |  {p}queue  |  {p}nowplaying  |  mods: {p}setlimit, {p}block/{p}unblock, "
-            f"{p}blocklist, {p}clearqueue"
+            f"line  |  {p}queue  |  {p}nowplaying  |  {p}specs  |  {p}peripherals  |  mods: "
+            f"{p}setlimit, {p}block/{p}unblock, {p}blocklist, {p}clearqueue"
         )
 
     @commands.is_moderator()
@@ -508,6 +524,7 @@ class TwitchChatBot(commands.Bot):
         player: RadioPlayer,
         tunables_store: JsonStore,
         blocklist_store: JsonStore,
+        specs_store: JsonStore,
         token_storage_path: Path,
     ) -> None:
         super().__init__(
@@ -521,6 +538,7 @@ class TwitchChatBot(commands.Bot):
         self.player = player
         self.tunables_store = tunables_store
         self.blocklist_store = blocklist_store
+        self.specs_store = specs_store
         self.prefix = prefix
         self._owner_id = owner_id
         self._bot_id = bot_id
