@@ -139,7 +139,7 @@ function render(data, elapsed) {
       lastThumb = data.thumbnail_url;
       applyAccent(data.thumbnail_url);
     }
-    
+
     const thumb = data.thumbnail_url ? `style="background-image:url('${escapeHtml(data.thumbnail_url)}')"` : '';
     const next = (data.queue || []).slice(0, 2)
       .map(q => `<div class="next-item">${escapeHtml(q.title)}</div>`).join('');
@@ -158,7 +158,7 @@ function render(data, elapsed) {
       </div>
       ${next ? `<div class="next"><div class="next-label">Up next</div>${next}</div>` : ''}
     `;
-    
+
     requestAnimationFrame(() => {
       const t = document.getElementById('t-title');
       if (t) t.style.opacity = '1';

@@ -133,18 +133,24 @@ class SongRequestComponent(commands.Component):
         chatter_key = str(ctx.chatter.id)
         tunables = TwitchTunables.from_dict(await self.bot.tunables_store.read())
         now = time.monotonic()
+        # .moderator already covers the broadcaster too (see the guard note
+        # further down in this file) — mods/broadcaster skip the cooldown
+        # and per-chatter pending cap below, everyone still shares the same
+        # queue_cap and duration cap (those protect shared airtime/memory,
+        # not just spam).
+        is_elevated = isinstance(ctx.chatter, Chatter) and ctx.chatter.moderator
 
         # No `await` between checking limits and reserving the slot below —
         # keeps check-and-reserve atomic so rapid-fire !sr can't race past
         # the cooldown/pending/queue caps before the resolver's network call.
         last = self.bot.last_request_at.get(chatter_key, 0.0)
-        if tunables.request_cooldown_seconds > 0 and (now - last) < tunables.request_cooldown_seconds:
+        if not is_elevated and tunables.request_cooldown_seconds > 0 and (now - last) < tunables.request_cooldown_seconds:
             remaining = tunables.request_cooldown_seconds - (now - last)
             await ctx.reply(f"Slow down — try again in {remaining:.0f}s.")
             return
 
         pending = self.bot.pending_by_chatter.get(chatter_key, 0)
-        if pending >= tunables.max_pending_per_chatter:
+        if not is_elevated and pending >= tunables.max_pending_per_chatter:
             await ctx.reply(f"You already have {pending} request(s) queued — wait for one to play first.")
             return
 

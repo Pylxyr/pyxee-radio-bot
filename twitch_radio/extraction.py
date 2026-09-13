@@ -154,9 +154,20 @@ class Resolver:
             # ReadWritePaths without any deploy changes.
             "cache_dir": str(DATA_DIR / "yt-dlp-cache"),
         }
-        extractor_args: dict[str, dict[str, list[str]]] = {}
+        extractor_args: dict[str, dict[str, list[str]]] = {
+            # Trims two of the several sequential requests YouTube's normal
+            # extraction makes per video: the webpage itself, and each
+            # player client's separate "config" call — neither is needed
+            # for the metadata (title/uploader/duration/thumbnail) or
+            # signature deciphering this bot actually uses; both come from
+            # the player API response already being fetched regardless.
+            # Deliberately NOT skipping 'js' (the third, related option) —
+            # that disables signature deciphering entirely and silently
+            # breaks some formats/qualities rather than just saving time.
+            "youtube": {"player_skip": ["webpage", "configs"]},
+        }
         if self._settings.ytdlp_player_client:
-            extractor_args["youtube"] = {"player_client": list(self._settings.ytdlp_player_client)}
+            extractor_args["youtube"]["player_client"] = list(self._settings.ytdlp_player_client)
         if self._settings.ytdlp_pot_provider_url:
             # Passed straight through to the bgutil-ytdlp-pot-provider
             # plugin, if installed — see README's cookies/PO-token note.
