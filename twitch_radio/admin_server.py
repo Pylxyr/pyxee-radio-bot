@@ -42,9 +42,9 @@ _OVERLAY_HTML = """<!doctype html>
   }
   .panel {
     width: 420px; padding: 14px 18px;
-    background: rgba(15, 17, 23, 0.82);
+    background: #0F1117; /* Fixed: Solid opaque background instead of rgba */
     border-radius: 16px;
-    backdrop-filter: blur(6px);
+    /* Fixed: backdrop-filter removed as it is obsolete on an opaque background */
     box-shadow: 0 8px 24px rgba(0,0,0,0.35);
     --accent: #E8A33D;
   }
@@ -106,8 +106,7 @@ function applyAccent(url) {
         r += px[i]; g += px[i + 1]; b += px[i + 2]; n++;
       }
       r = Math.round(r / n); g = Math.round(g / n); b = Math.round(b / n);
-      // Boost toward legible against the dark panel — thumbnail averages
-      // skew muddy otherwise.
+      // Boost toward legible against the dark panel
       const max = Math.max(r, g, b) || 1;
       const boost = 255 / max * 0.75;
       r = Math.min(255, Math.round(r * boost + 40));
@@ -115,12 +114,12 @@ function applyAccent(url) {
       b = Math.min(255, Math.round(b * boost + 40));
       panel.style.setProperty('--accent', `rgb(${r},${g},${b})`);
     } catch (e) {
-      // Tainted canvas (CDN didn't send permissive CORS headers) — keep
-      // whatever accent is already set rather than breaking the overlay.
+      // Tainted canvas block
     }
   };
   img.onerror = () => {};
-  img.src = url;
+  // Fixed: Append a timestamp cache-buster to prevent canvas tainting from cached CSS backgrounds
+  img.src = url + (url.indexOf('?') !== -1 ? '&' : '?') + 'cb=' + Date.now();
 }
 
 function render(data, elapsed) {
@@ -140,16 +139,7 @@ function render(data, elapsed) {
       lastThumb = data.thumbnail_url;
       applyAccent(data.thumbnail_url);
     }
-    // escapeHtml() here (not just on title/uploader/requester_name below)
-    // because this string gets spliced directly into an HTML attribute,
-    // not set via .textContent — an unescaped thumbnail_url containing a
-    // stray quote could break out of the style="..." attribute and inject
-    // markup. title/uploader/requester_name are effectively free-text
-    // (YouTube titles, Twitch display names); thumbnail_url is normally a
-    // YouTube-generated CDN URL, but !sr accepts arbitrary yt-dlp-supported
-    // URLs from any chatter, and some extractors pull thumbnail URLs from
-    // page metadata the target site's owner controls — escape it the same
-    // as everything else rather than trusting the source.
+    
     const thumb = data.thumbnail_url ? `style="background-image:url('${escapeHtml(data.thumbnail_url)}')"` : '';
     const next = (data.queue || []).slice(0, 2)
       .map(q => `<div class="next-item">${escapeHtml(q.title)}</div>`).join('');
@@ -168,17 +158,13 @@ function render(data, elapsed) {
       </div>
       ${next ? `<div class="next"><div class="next-label">Up next</div>${next}</div>` : ''}
     `;
-    // Rebuilt fresh above, so opacity starts at 0 — nudge it to 1 on the
-    // next frame so the CSS transition actually has something to animate.
+    
     requestAnimationFrame(() => {
       const t = document.getElementById('t-title');
       if (t) t.style.opacity = '1';
     });
   }
 
-  // Runs every frame (~60/sec via tick()) — only touch the two nodes that
-  // actually change per-frame, not a full innerHTML rebuild, which would
-  // wipe out the thumbnail/title/fade-in above 60 times a second.
   const pct = data.duration_seconds > 0 ? Math.min(100, (elapsed / data.duration_seconds) * 100) : 0;
   const fillEl = document.getElementById('t-fill');
   const elapsedEl = document.getElementById('t-elapsed');
@@ -187,32 +173,18 @@ function render(data, elapsed) {
 }
 
 function escapeHtml(s) {
-  // Deliberately NOT the textContent/innerHTML round-trip trick — that
-  // only escapes &, <, > (correct for text-node content, which is most
-  // uses below) but leaves both quote characters untouched. thumbnail_url
-  // is spliced into an HTML *attribute* (style="...url('...')..."), where
-  // an un-escaped " can close the attribute early and inject a new one —
-  // e.g. a crafted thumbnail_url of `x" onmouseover="..."` would break out
-  // and run script. Escaping quotes here too makes this one function safe
-  // for both contexts, text and attribute, rather than silently depending
-  // on every call site happening to only ever use it as text.
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[c]));
 }
 
 async function poll() {
-  // Fallback path only — the WebSocket connection below is the primary
-  // source of truth and pushes a fresh snapshot on every change; this just
-  // keeps the overlay working if WebSocket is unavailable or its
-  // connection is currently down (skipped while it's open, so it's a
-  // once-per-2s no-op fetch the rest of the time, not real polling).
   if (ws && ws.readyState === WebSocket.OPEN) return;
   try {
     const res = await fetch('/nowplaying.json');
     last = await res.json();
     lastFetchedAt = performance.now();
-  } catch (e) { /* keep showing the last known state */ }
+  } catch (e) { }
 }
 
 let ws = null;
@@ -222,8 +194,6 @@ function connectWs() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     socket = new WebSocket(`${proto}//${location.host}/ws/nowplaying`);
   } catch (e) {
-    // No WebSocket support at all (unlikely, but some embedded browser
-    // sources are old) — poll() above just keeps running unattended.
     return;
   }
   ws = socket;
@@ -231,7 +201,7 @@ function connectWs() {
     try {
       last = JSON.parse(ev.data);
       lastFetchedAt = performance.now();
-    } catch (e) { /* malformed frame — next one (or the poll() backstop) recovers */ }
+    } catch (e) { }
   };
   socket.onclose = () => { if (ws === socket) ws = null; setTimeout(connectWs, 2000); };
   socket.onerror = () => { try { socket.close(); } catch (e) {} };
@@ -251,7 +221,6 @@ setInterval(poll, 2000);
 tick();
 </script>
 </body></html>"""
-
 
 class _AuthRateLimiter:
     """Basic Auth has no built-in lockout — without this, /settings is
