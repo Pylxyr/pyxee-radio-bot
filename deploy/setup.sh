@@ -47,6 +47,15 @@ trim() {  # pure-bash whitespace trim — no external command, safe with any con
   printf '%s' "${s}"
 }
 
+detect_cloud_vm() {  # exit 0 if this looks like a cloud/datacenter VM
+  # 169.254.169.254 is the link-local cloud-metadata IP used by AWS, GCP,
+  # Azure, Oracle Cloud, DigitalOcean, and most others — unreachable on a
+  # residential/home connection. Any HTTP response at all (even 401/403,
+  # so deliberately no -f here) means something answered there, which is
+  # signal enough; a closed connection or timeout means it didn't.
+  curl -s -m 2 -o /dev/null http://169.254.169.254/ 2>/dev/null
+}
+
 REQUIRED_ENV_KEYS=(TWITCH_CLIENT_ID TWITCH_CLIENT_SECRET TWITCH_BOT_ID TWITCH_OWNER_ID)
 
 missing_required_env() {  # prints each still-blank required key, one per line
@@ -379,13 +388,32 @@ else
 
   echo ""
   echo "${CYAN}-- yt-dlp --${RESET}"
-  prompt_optional_field YTDLP_COOKIES_FILE "" 0 0 \
-    "— Leave blank on a residential connection. On a cloud VM, YouTube" \
-    "    often blocks anonymous requests ('Sign in to confirm you're not a" \
-    "    bot') and this is the simplest fix — a REAL cookies.txt from a" \
-    "    logged-in browser session (empty/placeholder makes it worse). MUST" \
-    "    be a path under data/ (e.g. data/cookies.txt) — anywhere else" \
-    "    crashes every !sr (read-only fs under this service's sandbox)."
+  if detect_cloud_vm; then
+    warn "This looks like a cloud/datacenter VM (a metadata service answered"
+    warn "at 169.254.169.254). YouTube commonly blocks plain requests from"
+    warn "datacenter IPs outright — expect !sr to fail with \"Sign in to"
+    warn "confirm you're not a bot\" without cookies set up below."
+    cookies_desc=(
+      "— Detected as likely needed (see warning above). A REAL cookies.txt"
+      "    from a logged-in browser session — export one now if you have a"
+      "    browser handy (private/incognito window, log into YouTube,"
+      "    export with a browser extension), or leave blank and come back"
+      "    once !sr actually fails (empty/placeholder file makes things"
+      "    worse, not better). MUST be a path under data/ (e.g."
+      "    data/cookies.txt) — anywhere else crashes every !sr (read-only"
+      "    fs under this service's sandbox)."
+    )
+  else
+    cookies_desc=(
+      "— Leave blank on a residential connection. On a cloud VM, YouTube"
+      "    often blocks anonymous requests ('Sign in to confirm you're not a"
+      "    bot') and this is the simplest fix — a REAL cookies.txt from a"
+      "    logged-in browser session (empty/placeholder makes it worse). MUST"
+      "    be a path under data/ (e.g. data/cookies.txt) — anywhere else"
+      "    crashes every !sr (read-only fs under this service's sandbox)."
+    )
+  fi
+  prompt_optional_field YTDLP_COOKIES_FILE "" 0 0 "${cookies_desc[@]}"
   prompt_optional_field YTDLP_POT_PROVIDER_URL "" 0 0 \
     "— Advanced, cloud-VM alternative to cookies: URL of a local bgutil-" \
     "    ytdlp-pot-provider instance (see README) if you've set one up." \

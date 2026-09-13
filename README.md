@@ -124,9 +124,19 @@ app on the phone.
    **Use two separate browser sessions** (e.g. a normal window + a private/
    incognito one) — reusing the same logged-in session for both authorizes
    the SAME account twice with no error, and chat just silently doesn't
-   work afterward. The bot checks for exactly this at startup and logs
-   which account, if either, is missing a token — check `journalctl -u
-   twitch-radio -f -o cat` right after starting if `!sr` doesn't respond.
+   work afterward. The bot checks for exactly this on every token save and
+   logs which account, if either, is missing a token — check `journalctl
+   -u twitch-radio -f -o cat` right after starting if `!sr` doesn't
+   respond.
+
+   Chat comes online automatically the moment both accounts are
+   authorized — no restart needed. If you started the service *before*
+   doing this step (step 2 above), you'll see a "no token yet" warning in
+   the log at first; that's expected, and it clears itself as soon as the
+   second OAuth step above completes. (If you're on a version from before
+   this was fixed, or `!sr` still doesn't respond a minute or two after
+   finishing both steps, `sudo systemctl restart twitch-radio` is the
+   fallback.)
 
    Tokens save to `data/twitch_tokens.json`, reloaded on every future start.
 
@@ -157,22 +167,38 @@ track boundaries).
 
 ## Running the bot on a separate machine from OBS
 
-Common case: a cloud VM running the bot, OBS on your own PC. `setup.sh`'s
-wizard asks about this directly (host, port, a settings password, your
-public IP, and the exact firewall commands to run) — this section is the
-manual/reference version of the same steps, for editing `.env` by hand or
-if the wizard's auto-detected IP didn't work out.
+Common case: a cloud VM running the bot, OBS on your own PC. Two ways to
+reach it from OBS:
 
-**On Termux, this section doesn't apply the same way.** There's no cloud
-firewall or public IP involved — `setup_termux.sh` detects the phone's
-*local network* IP instead, and the realistic setup is OBS on a computer
-on the same Wi-Fi as the phone (`http://<phone's-local-IP>:8098/stream.mp3`).
-Reaching it from outside that Wi-Fi network (cellular data instead of
-Wi-Fi, or an OBS box elsewhere on the internet) isn't the same problem as
-opening a cloud firewall port — most mobile carriers block inbound
-connections outright (CGNAT), so the steps below generally won't apply; a
-tunneling tool (e.g. Tailscale, or Cloudflare Tunnel) is the realistic
-option if you need that.
+- **Option A: open the port** — set up once, works forever after. The
+  stream and overlay become reachable by anyone who finds the IP:port (no
+  login wall beyond `/settings`' optional password) — but that's a music
+  stream and a "now playing" overlay, not sensitive data, so for the
+  common case of "I stream regularly and don't want a pre-stream ritual",
+  **this is the one to use.**
+- **Option B: SSH tunnel** — nothing is exposed to the internet at all,
+  but the tunnel has to be reconnected and left running every single time
+  you go live. Worth it specifically if you'd rather nothing about this
+  server be reachable from the open internet at all, even a music stream;
+  overkill otherwise.
+
+**On Termux, neither applies the same way.** There's no cloud firewall or
+public IP involved — `setup_termux.sh` detects the phone's *local network*
+IP instead, and the realistic setup is OBS on a computer on the same
+Wi-Fi as the phone (`http://<phone's-local-IP>:8098/stream.mp3`). Reaching
+it from outside that Wi-Fi (cellular data, or an OBS box elsewhere on the
+internet) isn't the same problem as opening a cloud firewall port — most
+mobile carriers block inbound connections outright (CGNAT), so Option A
+below generally won't work; Option B (SSH, if Termux's `sshd` is set up)
+or a tunneling tool (Tailscale, Cloudflare Tunnel) are the realistic
+options.
+
+### Option A: open the port
+
+`setup.sh`'s wizard asks about this directly (host, port, a settings
+password, your public IP, and the exact firewall commands to run) — this
+is the manual/reference version of the same steps, for editing `.env` by
+hand or if the wizard's auto-detected IP didn't work out.
 
 1. In `.env`, set `TWITCH_NOWPLAYING_HOST=0.0.0.0` and set
    `TWITCH_SETTINGS_PASSWORD` to something (a startup warning fires if you
@@ -197,8 +223,8 @@ option if you need that.
      Double-check the SSH rule is still there before disconnecting — a
      mistake here can lock you out. `sudo iptables -L INPUT -n --line-numbers`
      to inspect the live rules.
-3. Find your public IP if you need it: `curl ifconfig.me`, or your cloud
-   console.
+3. Find your public IP if you need it: `curl ifconfig.me` (run on the VM),
+   or your cloud console.
 4. Restart the service, then point OBS at
    `http://<VM's public IP>:8098/stream.mp3` and `.../overlay`.
 
@@ -206,6 +232,59 @@ This surface has no TLS. Fine for audio/overlay; if you'd rather not send
 the `/settings` Basic Auth password in cleartext over the open internet,
 put a reverse proxy (e.g. Caddy, which gets you free automatic HTTPS in one
 line) in front instead of exposing the port directly.
+
+### Option B: SSH tunnel (nothing exposed to the internet)
+
+No cloud firewall rule, no OS firewall edit, no public IP needed — the
+connection rides over the same SSH session you already use to manage the
+VM (and the same one the one-time OAuth step's `-L 4343:...` tunnel used).
+`TWITCH_NOWPLAYING_HOST` can stay at its default (`127.0.0.1`) since OBS
+never actually talks to the VM directly.
+
+**What you need, and where to find it:**
+
+- **The VM's public IP** — OCI Console → *Compute → Instances* → your
+  instance → *Public IP Address* on the instance details page. (Or
+  `curl ifconfig.me` run *on* the VM over an existing SSH session.)
+- **The SSH username** — whatever you're already using to SSH in for
+  everything else (check your existing SSH command/script — it's the
+  same one). On Oracle's stock Ubuntu images this is `ubuntu` unless you
+  changed it when creating the instance.
+- **A private key** — if OCI set you up with key-based auth (the default
+  when you create an instance — you either supplied your own public key or
+  downloaded a generated key pair at creation time), you need that private
+  key file (`.key`/`.pem`). If you're instead using a password, drop the
+  `-i` flag below and SSH will prompt for it.
+- No ingress rule needed in the VCN Security List/NSG for port 8098 at
+  all — only port 22 (SSH) has to be open, which it already is for you to
+  be managing the VM in the first place.
+
+**The tunnel command** — this is your existing OAuth-step tunnel with one
+more `-L` added for the audio/overlay port:
+
+```bash
+ssh -i "/path/to/your-key.pem" -L 4343:localhost:4343 -L 8098:localhost:8098 ubuntu@<VM_PUBLIC_IP>
+```
+
+(Windows: the same command works as-is in `cmd`/PowerShell with OpenSSH,
+which ships built in on Windows 10/11 — this is exactly the `.bat` script
+pattern if you already have one for the OAuth step, just with the extra
+`-L 8098:localhost:8098`.)
+
+While that session is connected, point OBS at `http://localhost:8098/stream.mp3`
+and `http://localhost:8098/overlay` — **not** the VM's public IP; the
+tunnel is what makes `localhost:8098` on your machine actually reach the
+VM's port 8098.
+
+**The catch:** the tunnel has to stay connected for the whole stream — if
+it drops (laptop sleeps, Wi-Fi blips, SSH times out), OBS's audio/overlay
+sources just go silent/blank until you reconnect it, with nothing in the
+bot's own logs to explain why (from the bot's side, nothing went wrong —
+its local port is still fine). If that's happened to you, adding
+`-o ServerAliveInterval=30 -o ServerAliveCountMax=3` to the command above
+makes SSH itself notice and close a dead connection quickly instead of
+hanging silently; reconnecting is still a manual re-run of the command
+unless you wrap it in something like `autossh` for automatic reconnects.
 
 ## Commands (in Twitch chat)
 

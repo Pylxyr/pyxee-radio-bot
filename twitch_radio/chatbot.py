@@ -519,6 +519,13 @@ class TwitchChatBot(commands.Bot):
         self._owner_id = owner_id
         self._bot_id = bot_id
         self._token_storage_path = token_storage_path
+        # Set once subscribe_websocket() succeeds — save_tokens() retries
+        # the subscription on every call until this is True, so completing
+        # OAuth (or fixing a scope problem) while the bot's already running
+        # takes effect immediately instead of needing a restart. Guards
+        # against re-subscribing on every later token *refresh* too, which
+        # save_tokens() is also called for.
+        self._chat_subscribed = False
         # Per-chatter state — deliberately in-memory only (not persisted):
         # losing cooldown/pending tracking across a restart is harmless (worst
         # case someone gets one extra request right after a restart), and
@@ -547,9 +554,25 @@ class TwitchChatBot(commands.Bot):
         # the umask at the time.
         with contextlib.suppress(OSError):
             Path(target).chmod(0o600)
+        # Called both right after the OAuth callback saves a fresh token
+        # and on every routine background refresh of an existing one —
+        # _try_subscribe_chat() is a no-op once already subscribed, so this
+        # is what makes completing OAuth while the bot's already running
+        # work without a restart.
+        await self._try_subscribe_chat()
 
-    async def setup_hook(self) -> None:
-        await self.add_component(SongRequestComponent(self))
+    def _oauth_complete(self) -> bool:
+        if not self._token_storage_path.exists():
+            return False
+        try:
+            saved_ids = set(json.loads(self._token_storage_path.read_text(encoding="utf-8")))
+        except Exception:
+            return False
+        return self._bot_id in saved_ids and self._owner_id in saved_ids
+
+    async def _try_subscribe_chat(self) -> None:
+        if self._chat_subscribed:
+            return
         self._log_token_diagnostics()
         subscription = eventsub.ChatMessageSubscription(
             broadcaster_user_id=self._owner_id,
@@ -558,23 +581,28 @@ class TwitchChatBot(commands.Bot):
         try:
             await self.subscribe_websocket(payload=subscription)
             log.info("Subscribed to chat messages for broadcaster=%s bot=%s", self._owner_id, self._bot_id)
+            self._chat_subscribed = True
         except Exception as e:
-            if self._token_storage_path.exists():
+            if self._oauth_complete():
                 log.exception(
-                    "Chat subscription failed even though %s exists — chat commands won't work "
-                    "until this is fixed. See the token diagnostics logged above, or redo the "
-                    "OAuth steps in README.md with &force_verify=true if a token was revoked or "
-                    "scopes changed. Error: %s",
-                    self._token_storage_path,
+                    "Chat subscription failed even though both accounts have saved tokens — "
+                    "chat commands won't work until this is fixed. See the token diagnostics "
+                    "logged above, or redo the OAuth steps in README.md with &force_verify=true "
+                    "if a token was revoked or scopes changed. Error: %s",
                     e,
                 )
             else:
                 log.warning(
-                    "Skipping chat subscription — no token file yet at %s (expected before the "
-                    "one-time OAuth steps in README.md are done): %s",
+                    "Skipping chat subscription for now — the one-time OAuth steps in "
+                    "README.md aren't done for both accounts yet at %s. Will retry "
+                    "automatically as soon as a token is saved, no restart needed. Error: %s",
                     self._token_storage_path,
                     e,
                 )
+
+    async def setup_hook(self) -> None:
+        await self.add_component(SongRequestComponent(self))
+        await self._try_subscribe_chat()
 
     def _log_token_diagnostics(self) -> None:
         # Catches the single most common cause of "OAuth said success but
