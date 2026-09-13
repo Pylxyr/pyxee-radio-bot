@@ -142,6 +142,7 @@ class Settings:
     token_path: Path
     tunables_path: Path
     blocklist_path: Path
+    specs_path: Path
 
     # yt-dlp
     ytdlp_cookies_file: Path | None
@@ -226,6 +227,7 @@ def load_settings() -> Settings:
         token_path=DATA_DIR / os.getenv("TWITCH_TOKEN_FILE", "twitch_tokens.json").strip(),
         tunables_path=DATA_DIR / os.getenv("TWITCH_TUNABLES_FILE", "tunables.json").strip(),
         blocklist_path=DATA_DIR / os.getenv("TWITCH_BLOCKLIST_FILE", "blocklist.json").strip(),
+        specs_path=DATA_DIR / os.getenv("TWITCH_SPECS_FILE", "specs.json").strip(),
         ytdlp_cookies_file=cookies_path,
         ytdlp_js_runtime_path=os.getenv("YTDLP_JS_RUNTIME_PATH", "").strip() or None,
         ytdlp_js_runtime_name=os.getenv("YTDLP_JS_RUNTIME_NAME", "deno").strip() or "deno",
