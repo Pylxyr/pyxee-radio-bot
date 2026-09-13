@@ -506,7 +506,18 @@ class RadioPlayer:
             log.info("Now playing: %s (requested by %s)", track.title, request.requester_name)
 
             decoder = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-re", "-i", track.stream_url,
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                # Without these, a dropped/hiccuping CDN connection just
+                # corrupts the stream instead of recovering — the likely
+                # cause of the "Error parsing Opus packet header" lines
+                # seen in the logs. -probesize/-analyzeduration also cut
+                # ffmpeg's own startup latency by skipping its default
+                # multi-second format probe before it starts producing
+                # output. Matches PyxeeBot's FFMPEG_BEFORE_OPTIONS.
+                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+                "-reconnect_on_network_error", "1", "-reconnect_on_http_error", "429,500,502,503,504",
+                "-probesize", "128k", "-analyzeduration", "0",
+                "-re", "-i", track.stream_url,
                 "-f", "s16le", "-ar", str(AUDIO_RATE), "-ac", str(AUDIO_CHANNELS), "-",
                 stdout=asyncio.subprocess.PIPE,
             )
