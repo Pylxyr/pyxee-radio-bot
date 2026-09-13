@@ -297,6 +297,8 @@ unless you wrap it in something like `autossh` for automatic reconnects.
 | `!position` / `!pos` | anyone | Shows where your request(s) sit in the queue |
 | `!queue` | anyone | Shows how many requests are queued |
 | `!nowplaying` / `!np` | anyone | Shows the current track and who requested it |
+| `!specs` | anyone | Shows the streamer's PC specs (set from `/settings`, not from chat) |
+| `!peripherals` / `!periphs` | anyone | Shows the streamer's peripherals (set from `/settings`, not from chat) |
 | `!commands` / `!help` | anyone | Lists the commands above |
 | `!setlimit <key> <value>` | moderators | Adjusts one request-limit tunable live from chat — same keys/ranges as `/settings` below |
 | `!block <url or uploader>` | moderators | Blocks a specific track (by link) or every track from an uploader (by name) from being requested again — a track block also pulls any already-queued copy of it out of the queue |
@@ -310,6 +312,12 @@ restart, or from chat via `!setlimit` (moderators only) — e.g. `!setlimit
 queue_cap 100`. Valid keys: `max_pending_per_chatter`,
 `request_cooldown_seconds`, `queue_cap`, `max_request_duration_seconds`,
 `vote_skip_threshold`.
+
+PC specs (CPU, cooler, GPU, RAM, motherboard, PSU, case) and peripherals
+(mouse, monitor, keyboard, IEM/headset, controller) shown by `!specs` and
+`!peripherals` are set from `/settings` too — there's no chat command to
+change them, only to view them. Every field is optional; a field left
+blank is simply left out of the chat reply rather than shown as empty.
 
 ## The local HTTP surface
 
@@ -375,6 +383,7 @@ twitch-radio-bot/
     ├── extraction.py             # yt-dlp resolver + short-lived cache (YouTube/SoundCloud only)
     ├── store.py                  # atomic JSON persistence
     ├── tunables.py                # TwitchTunables dataclass
+    ├── specs.py                   # PCSpecs/Peripherals dataclasses (!specs, !peripherals)
     ├── blocklist.py               # moderation blocklist normalization/lookup
     ├── player.py                  # RadioPlayer: MP3 encoder + subscriber fan-out, gapless queue
     ├── chatbot.py                 # TwitchChatBot + SongRequestComponent
