@@ -40,6 +40,7 @@ async def _async_run(settings: Settings) -> None:
     resolver = Resolver(settings)
     tunables_store = JsonStore(settings.tunables_path)
     blocklist_store = JsonStore(settings.blocklist_path)
+    specs_store = JsonStore(settings.specs_path)
 
     player = RadioPlayer(
         resolver=resolver.resolve,
@@ -56,6 +57,7 @@ async def _async_run(settings: Settings) -> None:
             player=player,
             tunables_store=tunables_store,
             blocklist_store=blocklist_store,
+            specs_store=specs_store,
             settings_password=settings.settings_password,
             broadcast_info={
                 "Audio stream": "/stream.mp3",
@@ -77,6 +79,7 @@ async def _async_run(settings: Settings) -> None:
                 player=player,
                 tunables_store=tunables_store,
                 blocklist_store=blocklist_store,
+                specs_store=specs_store,
                 token_storage_path=settings.token_path,
             )
             player.set_track_failure_notifier(bot.announce)
