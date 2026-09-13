@@ -1,248 +1,308 @@
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass
-from pathlib import Path
+import asyncio
+import dataclasses
+import logging
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+from urllib.parse import urlsplit
 
-from dotenv import load_dotenv
+import yt_dlp
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
-LOG_DIR = BASE_DIR / "logs"
+from twitch_radio.config import DATA_DIR, Settings
+from twitch_radio.models import Track
 
-load_dotenv(BASE_DIR / ".env")
+log = logging.getLogger(__name__)
 
+_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
-def _int_env(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
-def _bool_env(name: str, default: bool) -> bool:
-    raw = os.getenv(name, "").strip().lower()
-    if not raw:
-        return default
-    return raw in {"1", "true", "yes", "on"}
-
-
-def _clamped_int_env(name: str, default: int, lo: int, hi: int) -> int:
-    # _int_env alone silently clamps out-of-range values with no trace of
-    # it anywhere — e.g. AUDIO_BITRATE_KBPS=999999 would just quietly
-    # become 320 with nothing in the logs explaining the mismatch between
-    # what's in .env and what the service actually runs with. Same
-    # print()-not-log rationale as _log_level_env above: this runs before
-    # configure_logging() exists.
-    value = _int_env(name, default)
-    clamped = max(lo, min(hi, value))
-    if clamped != value:
-        print(f"WARNING: {name}={value} is outside the allowed range {lo}-{hi} — using {clamped}.")
-    return clamped
-
-
-_VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
-
-
-def _log_level_env(name: str, default: str) -> str:
-    # print() is deliberate — this runs before configure_logging() exists.
-    raw = os.getenv(name, "").strip().upper()
-    if not raw:
-        return default
-    if raw not in _VALID_LOG_LEVELS:
-        print(f"WARNING: {name}={raw!r} is not a valid log level — using {default}.")
-        return default
-    return raw
-
-
-def _check_cookies_path_writable(raw: str, path: Path) -> None:
-    # yt-dlp saves this file back on every single extraction once configured
-    # at all, and only data/ and logs/ are writable under the systemd unit's
-    # hardening — checked here so a bad path fails loudly at startup instead
-    # of on every !sr.
-    cookies_dir = path.parent
-    try:
-        cookies_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise RuntimeError(
-            f"YTDLP_COOKIES_FILE={raw!r} resolves to {path}, but its directory ({cookies_dir}) "
-            f"couldn't be created: {exc}. Use a path under data/ instead, e.g. "
-            f"YTDLP_COOKIES_FILE=data/cookies.txt."
-        ) from exc
-    if not os.access(cookies_dir, os.W_OK):
-        raise RuntimeError(
-            f"YTDLP_COOKIES_FILE={raw!r} resolves to {path}, but {cookies_dir} isn't writable. "
-            f"Use a path under data/ instead, e.g. YTDLP_COOKIES_FILE=data/cookies.txt."
-        )
-
-
-# YouTube player_client names and whether each accepts cookie auth, per
-# yt_dlp.extractor.youtube._base.INNERTUBE_CLIENTS[*]["SUPPORTS_COOKIES"] —
-# hardcoded rather than imported since that's a private yt-dlp module that
-# can change shape across versions; re-verify against the pinned yt-dlp
-# version in requirements.txt if this ever needs updating.
-# Checked against yt-dlp==2026.08.19.
-_VALID_PLAYER_CLIENTS = {
-    "web": True, "web_safari": True, "web_embedded": True, "web_music": True,
-    "web_creator": True, "android": False, "android_vr": False, "ios": False,
-    "visionos": False, "mweb": True, "tv": True, "tv_downgraded": True, "tv_simply": False,
+# Security posture: only YouTube and SoundCloud are accepted, not "anything
+# yt-dlp supports" (thousands of sites). Every extractor is more attack
+# surface — arbitrary sites can serve crafted metadata (title, uploader,
+# thumbnail) that flows into the overlay page and chat replies, and yt-dlp
+# itself has occasionally shipped extractor-specific bugs for less-trafficked
+# sites. Enforced twice, deliberately redundant: _ALLOWED_URL_HOSTS below
+# rejects a disallowed URL immediately, before any network call; the
+# `allowed_extractors` yt-dlp option in _build_options() is defense-in-depth
+# in case a URL matches an allowed host but a redirect or embed resolves it
+# through something else internally (e.g. the generic extractor).
+_ALLOWED_URL_HOSTS = {
+    "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be",
+    "soundcloud.com", "www.soundcloud.com", "m.soundcloud.com", "on.soundcloud.com",
 }
+# Matched with re.fullmatch against yt-dlp's lowercased IE_NAME for every
+# extractor it has (checked against yt-dlp==2026.08.19's actual matching
+# code, YoutubeDL.add_default_info_extractors / orderedSet_from_options) —
+# "youtube(:.*)?" covers every youtube:* variant (youtube:search for the
+# default text-search path, youtube:tab, youtube:clip, ...), same for
+# soundcloud. Deliberately does NOT include "generic" — that's yt-dlp's
+# scrape-any-webpage fallback, exactly what this restriction exists to keep
+# out.
+_ALLOWED_EXTRACTORS = ["youtube(:.*)?", "soundcloud(:.*)?"]
 
 
-def _check_player_clients(raw_clients: tuple[str, ...], cookies_configured: bool) -> None:
-    unknown = [c for c in raw_clients if c not in _VALID_PLAYER_CLIENTS]
-    if unknown:
-        print(
-            f"WARNING: YTDLP_PLAYER_CLIENT has unrecognized client name(s) {unknown} — yt-dlp "
-            f"will just skip them with a warning. Valid names: {sorted(_VALID_PLAYER_CLIENTS)}"
+def _is_allowed_url(url: str) -> bool:
+    try:
+        host = urlsplit(url).hostname or ""
+    except ValueError:
+        return False
+    return host.lower() in _ALLOWED_URL_HOSTS
+
+
+class DownloadError(Exception):
+    """Raised when yt-dlp fails to resolve a query into a playable track."""
+
+
+class UnsupportedSourceError(DownloadError):
+    """Raised when a direct URL isn't from an allowed source (YouTube or
+    SoundCloud) — distinct from DownloadError so the chat bot can give a
+    specific, accurate reply instead of the generic "couldn't fetch that"."""
+
+
+class Resolver:
+    """Turns a !sr query (URL or search text) into a playable Track.
+
+    Deliberately much simpler than the Discord bot's extraction pipeline: no
+    per-guild semaphores, no curation-mode isolation, no playlist expansion —
+    this service only ever needs one track per request, and there's no
+    sibling feature in-process to protect from contention (that whole
+    tiered-semaphore design existed specifically because Discord playback,
+    curation, and Twitch used to share one process; they don't anymore).
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._semaphore = asyncio.Semaphore(settings.ytdlp_concurrency)
+        # A couple of threads wider than the semaphore on purpose: wait_for()
+        # timing out only cancels our *wait* on a hung extraction, not the
+        # underlying thread — it keeps running (ThreadPoolExecutor can't
+        # preempt it) and stays occupied indefinitely if the hang never
+        # clears. Sizing the pool 1:1 with the concurrency limit means every
+        # such hang permanently steals one of the only slots available, and
+        # repeated hangs eventually starve every future request even though
+        # the semaphore keeps handing out permits. The extra headroom doesn't
+        # prevent that in the limit, but it buys a meaningful margin before
+        # it happens. A real fix would run extraction out-of-process so a
+        # hung one can actually be killed.
+        self._executor = ThreadPoolExecutor(
+            max_workers=settings.ytdlp_concurrency + 2, thread_name_prefix="ytdlp"
         )
-    if cookies_configured and raw_clients:
-        cookie_ok = [c for c in raw_clients if _VALID_PLAYER_CLIENTS.get(c)]
-        if not cookie_ok:
-            raise RuntimeError(
-                f"YTDLP_PLAYER_CLIENT={','.join(raw_clients)!r} has no client that supports "
-                f"cookie auth, but YTDLP_COOKIES_FILE is set — every client gets skipped and "
-                f"every request fails. android/android_vr/ios/visionos/tv_simply all reject "
-                f"cookies outright; mix in at least one of web/web_safari/web_embedded/"
-                f"web_music/web_creator/mweb/tv/tv_downgraded, or unset YTDLP_COOKIES_FILE."
-            )
+        # A !sr resolves once in chat (to confirm/queue it) and again in the
+        # player right before it actually plays — see resolve()'s docstring
+        # for why this cache is what makes the second one (usually) free.
+        # Keyed by resolved webpage_url, not the raw input query, since
+        # that's the only value both call sites are guaranteed to share.
+        self._cache: dict[str, tuple[Track, float]] = {}
 
+        # One yt-dlp options dict, built once and reused (mirrors
+        # _ytdl_instance below — Settings is frozen/loaded once at startup,
+        # so there's nothing to gain from rebuilding this per extraction).
+        self._ytdl_options: dict[str, Any] | None = None
+        # A *reused*, thread-local YoutubeDL instance per worker thread,
+        # rather than a fresh one on every _extract_sync call. This is the
+        # actual fix for slow time-to-first-audio: YouTube's per-player-
+        # version JS signature challenge is solved once and cached on the
+        # extractor instance itself (in memory, on top of yt-dlp's on-disk
+        # cache — see cache_dir in _build_options). A brand-new YoutubeDL()
+        # every call throws that cache away every single time, so the ~6s
+        # Deno JS-challenge solve reruns from scratch on every !sr, even for
+        # a song already played minutes earlier. Mirrors PyxeeBot's
+        # musicbot/cogs/music/_extraction.py::_extract_info, which keeps
+        # exactly this kind of thread-local `tlocal.instances` cache and is
+        # why it doesn't pay that cost per-track.
+        self._ytdl_tlocal = threading.local()
 
-@dataclass(frozen=True, slots=True)
-class Settings:
-    # Twitch app credentials — from https://dev.twitch.tv/console/apps
-    client_id: str
-    client_secret: str
-    bot_id: str
-    owner_id: str
-    prefix: str
+    def close(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
-    # Audio
-    audio_bitrate_kbps: int
-    # When True, the player won't start a new track while nobody's
-    # subscribed to /stream.mp3 (0 active listeners) — it just holds at the
-    # current silence/track boundary and resumes normally once someone
-    # (re)connects. A track already playing when the last listener
-    # disconnects still finishes normally; this only holds off *starting*
-    # the next one. Off by default to match existing behavior (the queue
-    # has always run on a continuous real-time clock regardless of
-    # listeners) — opt in via PAUSE_QUEUE_WHEN_NO_LISTENERS=true.
-    pause_when_no_listeners: bool
+    def _build_options(self) -> dict[str, Any]:
+        # yt-dlp's own diagnostic verbosity follows this service's LOG_LEVEL
+        # rather than a separate always-on switch — quiet in normal
+        # operation, but `LOG_LEVEL=DEBUG` gets full -v output for free
+        # without a code change or a second setting to remember.
+        verbose = self._settings.log_level == "DEBUG"
+        options: dict[str, Any] = {
+            # Audio-only when available (this pipeline immediately decodes
+            # to raw PCM and throws away any video track anyway — pulling a
+            # combined format wastes bandwidth for nothing), falling back to
+            # the best available format if no audio-only one is offered.
+            "format": "bestaudio/best",
+            "noplaylist": True,
+            "quiet": not verbose,
+            "no_warnings": not verbose,
+            "verbose": verbose,
+            "default_search": "ytsearch",
+            "socket_timeout": 15,
+            "extract_flat": False,
+            # See _ALLOWED_EXTRACTORS above — restricts yt-dlp itself to
+            # YouTube/SoundCloud as a second layer behind the URL-host check
+            # in resolve(), not a substitute for it (that check runs before
+            # any network call at all; this only matters once yt-dlp is
+            # already resolving something).
+            "allowed_extractors": _ALLOWED_EXTRACTORS,
+            # yt-dlp's default cache dir (~/.cache/yt-dlp) is unwritable
+            # under the systemd unit's ProtectHome=read-only — every write
+            # of a solved signature function there fails silently (visible
+            # as "Read-only file system" WARNINGs in the logs), so nothing
+            # ever survives a process restart. DENO_DIR already gets the
+            # same redirect-under-data/ treatment in the systemd unit for
+            # the same reason — this is the yt-dlp-side equivalent. Lives
+            # under DATA_DIR so it's covered by the unit's existing
+            # ReadWritePaths without any deploy changes.
+            "cache_dir": str(DATA_DIR / "yt-dlp-cache"),
+        }
+        extractor_args: dict[str, dict[str, list[str]]] = {}
+        if self._settings.ytdlp_player_client:
+            extractor_args["youtube"] = {"player_client": list(self._settings.ytdlp_player_client)}
+        if self._settings.ytdlp_pot_provider_url:
+            # Passed straight through to the bgutil-ytdlp-pot-provider
+            # plugin, if installed — see README's cookies/PO-token note.
+            # A no-op if that plugin isn't present.
+            extractor_args["youtubepot-bgutilhttp"] = {"base_url": [self._settings.ytdlp_pot_provider_url]}
+        if extractor_args:
+            options["extractor_args"] = extractor_args
+        if self._settings.ytdlp_cookies_file is not None:
+            options["cookiefile"] = str(self._settings.ytdlp_cookies_file)
+        if self._settings.ytdlp_js_runtime_path:
+            # Explicit pin only — an unset path leaves yt-dlp's own default
+            # (auto-detect a `deno` binary on PATH) in place. The dict key
+            # must be the actual runtime name ("deno", "node", "bun", or
+            # "quickjs") — yt-dlp uses it to pick the calling convention, so
+            # a Deno path filed under "node" silently gets invoked wrong.
+            options["js_runtimes"] = {
+                self._settings.ytdlp_js_runtime_name: {"path": self._settings.ytdlp_js_runtime_path}
+            }
+        return options
 
-    # Local HTTP surface — serves /stream.mp3, /overlay, /nowplaying.json, /settings
-    nowplaying_host: str
-    nowplaying_port: int
-    settings_password: str | None
+    def _get_ytdl_options(self) -> dict[str, Any]:
+        if self._ytdl_options is None:
+            self._ytdl_options = self._build_options()
+        return self._ytdl_options
 
-    # Persistence — both under DATA_DIR so a single ReadWritePaths entry in
-    # the systemd unit covers everything this process needs to write.
-    token_path: Path
-    tunables_path: Path
-    blocklist_path: Path
-    specs_path: Path
+    def _extract_sync(self, query: str) -> dict[str, Any]:
+        # Reused per-thread (see _ytdl_tlocal in __init__) instead of
+        # `with yt_dlp.YoutubeDL(...) as ydl:` — that context-manager form
+        # looks harmless but silently discards yt-dlp's in-memory
+        # signature-function cache on every single call.
+        tlocal = self._ytdl_tlocal
+        ydl = getattr(tlocal, "instance", None)
+        if ydl is None:
+            ydl = yt_dlp.YoutubeDL(self._get_ytdl_options())
+            tlocal.instance = ydl
+        info = ydl.extract_info(query, download=False)
+        return info if isinstance(info, dict) else {}
 
-    # yt-dlp
-    ytdlp_cookies_file: Path | None
-    ytdlp_js_runtime_path: str | None
-    ytdlp_js_runtime_name: str
-    ytdlp_concurrency: int
-    ytdlp_extract_timeout_seconds: int
-    ytdlp_player_client: tuple[str, ...]
-    ytdlp_cache_ttl_seconds: int
-    ytdlp_pot_provider_url: str | None
+    async def _extract_info(self, query: str) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        async with self._semaphore:
+            try:
+                info = await asyncio.wait_for(
+                    loop.run_in_executor(self._executor, self._extract_sync, query),
+                    timeout=self._settings.ytdlp_extract_timeout_seconds,
+                )
+            except TimeoutError as exc:
+                raise DownloadError(f"Timed out resolving {query!r}") from exc
+            except yt_dlp.utils.DownloadError as exc:
+                raise DownloadError(str(exc)) from exc
+        if not info:
+            raise DownloadError(f"yt-dlp returned nothing for {query!r}")
+        return info
 
-    # Logging
-    log_level: str
-    log_to_file: bool
-    log_dir: Path
+    def _query_for(self, raw: str) -> str:
+        raw = raw.strip()
+        if _URL_RE.match(raw):
+            return raw
+        return f"ytsearch1:{raw}"
 
+    def _prune_cache(self, now: float) -> None:
+        ttl = self._settings.ytdlp_cache_ttl_seconds
+        expired = [key for key, (_, cached_at) in self._cache.items() if now - cached_at >= ttl]
+        for key in expired:
+            del self._cache[key]
 
-def load_settings() -> Settings:
-    DATA_DIR.mkdir(exist_ok=True)
-    LOG_DIR.mkdir(exist_ok=True)
+    async def resolve(self, query: str, requester_id: int) -> Track | None:
+        """Resolves one query to one Track, or None if nothing playable was
+        found (e.g. a search with zero results, or a private/deleted video).
+        Never raises for "not found" — only for actual failures (timeout,
+        network error), which the caller is expected to catch.
 
-    def _required(name: str) -> str:
-        value = os.getenv(name, "").strip()
-        if not value:
-            raise RuntimeError(f"{name} is not set — add it to .env before starting. See .env.example.")
-        return value
+        Cached briefly (YTDLP_CACHE_TTL_SECONDS) so the player's re-resolve
+        right before actual playback — which passes back exactly the
+        webpage_url this returned — reuses this result instead of running a
+        second full extraction for what's the same request arriving twice.
+        A cache hit still returns a fresh Track with the requested
+        requester_id, and callers that need a guaranteed live check (state
+        that could have changed since caching, like is_live) should treat a
+        cached result as informational, not gospel, for anything genuinely
+        safety-relevant.
+        """
+        now = time.monotonic()
+        raw = query.strip()
+        if _URL_RE.match(raw) and not _is_allowed_url(raw):
+            raise UnsupportedSourceError("Only YouTube and SoundCloud links are supported.")
 
-    def _required_numeric_id(name: str) -> str:
-        # Real production failure this guards against: TWITCH_BOT_ID pasted
-        # as "Twitch ID:1536026185" instead of just the digits — Helix
-        # rejects that with a bare "Bad Identifiers" error.
-        value = _required(name)
-        if not value.isdigit():
-            raise RuntimeError(
-                f"{name}={value!r} isn't a plain numeric Twitch user ID — digits only, no "
-                f"username, no label. Look one up at "
-                f"https://www.streamweasels.com/tools/convert-twitch-username-to-user-id/"
-            )
-        return value
+        ttl = self._settings.ytdlp_cache_ttl_seconds
+        if ttl > 0:
+            self._prune_cache(now)
+            cached = self._cache.get(query.strip())
+            if cached is not None:
+                track, cached_at = cached
+                if now - cached_at < ttl:
+                    return dataclasses.replace(track, requester_id=requester_id)
 
-    client_id = _required("TWITCH_CLIENT_ID")
-    client_secret = _required("TWITCH_CLIENT_SECRET")
-    bot_id = _required_numeric_id("TWITCH_BOT_ID")
-    owner_id = _required_numeric_id("TWITCH_OWNER_ID")
+        info = await self._extract_info(self._query_for(query))
 
-    cookies_raw = os.getenv("YTDLP_COOKIES_FILE", "").strip()
-    cookies_path = (BASE_DIR / cookies_raw) if cookies_raw else None
-    if cookies_path is not None:
-        _check_cookies_path_writable(cookies_raw, cookies_path)
+        # A bare "ytsearchN:" query wraps its one hit in an "entries" list;
+        # a direct URL resolves straight to the item itself.
+        entries = info.get("entries") if isinstance(info, dict) else None
+        # entries is None (key absent) for a direct URL resolve — the item
+        # IS info itself. entries == [] (key present, empty) is a genuine
+        # zero-results search and must NOT fall back to using info as the
+        # item — those are different things, but both are falsy in Python,
+        # so this has to check "is None" specifically rather than truthiness.
+        item = next((e for e in entries if e), None) if entries is not None else info
+        if not item:
+            return None
 
-    player_client_raw = os.getenv("YTDLP_PLAYER_CLIENT", "").strip()
-    if not player_client_raw and cookies_path is not None:
-        # yt-dlp's own default client list when cookies are set (verified
-        # against yt-dlp==2026.08.19) is
-        # ('web_embedded', 'tv_downgraded', 'web') — tv_downgraded has a
-        # known open bug (yt-dlp#17389, "The page needs to be reloaded").
-        # Pinning to the other two already-default clients avoids it.
-        player_client_raw = "web_embedded,web"
-    ytdlp_player_client = tuple(c.strip() for c in player_client_raw.split(",") if c.strip())
-    _check_player_clients(ytdlp_player_client, cookies_configured=cookies_path is not None)
+        stream_url = item.get("url")
+        webpage_url = item.get("webpage_url")
+        if not webpage_url:
+            if _URL_RE.match(query.strip()):
+                # The query itself was already a stable URL — safe to reuse.
+                webpage_url = query
+            else:
+                # No stable URL to persist. Falling back to the raw search
+                # text here would silently turn into a *fresh* search the
+                # next time this gets re-resolved (player._play_one_inner
+                # calls back into resolve() with whatever webpage_url we
+                # return) — meaning the song that plays could end up being
+                # different from the one confirmed to the requester in chat.
+                log.warning(
+                    "yt-dlp returned no webpage_url for %r and the query wasn't a URL either "
+                    "— refusing to queue it rather than risk a different track playing later.",
+                    query,
+                )
+                return None
+        if not stream_url:
+            return None
 
-    nowplaying_host = os.getenv("TWITCH_NOWPLAYING_HOST", "127.0.0.1").strip() or "127.0.0.1"
-    settings_password = os.getenv("TWITCH_SETTINGS_PASSWORD", "").strip() or None
-    if nowplaying_host not in ("127.0.0.1", "localhost") and settings_password is None:
-        print(
-            f"WARNING: TWITCH_NOWPLAYING_HOST={nowplaying_host!r} is reachable off this machine, "
-            f"but TWITCH_SETTINGS_PASSWORD is unset — anyone who finds the port can change your "
-            f"queue/cooldown settings via /settings. Set TWITCH_SETTINGS_PASSWORD."
+        track = Track(
+            title=item.get("title") or "Unknown title",
+            webpage_url=webpage_url,
+            stream_url=stream_url,
+            uploader=item.get("uploader") or "Unknown uploader",
+            # yt-dlp reports duration=None for an in-progress livestream, which
+            # would otherwise read as "0 seconds" and slip straight past the
+            # max-duration check — is_live is what actually flags that case.
+            duration=int(item.get("duration") or 0),
+            requester_id=requester_id,
+            thumbnail_url=item.get("thumbnail"),
+            query=query,
+            is_live=bool(item.get("is_live")),
         )
-
-    return Settings(
-        client_id=client_id,
-        client_secret=client_secret,
-        bot_id=bot_id,
-        owner_id=owner_id,
-        prefix=os.getenv("TWITCH_PREFIX", "!").strip() or "!",
-        audio_bitrate_kbps=_clamped_int_env("AUDIO_BITRATE_KBPS", 128, 64, 320),
-        pause_when_no_listeners=_bool_env("PAUSE_QUEUE_WHEN_NO_LISTENERS", False),
-        nowplaying_host=nowplaying_host,
-        nowplaying_port=_clamped_int_env("TWITCH_NOWPLAYING_PORT", 8098, 1024, 65535),
-        settings_password=settings_password,
-        token_path=DATA_DIR / os.getenv("TWITCH_TOKEN_FILE", "twitch_tokens.json").strip(),
-        tunables_path=DATA_DIR / os.getenv("TWITCH_TUNABLES_FILE", "tunables.json").strip(),
-        blocklist_path=DATA_DIR / os.getenv("TWITCH_BLOCKLIST_FILE", "blocklist.json").strip(),
-        specs_path=DATA_DIR / os.getenv("TWITCH_SPECS_FILE", "specs.json").strip(),
-        ytdlp_cookies_file=cookies_path,
-        ytdlp_js_runtime_path=os.getenv("YTDLP_JS_RUNTIME_PATH", "").strip() or None,
-        ytdlp_js_runtime_name=os.getenv("YTDLP_JS_RUNTIME_NAME", "deno").strip() or "deno",
-        ytdlp_concurrency=_clamped_int_env("YTDLP_CONCURRENCY", 2, 1, 4),
-        ytdlp_extract_timeout_seconds=_clamped_int_env("YTDLP_EXTRACT_TIMEOUT_SECONDS", 45, 10, 120),
-        ytdlp_player_client=ytdlp_player_client,
-        # Skips the player's second extraction (chat resolves once to queue,
-        # then it re-resolves right before playing) for anything near the
-        # front of the queue. 0 disables caching.
-        ytdlp_cache_ttl_seconds=_clamped_int_env("YTDLP_CACHE_TTL_SECONDS", 300, 0, 3600),
-        # Only used if you've separately set up a bgutil-ytdlp-pot-provider
-        # instance (see README) — points yt-dlp's PO-token plugin at it.
-        # None means "no PO token provider configured", not an error.
-        ytdlp_pot_provider_url=os.getenv("YTDLP_POT_PROVIDER_URL", "").strip() or None,
-        log_level=_log_level_env("LOG_LEVEL", "INFO"),
-        log_to_file=_bool_env("LOG_TO_FILE", True),
-        log_dir=LOG_DIR,
-    )
+        if ttl > 0:
+            self._cache[webpage_url] = (track, now)
+        return track
