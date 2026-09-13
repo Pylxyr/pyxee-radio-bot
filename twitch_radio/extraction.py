@@ -4,6 +4,7 @@ import asyncio
 import dataclasses
 import logging
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -11,7 +12,7 @@ from urllib.parse import urlsplit
 
 import yt_dlp
 
-from twitch_radio.config import Settings
+from twitch_radio.config import DATA_DIR, Settings
 from twitch_radio.models import Track
 
 log = logging.getLogger(__name__)
@@ -96,6 +97,24 @@ class Resolver:
         # that's the only value both call sites are guaranteed to share.
         self._cache: dict[str, tuple[Track, float]] = {}
 
+        # One yt-dlp options dict, built once and reused (mirrors
+        # _ytdl_instance below — Settings is frozen/loaded once at startup,
+        # so there's nothing to gain from rebuilding this per extraction).
+        self._ytdl_options: dict[str, Any] | None = None
+        # A *reused*, thread-local YoutubeDL instance per worker thread,
+        # rather than a fresh one on every _extract_sync call. This is the
+        # actual fix for slow time-to-first-audio: YouTube's per-player-
+        # version JS signature challenge is solved once and cached on the
+        # extractor instance itself (in memory, on top of yt-dlp's on-disk
+        # cache — see cache_dir in _build_options). A brand-new YoutubeDL()
+        # every call throws that cache away every single time, so the ~6s
+        # Deno JS-challenge solve reruns from scratch on every !sr, even for
+        # a song already played minutes earlier. Mirrors PyxeeBot's
+        # musicbot/cogs/music/_extraction.py::_extract_info, which keeps
+        # exactly this kind of thread-local `tlocal.instances` cache and is
+        # why it doesn't pay that cost per-track.
+        self._ytdl_tlocal = threading.local()
+
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
 
@@ -124,6 +143,16 @@ class Resolver:
             # any network call at all; this only matters once yt-dlp is
             # already resolving something).
             "allowed_extractors": _ALLOWED_EXTRACTORS,
+            # yt-dlp's default cache dir (~/.cache/yt-dlp) is unwritable
+            # under the systemd unit's ProtectHome=read-only — every write
+            # of a solved signature function there fails silently (visible
+            # as "Read-only file system" WARNINGs in the logs), so nothing
+            # ever survives a process restart. DENO_DIR already gets the
+            # same redirect-under-data/ treatment in the systemd unit for
+            # the same reason — this is the yt-dlp-side equivalent. Lives
+            # under DATA_DIR so it's covered by the unit's existing
+            # ReadWritePaths without any deploy changes.
+            "cache_dir": str(DATA_DIR / "yt-dlp-cache"),
         }
         extractor_args: dict[str, dict[str, list[str]]] = {}
         if self._settings.ytdlp_player_client:
@@ -148,9 +177,22 @@ class Resolver:
             }
         return options
 
+    def _get_ytdl_options(self) -> dict[str, Any]:
+        if self._ytdl_options is None:
+            self._ytdl_options = self._build_options()
+        return self._ytdl_options
+
     def _extract_sync(self, query: str) -> dict[str, Any]:
-        with yt_dlp.YoutubeDL(self._build_options()) as ydl:
-            info = ydl.extract_info(query, download=False)
+        # Reused per-thread (see _ytdl_tlocal in __init__) instead of
+        # `with yt_dlp.YoutubeDL(...) as ydl:` — that context-manager form
+        # looks harmless but silently discards yt-dlp's in-memory
+        # signature-function cache on every single call.
+        tlocal = self._ytdl_tlocal
+        ydl = getattr(tlocal, "instance", None)
+        if ydl is None:
+            ydl = yt_dlp.YoutubeDL(self._get_ytdl_options())
+            tlocal.instance = ydl
+        info = ydl.extract_info(query, download=False)
         return info if isinstance(info, dict) else {}
 
     async def _extract_info(self, query: str) -> dict[str, Any]:
