@@ -14,6 +14,7 @@ from aiohttp import web
 from twitch_radio.blocklist import clean_list
 from twitch_radio.blocklist import counts as blocklist_counts
 from twitch_radio.player import RadioPlayer
+from twitch_radio.specs import MAX_FIELD_LENGTH, PC_SPEC_FIELDS, PERIPHERAL_FIELDS, PCSpecs, Peripherals
 from twitch_radio.store import JsonStore
 from twitch_radio.tunables import TUNABLE_BOUNDS, TwitchTunables
 
@@ -42,9 +43,9 @@ _OVERLAY_HTML = """<!doctype html>
   }
   .panel {
     width: 420px; padding: 14px 18px;
-    background: #0F1117; /* Fixed: Solid opaque background instead of rgba */
+    background: rgba(15, 17, 23, 0.82);
     border-radius: 16px;
-    /* Fixed: backdrop-filter removed as it is obsolete on an opaque background */
+    backdrop-filter: blur(6px);
     box-shadow: 0 8px 24px rgba(0,0,0,0.35);
     --accent: #E8A33D;
   }
@@ -106,7 +107,8 @@ function applyAccent(url) {
         r += px[i]; g += px[i + 1]; b += px[i + 2]; n++;
       }
       r = Math.round(r / n); g = Math.round(g / n); b = Math.round(b / n);
-      // Boost toward legible against the dark panel
+      // Boost toward legible against the dark panel — thumbnail averages
+      // skew muddy otherwise.
       const max = Math.max(r, g, b) || 1;
       const boost = 255 / max * 0.75;
       r = Math.min(255, Math.round(r * boost + 40));
@@ -114,12 +116,12 @@ function applyAccent(url) {
       b = Math.min(255, Math.round(b * boost + 40));
       panel.style.setProperty('--accent', `rgb(${r},${g},${b})`);
     } catch (e) {
-      // Tainted canvas block
+      // Tainted canvas (CDN didn't send permissive CORS headers) — keep
+      // whatever accent is already set rather than breaking the overlay.
     }
   };
   img.onerror = () => {};
-  // Fixed: Append a timestamp cache-buster to prevent canvas tainting from cached CSS backgrounds
-  img.src = url + (url.indexOf('?') !== -1 ? '&' : '?') + 'cb=' + Date.now();
+  img.src = url;
 }
 
 function render(data, elapsed) {
@@ -139,7 +141,16 @@ function render(data, elapsed) {
       lastThumb = data.thumbnail_url;
       applyAccent(data.thumbnail_url);
     }
-
+    // escapeHtml() here (not just on title/uploader/requester_name below)
+    // because this string gets spliced directly into an HTML attribute,
+    // not set via .textContent — an unescaped thumbnail_url containing a
+    // stray quote could break out of the style="..." attribute and inject
+    // markup. title/uploader/requester_name are effectively free-text
+    // (YouTube titles, Twitch display names); thumbnail_url is normally a
+    // YouTube-generated CDN URL, but !sr accepts arbitrary yt-dlp-supported
+    // URLs from any chatter, and some extractors pull thumbnail URLs from
+    // page metadata the target site's owner controls — escape it the same
+    // as everything else rather than trusting the source.
     const thumb = data.thumbnail_url ? `style="background-image:url('${escapeHtml(data.thumbnail_url)}')"` : '';
     const next = (data.queue || []).slice(0, 2)
       .map(q => `<div class="next-item">${escapeHtml(q.title)}</div>`).join('');
@@ -158,13 +169,17 @@ function render(data, elapsed) {
       </div>
       ${next ? `<div class="next"><div class="next-label">Up next</div>${next}</div>` : ''}
     `;
-
+    // Rebuilt fresh above, so opacity starts at 0 — nudge it to 1 on the
+    // next frame so the CSS transition actually has something to animate.
     requestAnimationFrame(() => {
       const t = document.getElementById('t-title');
       if (t) t.style.opacity = '1';
     });
   }
 
+  // Runs every frame (~60/sec via tick()) — only touch the two nodes that
+  // actually change per-frame, not a full innerHTML rebuild, which would
+  // wipe out the thumbnail/title/fade-in above 60 times a second.
   const pct = data.duration_seconds > 0 ? Math.min(100, (elapsed / data.duration_seconds) * 100) : 0;
   const fillEl = document.getElementById('t-fill');
   const elapsedEl = document.getElementById('t-elapsed');
@@ -173,18 +188,32 @@ function render(data, elapsed) {
 }
 
 function escapeHtml(s) {
+  // Deliberately NOT the textContent/innerHTML round-trip trick — that
+  // only escapes &, <, > (correct for text-node content, which is most
+  // uses below) but leaves both quote characters untouched. thumbnail_url
+  // is spliced into an HTML *attribute* (style="...url('...')..."), where
+  // an un-escaped " can close the attribute early and inject a new one —
+  // e.g. a crafted thumbnail_url of `x" onmouseover="..."` would break out
+  // and run script. Escaping quotes here too makes this one function safe
+  // for both contexts, text and attribute, rather than silently depending
+  // on every call site happening to only ever use it as text.
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[c]));
 }
 
 async function poll() {
+  // Fallback path only — the WebSocket connection below is the primary
+  // source of truth and pushes a fresh snapshot on every change; this just
+  // keeps the overlay working if WebSocket is unavailable or its
+  // connection is currently down (skipped while it's open, so it's a
+  // once-per-2s no-op fetch the rest of the time, not real polling).
   if (ws && ws.readyState === WebSocket.OPEN) return;
   try {
     const res = await fetch('/nowplaying.json');
     last = await res.json();
     lastFetchedAt = performance.now();
-  } catch (e) { }
+  } catch (e) { /* keep showing the last known state */ }
 }
 
 let ws = null;
@@ -194,6 +223,8 @@ function connectWs() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     socket = new WebSocket(`${proto}//${location.host}/ws/nowplaying`);
   } catch (e) {
+    // No WebSocket support at all (unlikely, but some embedded browser
+    // sources are old) — poll() above just keeps running unattended.
     return;
   }
   ws = socket;
@@ -201,7 +232,7 @@ function connectWs() {
     try {
       last = JSON.parse(ev.data);
       lastFetchedAt = performance.now();
-    } catch (e) { }
+    } catch (e) { /* malformed frame — next one (or the poll() backstop) recovers */ }
   };
   socket.onclose = () => { if (ws === socket) ws = null; setTimeout(connectWs, 2000); };
   socket.onerror = () => { try { socket.close(); } catch (e) {} };
@@ -221,6 +252,7 @@ setInterval(poll, 2000);
 tick();
 </script>
 </body></html>"""
+
 
 class _AuthRateLimiter:
     """Basic Auth has no built-in lockout — without this, /settings is
@@ -279,12 +311,14 @@ class AdminServer:
         player: RadioPlayer,
         tunables_store: JsonStore,
         blocklist_store: JsonStore,
+        specs_store: JsonStore,
         settings_password: str | None,
         broadcast_info: dict[str, str],
     ) -> None:
         self._player = player
         self._tunables_store = tunables_store
         self._blocklist_store = blocklist_store
+        self._specs_store = specs_store
         self._settings_password = settings_password
         self._broadcast_info = broadcast_info
         self._auth_limiter = _AuthRateLimiter()
@@ -461,7 +495,12 @@ class AdminServer:
         if denied is not None:
             return denied
         tunables = TwitchTunables.from_dict(await self._tunables_store.read())
-        return web.Response(text=self._render_page(tunables, message=None), content_type="text/html")
+        specs_data = await self._specs_store.read()
+        pc_specs = PCSpecs.from_dict(specs_data)
+        peripherals = Peripherals.from_dict(specs_data)
+        return web.Response(
+            text=self._render_page(tunables, pc_specs, peripherals, message=None), content_type="text/html"
+        )
 
     async def handle_settings_post(self, request: web.Request) -> web.Response:
         denied = self._authorize(request)
@@ -499,23 +538,58 @@ class AdminServer:
 
         result = await self._tunables_store.update(_mutate)
 
+        def _mutate_specs(current: dict[str, Any]) -> dict[str, Any]:
+            updated = dict(current)
+            for field, _label in (*PC_SPEC_FIELDS, *PERIPHERAL_FIELDS):
+                raw = form.get(field)
+                if raw is not None:
+                    updated[field] = str(raw)
+            # Routed through from_dict()/to_dict() so the strip+length-clamp
+            # (and the fixed set of known fields) is applied in one place —
+            # specs.py — rather than duplicated here. Free-text fields have
+            # no failure mode the way tunable bounds do, so unlike _mutate
+            # above there's nothing to add to `errors`; this always saves.
+            return {**PCSpecs.from_dict(updated).to_dict(), **Peripherals.from_dict(updated).to_dict()}
+
+        specs_result = await self._specs_store.update(_mutate_specs)
+        pc_specs = PCSpecs.from_dict(specs_result)
+        peripherals = Peripherals.from_dict(specs_result)
+
         if errors:
             tunables = TwitchTunables.from_dict(preview or result)
             return web.Response(
-                text=self._render_page(tunables, message="Not saved — " + "; ".join(errors)),
+                text=self._render_page(
+                    tunables, pc_specs, peripherals, message="Tunables not saved — " + "; ".join(errors)
+                ),
                 content_type="text/html",
                 status=400,
             )
 
-        log.info("Settings updated via /settings from %s: %s", request.remote, result)
+        log.info(
+            "Settings updated via /settings from %s: tunables=%s specs=%s", request.remote, result, specs_result
+        )
         tunables = TwitchTunables.from_dict(result)
-        return web.Response(text=self._render_page(tunables, message="Saved."), content_type="text/html")
+        return web.Response(
+            text=self._render_page(tunables, pc_specs, peripherals, message="Saved."), content_type="text/html"
+        )
 
-    def _render_page(self, tunables: TwitchTunables, *, message: str | None) -> str:
+    def _text_field_rows(self, fields: list[tuple[str, str]], values: dict[str, str]) -> str:
+        return "".join(
+            f"<label>{escape(label)}\n"
+            f'<input type="text" name="{escape(name)}" value="{escape(values.get(name, ""))}" '
+            f'maxlength="{MAX_FIELD_LENGTH}"></label>\n'
+            for name, label in fields
+        )
+
+    def _render_page(
+        self, tunables: TwitchTunables, pc_specs: PCSpecs, peripherals: Peripherals, *, message: str | None
+    ) -> str:
         info_rows = "".join(
             f"<tr><td>{escape(k)}</td><td>{escape(v)}</td></tr>" for k, v in self._broadcast_info.items()
         )
         message_html = f'<p class="msg">{escape(message)}</p>' if message else ""
+        pc_spec_rows = self._text_field_rows(PC_SPEC_FIELDS, pc_specs.to_dict())
+        peripheral_rows = self._text_field_rows(PERIPHERAL_FIELDS, peripherals.to_dict())
         return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Twitch Radio Settings</title>
 <style>
@@ -526,6 +600,7 @@ table {{ margin-top: 1.5rem; border-collapse: collapse; }}
 td {{ padding: 0.2rem 0.6rem; border-bottom: 1px solid #ddd; }}
 .msg {{ color: #a33; font-weight: bold; }}
 button {{ margin-top: 1rem; padding: 0.5rem 1rem; }}
+h2 {{ margin-top: 2rem; border-top: 1px solid #ddd; padding-top: 1rem; }}
 </style></head><body>
 <h1>Twitch Radio Settings</h1>
 {message_html}
@@ -540,6 +615,13 @@ button {{ margin-top: 1rem; padding: 0.5rem 1rem; }}
 <input type="number" name="max_request_duration_seconds" value="{tunables.max_request_duration_seconds}"></label>
 <label>Vote-skip threshold (unique !voteskip votes needed)
 <input type="number" name="vote_skip_threshold" value="{tunables.vote_skip_threshold}"></label>
+
+<h2>PC specs (shown to viewers via !specs)</h2>
+{pc_spec_rows}
+
+<h2>Peripherals (shown to viewers via !peripherals)</h2>
+{peripheral_rows}
+
 <button type="submit">Save</button>
 </form>
 <table>{info_rows}</table>
@@ -551,6 +633,7 @@ async def run_admin_server(
     player: RadioPlayer,
     tunables_store: JsonStore,
     blocklist_store: JsonStore,
+    specs_store: JsonStore,
     settings_password: str | None,
     broadcast_info: dict[str, str],
     host: str,
@@ -558,7 +641,7 @@ async def run_admin_server(
 ) -> web.AppRunner:
     server = AdminServer(
         player=player, tunables_store=tunables_store, blocklist_store=blocklist_store,
-        settings_password=settings_password, broadcast_info=broadcast_info,
+        specs_store=specs_store, settings_password=settings_password, broadcast_info=broadcast_info,
     )
     app = web.Application()
     app.router.add_get("/nowplaying.json", server.handle_nowplaying)
