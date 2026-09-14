@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import logging
 import re
 import threading
@@ -37,6 +38,24 @@ _ALLOWED_URL_HOSTS = {
 # keep out. Checked against yt-dlp==2026.08.19.
 _ALLOWED_EXTRACTORS = ["youtube(:.*)?", "soundcloud(:.*)?"]
 
+# yt-dlp's own no-cookies default is ('visionos', 'web') (yt_dlp.extractor
+# .youtube._video.YoutubeIE._DEFAULT_CLIENTS, checked against
+# yt-dlp==2026.08.19) — and _extract_player_responses() in that same file
+# processes every requested client unconditionally, with no short-circuit
+# once one succeeds. So the default genuinely does two full clients' worth
+# of network+processing work on *every* resolve, not just a cold one.
+# 'visionos' alone is yt-dlp's own designated JS-less client (see
+# _DEFAULT_JSLESS_CLIENTS in the same file) — it skips the ~6s Deno
+# signature-challenge solve entirely. Used here as a fast first attempt,
+# with an automatic fallback to the full default below if it comes back
+# empty, so the worst case is "no slower than before", not "less reliable".
+# Only applies when nothing else has already made the client choice for us
+# — i.e. no cookies configured and no explicit YTDLP_PLAYER_CLIENT (see
+# _fast_client_enabled below; config.py already forces cookie deployments
+# onto a fixed, cookie-compatible client list before this ever sees them).
+_FAST_PLAYER_CLIENT: tuple[str, ...] = ("visionos",)
+_FAST_EXTRACT_TIMEOUT_SECONDS = 15.0
+
 
 def _is_allowed_url(url: str) -> bool:
     try:
@@ -64,6 +83,13 @@ class Resolver:
     feature in-process to protect from contention.
     """
 
+    # A stable, always-public, extremely unlikely-to-disappear video —
+    # YouTube's own first-ever upload. Content is irrelevant; this is never
+    # queued or played, only resolved and discarded, purely to warm up
+    # yt-dlp's on-disk JS-challenge cache and this process's worker threads
+    # before a real listener's first !sr. See warm_up() below.
+    _WARMUP_QUERY = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._semaphore = asyncio.Semaphore(settings.ytdlp_concurrency)
@@ -81,19 +107,47 @@ class Resolver:
         # resolved webpage_url, the only value both call sites share.
         self._cache: dict[str, tuple[Track, float]] = {}
 
+        # Nothing else has already pinned the client list for us — see the
+        # module comment above _FAST_PLAYER_CLIENT.
+        self._fast_client_enabled = not settings.ytdlp_player_client
+
         self._ytdl_options: dict[str, Any] | None = None
+        self._fast_ytdl_options: dict[str, Any] | None = None
         # A *reused*, thread-local YoutubeDL instance per worker thread
         # rather than a fresh one per call — YouTube's per-player-version JS
         # signature challenge is solved once and cached on the extractor
         # instance itself. A fresh YoutubeDL() every call throws that away,
         # so the ~6s Deno JS-challenge solve would rerun from scratch on
-        # every !sr, even for a song played minutes earlier.
+        # every !sr, even for a song played minutes earlier. Fast-client and
+        # full-client attempts use different extractor_args, so each thread
+        # gets up to two instances (one per attribute below), not one.
         self._ytdl_tlocal = threading.local()
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
 
-    def _build_options(self) -> dict[str, Any]:
+    async def warm_up(self) -> None:
+        """Best-effort: resolves a throwaway video on every worker thread
+        this Resolver will normally use, so the first *real* !sr after a
+        restart doesn't pay the full cold-start cost (JS runtime startup,
+        first signature-challenge solve) by itself. Meant to be started as
+        a background task right after construction — never awaited inline
+        before the bot comes up, and never lets a failure (e.g. no network
+        yet) propagate; a real request falls back to paying the cold-start
+        cost itself, exactly as if this didn't run at all.
+        """
+        start = time.monotonic()
+
+        async def _one() -> None:
+            try:
+                await self._extract_info(self._WARMUP_QUERY)
+            except Exception:
+                log.debug("Resolver warm-up task failed (non-fatal).", exc_info=True)
+
+        await asyncio.gather(*(_one() for _ in range(self._settings.ytdlp_concurrency)))
+        log.info("Resolver warm-up finished in %.1fs.", time.monotonic() - start)
+
+    def _build_options(self, *, player_client_override: tuple[str, ...] | None = None) -> dict[str, Any]:
         verbose = self._settings.log_level == "DEBUG"
         options: dict[str, Any] = {
             # Audio-only when available — this pipeline decodes to raw PCM
@@ -111,11 +165,26 @@ class Resolver:
             # under the systemd unit's ProtectHome=read-only, so nothing
             # would survive a restart. Lives under DATA_DIR, already
             # covered by the unit's ReadWritePaths.
-            "cache_dir": str(DATA_DIR / "yt-dlp-cache"),
+            #
+            # The params key is "cachedir" (no underscore) — verified
+            # directly against yt_dlp.cache.Cache._get_root_dir(), which
+            # reads exactly that key and falls back to $XDG_CACHE_HOME or
+            # ~/.cache otherwise. A previous version of this code passed
+            # "cache_dir" here, which yt-dlp silently never looks at: every
+            # write went to the (read-only, under systemd) default location
+            # instead, failed, and was never persisted — so the ~7s Deno
+            # JS-signature-challenge solve reran from scratch on every
+            # single resolve rather than roughly once per YouTube player
+            # rotation. This was very likely the dominant cause of "!sr is
+            # slow" under the systemd deployment this README documents.
+            "cachedir": str(DATA_DIR / "yt-dlp-cache"),
         }
         extractor_args: dict[str, dict[str, list[str]]] = {}
-        if self._settings.ytdlp_player_client:
-            extractor_args["youtube"] = {"player_client": list(self._settings.ytdlp_player_client)}
+        player_client = (
+            player_client_override if player_client_override is not None else self._settings.ytdlp_player_client
+        )
+        if player_client:
+            extractor_args["youtube"] = {"player_client": list(player_client)}
         if self._settings.ytdlp_pot_provider_url:
             extractor_args["youtubepot-bgutilhttp"] = {"base_url": [self._settings.ytdlp_pot_provider_url]}
         if extractor_args:
@@ -128,30 +197,35 @@ class Resolver:
             }
         return options
 
-    def _get_ytdl_options(self) -> dict[str, Any]:
+    def _get_ytdl_options(self, *, fast: bool) -> dict[str, Any]:
+        if fast:
+            if self._fast_ytdl_options is None:
+                self._fast_ytdl_options = self._build_options(player_client_override=_FAST_PLAYER_CLIENT)
+            return self._fast_ytdl_options
         if self._ytdl_options is None:
             self._ytdl_options = self._build_options()
         return self._ytdl_options
 
-    def _extract_sync(self, query: str) -> dict[str, Any]:
+    def _extract_sync(self, query: str, *, fast: bool) -> dict[str, Any]:
         # Reused per-thread rather than `with yt_dlp.YoutubeDL(...) as ydl:`
         # — that context-manager form discards the in-memory signature
         # cache on every call (see _ytdl_tlocal above).
         tlocal = self._ytdl_tlocal
-        ydl = getattr(tlocal, "instance", None)
+        attr = "fast_instance" if fast else "instance"
+        ydl = getattr(tlocal, attr, None)
         if ydl is None:
-            ydl = yt_dlp.YoutubeDL(self._get_ytdl_options())
-            tlocal.instance = ydl
+            ydl = yt_dlp.YoutubeDL(self._get_ytdl_options(fast=fast))
+            setattr(tlocal, attr, ydl)
         info = ydl.extract_info(query, download=False)
         return info if isinstance(info, dict) else {}
 
-    async def _extract_info(self, query: str) -> dict[str, Any]:
+    async def _extract_info_via(self, query: str, *, fast: bool, timeout: float) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
         async with self._semaphore:
             try:
                 info = await asyncio.wait_for(
-                    loop.run_in_executor(self._executor, self._extract_sync, query),
-                    timeout=self._settings.ytdlp_extract_timeout_seconds,
+                    loop.run_in_executor(self._executor, functools.partial(self._extract_sync, query, fast=fast)),
+                    timeout=timeout,
                 )
             except TimeoutError as exc:
                 raise DownloadError(f"Timed out resolving {query!r}") from exc
@@ -159,6 +233,41 @@ class Resolver:
                 raise DownloadError(str(exc)) from exc
         if not info:
             raise DownloadError(f"yt-dlp returned nothing for {query!r}")
+        return info
+
+    def _has_playable_url(self, info: dict[str, Any]) -> bool:
+        # Mirrors resolve()'s own entries-vs-item unwrapping below — used
+        # only to decide whether the fast attempt is good enough to keep,
+        # not to build the actual Track (resolve() still does that itself
+        # from whichever info dict this function ends up returning).
+        entries = info.get("entries") if isinstance(info, dict) else None
+        item = next((e for e in entries if e), None) if entries is not None else info
+        return bool(item and item.get("url"))
+
+    async def _extract_info(self, query: str) -> dict[str, Any]:
+        if self._fast_client_enabled:
+            start = time.monotonic()
+            try:
+                info = await self._extract_info_via(
+                    query, fast=True, timeout=min(self._settings.ytdlp_extract_timeout_seconds, _FAST_EXTRACT_TIMEOUT_SECONDS)
+                )
+            except DownloadError as exc:
+                log.info(
+                    "Fast resolve (visionos) failed for %r after %.1fs (%s) — falling back.",
+                    query, time.monotonic() - start, exc,
+                )
+            else:
+                if self._has_playable_url(info):
+                    log.debug("Fast resolve (visionos) for %r took %.1fs.", query, time.monotonic() - start)
+                    return info
+                log.info(
+                    "Fast resolve (visionos) returned no playable format for %r after %.1fs — falling back.",
+                    query, time.monotonic() - start,
+                )
+
+        start = time.monotonic()
+        info = await self._extract_info_via(query, fast=False, timeout=self._settings.ytdlp_extract_timeout_seconds)
+        log.debug("Resolve for %r took %.1fs.", query, time.monotonic() - start)
         return info
 
     def _query_for(self, raw: str) -> str:
