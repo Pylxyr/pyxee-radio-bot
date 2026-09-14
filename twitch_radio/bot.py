@@ -42,6 +42,14 @@ async def _async_run(settings: Settings) -> None:
     blocklist_store = JsonStore(settings.blocklist_path)
     specs_store = JsonStore(settings.specs_path)
 
+    # Fire-and-forget: warms up yt-dlp's worker threads (and, once cached,
+    # persists across restarts too) before the first real !sr arrives. Never
+    # awaited inline — must not delay the rest of startup — and warm_up()
+    # itself is non-fatal on failure, so this is pure upside.
+    warmup_task = asyncio.create_task(resolver.warm_up(), name="resolver-warmup")
+    _bg_tasks.add(warmup_task)
+    warmup_task.add_done_callback(_bg_tasks.discard)
+
     player = RadioPlayer(
         resolver=resolver.resolve,
         audio_bitrate_kbps=settings.audio_bitrate_kbps,
