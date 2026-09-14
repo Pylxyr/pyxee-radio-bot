@@ -65,6 +65,9 @@ from twitch_radio.store import JsonStore
 from twitch_radio.tunables import TUNABLE_BOUNDS, TwitchTunables
 
 if TYPE_CHECKING:
+    from twitchio.authentication import ValidateTokenPayload
+    from twitchio.payloads import TokenRefreshedPayload
+
     from twitch_radio.extraction import Resolver
 
 log = logging.getLogger(__name__)
@@ -506,9 +509,9 @@ class TwitchChatBot(commands.Bot):
         self._bot_id = bot_id
         self._token_storage_path = token_storage_path
         # Set once subscribe_websocket() succeeds — save_tokens() retries the
-        # subscription on every call until this is True, so completing OAuth
-        # (or fixing a scope problem) while already running takes effect
-        # immediately instead of needing a restart.
+        # subscription on every call until this is True (see add_token()
+        # and event_token_refreshed() below for what actually triggers
+        # save_tokens() live, not just at shutdown).
         self._chat_subscribed = False
         # Per-chatter state — deliberately in-memory only: losing cooldown/
         # pending tracking across a restart is harmless, and persisting it
@@ -522,6 +525,14 @@ class TwitchChatBot(commands.Bot):
         await super().load_tokens(path or str(self._token_storage_path))
 
     async def save_tokens(self, path: str | None = None, /) -> None:
+        """Writes tokens to disk, locks the file down, and retries the chat
+        subscription (a no-op once already subscribed). twitchio's own
+        Client only calls this method on a *graceful* close — never
+        automatically after OAuth completes or after a background token
+        refresh — so add_token() and event_token_refreshed() below both
+        call it explicitly. That's what actually makes completing OAuth
+        (or a routine token refresh) while already running take effect
+        immediately, instead of only ever persisting at the next restart."""
         self._token_storage_path.parent.mkdir(parents=True, exist_ok=True)
         target = path or str(self._token_storage_path)
         await super().save_tokens(target)
@@ -532,11 +543,26 @@ class TwitchChatBot(commands.Bot):
         # can reset permissions.
         with contextlib.suppress(OSError):
             Path(target).chmod(0o600)
-        # Called both right after the OAuth callback saves a fresh token and
-        # on every routine background refresh — _try_subscribe_chat() is a
-        # no-op once already subscribed, so this is what makes completing
-        # OAuth while already running work without a restart.
         await self._try_subscribe_chat()
+
+    async def add_token(self, token: str, refresh: str) -> ValidateTokenPayload:
+        """twitchio calls this automatically the instant an OAuth
+        authorization completes (via its own event_oauth_authorized), well
+        before setup_hook() or any later save_tokens() call — verified
+        directly against twitchio==3.3.2's Client.close(), which is the
+        *only* place the base class calls save_tokens() on its own."""
+        response = await super().add_token(token, refresh)
+        await self.save_tokens()
+        return response
+
+    async def event_token_refreshed(self, payload: TokenRefreshedPayload) -> None:
+        """twitchio dispatches this after silently refreshing a
+        soon-to-expire token in the background — with no listener, the
+        refreshed pair only lives in memory until save_tokens() next runs
+        (graceful shutdown), so an ungraceful stop (crash, power loss,
+        `kill -9`) in between loads a stale, already-rotated refresh token
+        on the next start and forces re-authorization."""
+        await self.save_tokens()
 
     def _oauth_complete(self) -> bool:
         if not self._token_storage_path.exists():
