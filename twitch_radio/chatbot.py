@@ -37,6 +37,7 @@ where). Full walkthrough in README.md; short version:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -128,20 +129,46 @@ class SongRequestComponent(commands.Component):
             await ctx.reply("Queue's full right now — try again in a bit.")
             return
 
+        try:
+            requester_id = int(ctx.chatter.id)
+        except (TypeError, ValueError):
+            # Bail out rather than fall back to a fixed sentinel (e.g.
+            # 0) — that would let two different chatters hitting this
+            # branch collide under the same fake requester_id.
+            await ctx.reply("Couldn't identify you — try again.")
+            return
+
         self.bot.last_request_at[chatter_key] = now
         self.bot.pending_by_chatter[chatter_key] = pending + 1
+
+        # Resolving is a real network round trip — anywhere from under a
+        # second to ~15-20s cold — so !sr replies right away instead of
+        # leaving chat wondering whether the bot even saw the command.
+        # _resolve_and_queue (a background task, not awaited here) sends the
+        # actual "Queued: ..." or an error once resolution finishes; it owns
+        # releasing the pending-count reservation made just above, on every
+        # exit path, the same way this method used to.
+        await ctx.reply(f"Looking up {query!r}\u2026")
+
+        requester_name = ctx.chatter.display_name or ctx.chatter.name or "a viewer"
+        task = asyncio.create_task(
+            self._resolve_and_queue(ctx, query, chatter_key, requester_id, requester_name),
+            name=f"song-request-{chatter_key}",
+        )
+        self.bot.background_tasks.add(task)
+        task.add_done_callback(self.bot.background_tasks.discard)
+
+    async def _resolve_and_queue(
+        self, ctx: commands.Context, query: str, chatter_key: str, requester_id: int, requester_name: str
+    ) -> None:
+        """The slow half of !sr, split out of song_request() so a slow
+        resolve can't delay that command's own reply (see the comment
+        there). ctx.reply() has no dependency on the originating command's
+        coroutine still being alive — it's a plain API call keyed off
+        already-captured channel/message-id attributes — so replying from
+        here, well after song_request() has returned, is safe."""
         reserved = True
-
         try:
-            try:
-                requester_id = int(ctx.chatter.id)
-            except (TypeError, ValueError):
-                # Bail out rather than fall back to a fixed sentinel (e.g.
-                # 0) — that would let two different chatters hitting this
-                # branch collide under the same fake requester_id.
-                await ctx.reply("Couldn't identify you — try again.")
-                return
-
             # Cheap pre-resolve check for a direct link to something already
             # blocked — skips the network round trip for the common case of
             # re-pasting a link a mod just blocked. Doesn't replace the
@@ -171,6 +198,11 @@ class SongRequestComponent(commands.Component):
             if track.is_live:
                 await ctx.reply("Can't queue a livestream — sorry!")
                 return
+
+            # Re-read rather than reuse whatever song_request() read before
+            # resolving — a mod could easily adjust /settings during a
+            # multi-second resolve.
+            tunables = TwitchTunables.from_dict(await self.bot.tunables_store.read())
 
             if 0 < tunables.max_request_duration_seconds < track.duration:
                 minutes = tunables.max_request_duration_seconds // 60
@@ -208,13 +240,20 @@ class SongRequestComponent(commands.Component):
                 QueuedRequest(
                     webpage_url=track.webpage_url,
                     requester_id=requester_id,
-                    requester_name=ctx.chatter.display_name or ctx.chatter.name or "a viewer",
+                    requester_name=requester_name,
                     title=track.title,
                     on_start=_on_start,
                 )
             )
             reserved = False  # ownership of the reservation now belongs to on_start's eventual decrement
             await ctx.reply(f"Queued: {track.title} (#{self.bot.player.queue_size()} in queue)")
+        except Exception:
+            # Catch-all so a bug here can't silently eat the chatter's
+            # pending-count reservation forever, or fail with no reply at
+            # all — create_task() has no caller left to propagate to.
+            log.exception("Unhandled error resolving/queuing song request: %s", query)
+            with contextlib.suppress(Exception):
+                await ctx.reply("Something went wrong queuing that — try again.")
         finally:
             if reserved:
                 remaining_pending = self.bot.pending_by_chatter.get(chatter_key, 1) - 1
@@ -518,6 +557,11 @@ class TwitchChatBot(commands.Bot):
         # would add complexity for no real benefit.
         self.last_request_at: dict[str, float] = {}
         self.pending_by_chatter: Counter[str] = Counter()
+        # Strong references to in-flight _resolve_and_queue() tasks — without
+        # this, asyncio is free to garbage-collect a fire-and-forget task
+        # mid-flight (a well-known footgun; see the asyncio docs on
+        # create_task). Entries remove themselves via add_done_callback.
+        self.background_tasks: set[asyncio.Task[None]] = set()
 
     async def load_tokens(self, path: str | None = None, /) -> None:
         # Redirects TwitchIO's default token file into DATA_DIR instead.
