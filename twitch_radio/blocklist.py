@@ -8,9 +8,9 @@ _YOUTUBE_ID_RE = re.compile(r"^[\w-]{11}$")
 
 _YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}
 _SOUNDCLOUD_HOSTS = {"soundcloud.com", "www.soundcloud.com", "m.soundcloud.com"}
-# SoundCloud profile tabs — /artist/<one of these> is 2 path segments too,
-# same shape as a real /artist/track-slug link, so the segment count alone
-# can't tell them apart.
+# SoundCloud profile tabs — /artist/<one of these> has the same 2-segment
+# shape as a real /artist/track-slug link, so segment count alone can't
+# tell them apart.
 _SOUNDCLOUD_RESERVED_SEGMENTS = {
     "tracks", "albums", "sets", "likes", "reposts", "comments",
     "followers", "following", "popular-tracks",
@@ -19,16 +19,12 @@ _SOUNDCLOUD_RESERVED_SEGMENTS = {
 
 def normalize_track_key(url: str) -> str | None:
     """Returns a stable block-key for a YouTube or SoundCloud track URL, or
-    None if the URL isn't recognized as either (matches
-    extraction.py's own YouTube/SoundCloud-only restriction — nothing else
-    is ever playable here anyway).
+    None if the URL isn't recognized as either.
 
     YouTube keys are the bare 11-character video ID, so youtu.be/<id>,
     youtube.com/watch?v=<id>, and youtube.com/shorts/<id> all normalize to
-    the same key regardless of which form a mod happened to paste or which
-    form yt-dlp's webpage_url comes back as. SoundCloud has no separate
-    short-link form to worry about, so its key is just the lowercased path
-    with query/fragment stripped.
+    the same key. SoundCloud has no separate short-link form, so its key
+    is just the lowercased path with query/fragment stripped.
     """
     try:
         parts = urlsplit(url.strip())
@@ -57,10 +53,9 @@ def normalize_track_key(url: str) -> str | None:
 
 def looks_like_a_single_track(url: str, key: str | None) -> bool:
     """False for a URL-shaped !block target that won't usefully match
-    anything: a YouTube playlist/channel link (key is None — no video ID
-    to extract) or a SoundCloud profile/set/tab link (key isn't None,
-    since normalize_track_key() keys SoundCloud by raw path regardless of
-    shape — a real track path is exactly two segments, /artist/track)."""
+    anything: a YouTube playlist/channel link (key is None) or a
+    SoundCloud profile/set/tab link (a real track path is exactly two
+    segments, /artist/track)."""
     if key is None:
         return False
     if key.startswith("sc:"):
@@ -71,11 +66,7 @@ def looks_like_a_single_track(url: str, key: str | None) -> bool:
 
 def clean_list(value: Any) -> list[str]:
     """Tolerates a hand-edited or corrupted blocklist.json — anything that
-    isn't a list of strings is treated as empty rather than crashing (or
-    silently doing something wrong, e.g. set() on a stray string blocking
-    it character-by-character) the command that touches it. Same
-    philosophy as tunables.py's from_dict degrading per-field instead of
-    raising."""
+    isn't a list of strings reads as empty rather than crashing."""
     if not isinstance(value, list):
         return []
     return [v for v in value if isinstance(v, str)]

@@ -14,17 +14,12 @@ log = logging.getLogger(__name__)
 
 
 class JsonStore:
-    """Tiny atomic JSON key-value file, guarded by an in-process lock.
+    """Tiny atomic JSON key-value file, guarded by an in-process asyncio.Lock.
 
-    This replaces the Discord bot's single-row aiosqlite table for the same
-    data — that made sense when it lived inside a process that already had a
-    shared-write-lock aiosqlite connection open for a dozen other tables;
-    pulling in aiosqlite here just for one row of settings would be a lot of
-    dependency for very little. Reads/writes are serialized by asyncio.Lock
-    (this data is only ever touched from the chat bot's commands and the
-    /settings HTTP handler, both in the same event loop), and writes are
-    write-temp-then-rename so a crash mid-write can never leave a corrupt or
-    half-written file behind.
+    Reads/writes are serialized by the lock (this data is only ever touched
+    from the chat bot's commands and the /settings HTTP handler, both on the
+    same event loop), and writes are write-temp-then-rename so a crash
+    mid-write can never leave a corrupt or half-written file behind.
     """
 
     def __init__(self, path: Path) -> None:
@@ -42,16 +37,10 @@ class JsonStore:
     async def update(
         self, mutator: Callable[[dict[str, Any]], dict[str, Any] | None]
     ) -> dict[str, Any]:
-        """Read-modify-write while holding the lock across all three steps.
-
-        Plain `read()` then `write()` from a caller is two separate lock
-        acquisitions with an await in between — two concurrent callers (e.g.
-        two /settings submissions) can each read the same starting state and
-        the second write silently clobbers the first. `mutator` receives the
-        current dict and returns the dict to persist, or None to leave the
-        file untouched (e.g. the caller's own validation failed) — either
-        way the lock isn't released until the write (or no-op) is done.
-        """
+        """Read-modify-write while holding the lock across all three steps,
+        so two concurrent callers (e.g. two /settings submissions) can't
+        silently clobber each other. `mutator` returns the dict to persist,
+        or None to leave the file untouched."""
         async with self._lock:
             current = await asyncio.to_thread(self._read_sync)
             updated = mutator(current)
@@ -67,9 +56,8 @@ class JsonStore:
         except FileNotFoundError:
             return {}
         except (json.JSONDecodeError, OSError):
-            # Falls back to defaults either way, but silently is the wrong
-            # failure mode for "someone's saved tunables just vanished" —
-            # this should show up in the logs even though it's non-fatal.
+            # Falls back to defaults either way, but this should show up in
+            # the logs rather than silently vanishing someone's saved settings.
             log.warning("Couldn't read %s — falling back to defaults.", self._path, exc_info=True)
             return {}
         if not isinstance(loaded, dict):

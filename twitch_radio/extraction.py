@@ -20,27 +20,21 @@ log = logging.getLogger(__name__)
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 # Security posture: only YouTube and SoundCloud are accepted, not "anything
-# yt-dlp supports" (thousands of sites). Every extractor is more attack
-# surface — arbitrary sites can serve crafted metadata (title, uploader,
-# thumbnail) that flows into the overlay page and chat replies, and yt-dlp
-# itself has occasionally shipped extractor-specific bugs for less-trafficked
-# sites. Enforced twice, deliberately redundant: _ALLOWED_URL_HOSTS below
-# rejects a disallowed URL immediately, before any network call; the
+# yt-dlp supports". Every extractor is more attack surface — arbitrary
+# sites can serve crafted metadata (title, uploader, thumbnail) that flows
+# into the overlay page and chat replies. Enforced twice: _ALLOWED_URL_HOSTS
+# below rejects a disallowed URL before any network call; the
 # `allowed_extractors` yt-dlp option in _build_options() is defense-in-depth
-# in case a URL matches an allowed host but a redirect or embed resolves it
-# through something else internally (e.g. the generic extractor).
+# in case a redirect or embed resolves an allowed-looking URL through
+# something else internally (e.g. the generic extractor).
 _ALLOWED_URL_HOSTS = {
     "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be",
     "soundcloud.com", "www.soundcloud.com", "m.soundcloud.com", "on.soundcloud.com",
 }
-# Matched with re.fullmatch against yt-dlp's lowercased IE_NAME for every
-# extractor it has (checked against yt-dlp==2026.08.19's actual matching
-# code, YoutubeDL.add_default_info_extractors / orderedSet_from_options) —
-# "youtube(:.*)?" covers every youtube:* variant (youtube:search for the
-# default text-search path, youtube:tab, youtube:clip, ...), same for
-# soundcloud. Deliberately does NOT include "generic" — that's yt-dlp's
-# scrape-any-webpage fallback, exactly what this restriction exists to keep
-# out.
+# Matched with re.fullmatch against yt-dlp's lowercased IE_NAME — covers
+# every youtube:*/soundcloud:* variant. Deliberately excludes "generic",
+# yt-dlp's scrape-any-webpage fallback, which this restriction exists to
+# keep out. Checked against yt-dlp==2026.08.19.
 _ALLOWED_EXTRACTORS = ["youtube(:.*)?", "soundcloud(:.*)?"]
 
 
@@ -59,76 +53,51 @@ class DownloadError(Exception):
 class UnsupportedSourceError(DownloadError):
     """Raised when a direct URL isn't from an allowed source (YouTube or
     SoundCloud) — distinct from DownloadError so the chat bot can give a
-    specific, accurate reply instead of the generic "couldn't fetch that"."""
+    specific reply instead of a generic "couldn't fetch that"."""
 
 
 class Resolver:
     """Turns a !sr query (URL or search text) into a playable Track.
 
-    Deliberately much simpler than the Discord bot's extraction pipeline: no
-    per-guild semaphores, no curation-mode isolation, no playlist expansion —
-    this service only ever needs one track per request, and there's no
-    sibling feature in-process to protect from contention (that whole
-    tiered-semaphore design existed specifically because Discord playback,
-    curation, and Twitch used to share one process; they don't anymore).
+    Deliberately simple: no per-guild semaphores, no playlist expansion —
+    this service only ever needs one track per request, with no sibling
+    feature in-process to protect from contention.
     """
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._semaphore = asyncio.Semaphore(settings.ytdlp_concurrency)
-        # A couple of threads wider than the semaphore on purpose: wait_for()
-        # timing out only cancels our *wait* on a hung extraction, not the
-        # underlying thread — it keeps running (ThreadPoolExecutor can't
-        # preempt it) and stays occupied indefinitely if the hang never
-        # clears. Sizing the pool 1:1 with the concurrency limit means every
-        # such hang permanently steals one of the only slots available, and
-        # repeated hangs eventually starve every future request even though
-        # the semaphore keeps handing out permits. The extra headroom doesn't
-        # prevent that in the limit, but it buys a meaningful margin before
-        # it happens. A real fix would run extraction out-of-process so a
-        # hung one can actually be killed.
+        # A couple of threads wider than the semaphore: a timed-out wait_for()
+        # only cancels our *wait*, not the underlying thread (ThreadPoolExecutor
+        # can't preempt it), so a hung extraction keeps occupying a worker
+        # indefinitely. The extra headroom buys margin before repeated hangs
+        # starve every future request. A real fix would run extraction
+        # out-of-process so a hung one can actually be killed.
         self._executor = ThreadPoolExecutor(
             max_workers=settings.ytdlp_concurrency + 2, thread_name_prefix="ytdlp"
         )
         # A !sr resolves once in chat (to confirm/queue it) and again in the
-        # player right before it actually plays — see resolve()'s docstring
-        # for why this cache is what makes the second one (usually) free.
-        # Keyed by resolved webpage_url, not the raw input query, since
-        # that's the only value both call sites are guaranteed to share.
+        # player right before it plays — see resolve()'s docstring. Keyed by
+        # resolved webpage_url, the only value both call sites share.
         self._cache: dict[str, tuple[Track, float]] = {}
 
-        # One yt-dlp options dict, built once and reused (mirrors
-        # _ytdl_instance below — Settings is frozen/loaded once at startup,
-        # so there's nothing to gain from rebuilding this per extraction).
         self._ytdl_options: dict[str, Any] | None = None
-        # A *reused*, thread-local YoutubeDL instance per worker thread,
-        # rather than a fresh one on every _extract_sync call. This is the
-        # actual fix for slow time-to-first-audio: YouTube's per-player-
-        # version JS signature challenge is solved once and cached on the
-        # extractor instance itself (in memory, on top of yt-dlp's on-disk
-        # cache — see cache_dir in _build_options). A brand-new YoutubeDL()
-        # every call throws that cache away every single time, so the ~6s
-        # Deno JS-challenge solve reruns from scratch on every !sr, even for
-        # a song already played minutes earlier. Mirrors PyxeeBot's
-        # musicbot/cogs/music/_extraction.py::_extract_info, which keeps
-        # exactly this kind of thread-local `tlocal.instances` cache and is
-        # why it doesn't pay that cost per-track.
+        # A *reused*, thread-local YoutubeDL instance per worker thread
+        # rather than a fresh one per call — YouTube's per-player-version JS
+        # signature challenge is solved once and cached on the extractor
+        # instance itself. A fresh YoutubeDL() every call throws that away,
+        # so the ~6s Deno JS-challenge solve would rerun from scratch on
+        # every !sr, even for a song played minutes earlier.
         self._ytdl_tlocal = threading.local()
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
 
     def _build_options(self) -> dict[str, Any]:
-        # yt-dlp's own diagnostic verbosity follows this service's LOG_LEVEL
-        # rather than a separate always-on switch — quiet in normal
-        # operation, but `LOG_LEVEL=DEBUG` gets full -v output for free
-        # without a code change or a second setting to remember.
         verbose = self._settings.log_level == "DEBUG"
         options: dict[str, Any] = {
-            # Audio-only when available (this pipeline immediately decodes
-            # to raw PCM and throws away any video track anyway — pulling a
-            # combined format wastes bandwidth for nothing), falling back to
-            # the best available format if no audio-only one is offered.
+            # Audio-only when available — this pipeline decodes to raw PCM
+            # and discards any video track anyway.
             "format": "bestaudio/best",
             "noplaylist": True,
             "quiet": not verbose,
@@ -137,41 +106,23 @@ class Resolver:
             "default_search": "ytsearch",
             "socket_timeout": 15,
             "extract_flat": False,
-            # See _ALLOWED_EXTRACTORS above — restricts yt-dlp itself to
-            # YouTube/SoundCloud as a second layer behind the URL-host check
-            # in resolve(), not a substitute for it (that check runs before
-            # any network call at all; this only matters once yt-dlp is
-            # already resolving something).
             "allowed_extractors": _ALLOWED_EXTRACTORS,
             # yt-dlp's default cache dir (~/.cache/yt-dlp) is unwritable
-            # under the systemd unit's ProtectHome=read-only — every write
-            # of a solved signature function there fails silently (visible
-            # as "Read-only file system" WARNINGs in the logs), so nothing
-            # ever survives a process restart. DENO_DIR already gets the
-            # same redirect-under-data/ treatment in the systemd unit for
-            # the same reason — this is the yt-dlp-side equivalent. Lives
-            # under DATA_DIR so it's covered by the unit's existing
-            # ReadWritePaths without any deploy changes.
+            # under the systemd unit's ProtectHome=read-only, so nothing
+            # would survive a restart. Lives under DATA_DIR, already
+            # covered by the unit's ReadWritePaths.
             "cache_dir": str(DATA_DIR / "yt-dlp-cache"),
         }
         extractor_args: dict[str, dict[str, list[str]]] = {}
         if self._settings.ytdlp_player_client:
             extractor_args["youtube"] = {"player_client": list(self._settings.ytdlp_player_client)}
         if self._settings.ytdlp_pot_provider_url:
-            # Passed straight through to the bgutil-ytdlp-pot-provider
-            # plugin, if installed — see README's cookies/PO-token note.
-            # A no-op if that plugin isn't present.
             extractor_args["youtubepot-bgutilhttp"] = {"base_url": [self._settings.ytdlp_pot_provider_url]}
         if extractor_args:
             options["extractor_args"] = extractor_args
         if self._settings.ytdlp_cookies_file is not None:
             options["cookiefile"] = str(self._settings.ytdlp_cookies_file)
         if self._settings.ytdlp_js_runtime_path:
-            # Explicit pin only — an unset path leaves yt-dlp's own default
-            # (auto-detect a `deno` binary on PATH) in place. The dict key
-            # must be the actual runtime name ("deno", "node", "bun", or
-            # "quickjs") — yt-dlp uses it to pick the calling convention, so
-            # a Deno path filed under "node" silently gets invoked wrong.
             options["js_runtimes"] = {
                 self._settings.ytdlp_js_runtime_name: {"path": self._settings.ytdlp_js_runtime_path}
             }
@@ -183,10 +134,9 @@ class Resolver:
         return self._ytdl_options
 
     def _extract_sync(self, query: str) -> dict[str, Any]:
-        # Reused per-thread (see _ytdl_tlocal in __init__) instead of
-        # `with yt_dlp.YoutubeDL(...) as ydl:` — that context-manager form
-        # looks harmless but silently discards yt-dlp's in-memory
-        # signature-function cache on every single call.
+        # Reused per-thread rather than `with yt_dlp.YoutubeDL(...) as ydl:`
+        # — that context-manager form discards the in-memory signature
+        # cache on every call (see _ytdl_tlocal above).
         tlocal = self._ytdl_tlocal
         ydl = getattr(tlocal, "instance", None)
         if ydl is None:
@@ -225,19 +175,14 @@ class Resolver:
 
     async def resolve(self, query: str, requester_id: int) -> Track | None:
         """Resolves one query to one Track, or None if nothing playable was
-        found (e.g. a search with zero results, or a private/deleted video).
-        Never raises for "not found" — only for actual failures (timeout,
-        network error), which the caller is expected to catch.
+        found. Never raises for "not found" — only for actual failures
+        (timeout, network error), which the caller is expected to catch.
 
         Cached briefly (YTDLP_CACHE_TTL_SECONDS) so the player's re-resolve
-        right before actual playback — which passes back exactly the
-        webpage_url this returned — reuses this result instead of running a
-        second full extraction for what's the same request arriving twice.
-        A cache hit still returns a fresh Track with the requested
-        requester_id, and callers that need a guaranteed live check (state
-        that could have changed since caching, like is_live) should treat a
-        cached result as informational, not gospel, for anything genuinely
-        safety-relevant.
+        right before playback reuses this result instead of a second full
+        extraction. A cache hit still returns a fresh Track with the
+        requested requester_id; treat a cached result as informational, not
+        gospel, for anything genuinely safety-relevant (e.g. is_live).
         """
         now = time.monotonic()
         raw = query.strip()
@@ -256,13 +201,11 @@ class Resolver:
         info = await self._extract_info(self._query_for(query))
 
         # A bare "ytsearchN:" query wraps its one hit in an "entries" list;
-        # a direct URL resolves straight to the item itself.
+        # a direct URL resolves straight to the item itself. entries == []
+        # (present but empty) is a genuine zero-results search and must NOT
+        # fall back to using info as the item — check "is None" specifically
+        # since both are otherwise falsy.
         entries = info.get("entries") if isinstance(info, dict) else None
-        # entries is None (key absent) for a direct URL resolve — the item
-        # IS info itself. entries == [] (key present, empty) is a genuine
-        # zero-results search and must NOT fall back to using info as the
-        # item — those are different things, but both are falsy in Python,
-        # so this has to check "is None" specifically rather than truthiness.
         item = next((e for e in entries if e), None) if entries is not None else info
         if not item:
             return None
@@ -271,15 +214,12 @@ class Resolver:
         webpage_url = item.get("webpage_url")
         if not webpage_url:
             if _URL_RE.match(query.strip()):
-                # The query itself was already a stable URL — safe to reuse.
                 webpage_url = query
             else:
                 # No stable URL to persist. Falling back to the raw search
-                # text here would silently turn into a *fresh* search the
-                # next time this gets re-resolved (player._play_one_inner
-                # calls back into resolve() with whatever webpage_url we
-                # return) — meaning the song that plays could end up being
-                # different from the one confirmed to the requester in chat.
+                # text would silently turn into a *fresh* search on the next
+                # re-resolve — the song that plays could differ from what
+                # was confirmed to the requester in chat.
                 log.warning(
                     "yt-dlp returned no webpage_url for %r and the query wasn't a URL either "
                     "— refusing to queue it rather than risk a different track playing later.",
@@ -294,9 +234,9 @@ class Resolver:
             webpage_url=webpage_url,
             stream_url=stream_url,
             uploader=item.get("uploader") or "Unknown uploader",
-            # yt-dlp reports duration=None for an in-progress livestream, which
-            # would otherwise read as "0 seconds" and slip straight past the
-            # max-duration check — is_live is what actually flags that case.
+            # yt-dlp reports duration=None for an in-progress livestream,
+            # which would otherwise read as 0s and slip past the max-duration
+            # check — is_live is what actually flags that case.
             duration=int(item.get("duration") or 0),
             requester_id=requester_id,
             thumbnail_url=item.get("thumbnail"),

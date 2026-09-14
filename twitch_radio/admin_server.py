@@ -20,12 +20,8 @@ from twitch_radio.tunables import TUNABLE_BOUNDS, TwitchTunables
 
 log = logging.getLogger(__name__)
 
-# (form field name, attribute name, min, max) — field name and attribute
-# name are identical for every tunable today, so this is just TUNABLE_BOUNDS
-# reshaped into the (name, name, lo, hi) tuples the form-handling code
-# below wants. Derived from tunables.py's TUNABLE_BOUNDS rather than
-# hardcoded again here, so this and the chat !setlimit command can't drift
-# apart on what range is actually allowed.
+# Derived from tunables.py's TUNABLE_BOUNDS (not re-hardcoded here) so this
+# and the chat !setlimit command can never drift apart on allowed ranges.
 _FIELDS = [(name, name, lo, hi) for name, (lo, hi) in TUNABLE_BOUNDS.items()]
 
 _OVERLAY_HTML = """<!doctype html>
@@ -107,8 +103,7 @@ function applyAccent(url) {
         r += px[i]; g += px[i + 1]; b += px[i + 2]; n++;
       }
       r = Math.round(r / n); g = Math.round(g / n); b = Math.round(b / n);
-      // Boost toward legible against the dark panel — thumbnail averages
-      // skew muddy otherwise.
+      // Boost toward legible against the dark panel — raw thumbnail averages skew muddy.
       const max = Math.max(r, g, b) || 1;
       const boost = 255 / max * 0.75;
       r = Math.min(255, Math.round(r * boost + 40));
@@ -116,8 +111,7 @@ function applyAccent(url) {
       b = Math.min(255, Math.round(b * boost + 40));
       panel.style.setProperty('--accent', `rgb(${r},${g},${b})`);
     } catch (e) {
-      // Tainted canvas (CDN didn't send permissive CORS headers) — keep
-      // whatever accent is already set rather than breaking the overlay.
+      // Tainted canvas (no permissive CORS from the CDN) — keep the current accent.
     }
   };
   img.onerror = () => {};
@@ -141,16 +135,10 @@ function render(data, elapsed) {
       lastThumb = data.thumbnail_url;
       applyAccent(data.thumbnail_url);
     }
-    // escapeHtml() here (not just on title/uploader/requester_name below)
-    // because this string gets spliced directly into an HTML attribute,
-    // not set via .textContent — an unescaped thumbnail_url containing a
-    // stray quote could break out of the style="..." attribute and inject
-    // markup. title/uploader/requester_name are effectively free-text
-    // (YouTube titles, Twitch display names); thumbnail_url is normally a
-    // YouTube-generated CDN URL, but !sr accepts arbitrary yt-dlp-supported
-    // URLs from any chatter, and some extractors pull thumbnail URLs from
-    // page metadata the target site's owner controls — escape it the same
-    // as everything else rather than trusting the source.
+    // escapeHtml() here too (not just on title/uploader/requester below): this
+    // value lands inside an HTML attribute (style="...url('...')"), where an
+    // unescaped quote can break out and inject markup — !sr accepts arbitrary
+    // URLs from chat, so thumbnail_url isn't trustworthy input.
     const thumb = data.thumbnail_url ? `style="background-image:url('${escapeHtml(data.thumbnail_url)}')"` : '';
     const next = (data.queue || []).slice(0, 2)
       .map(q => `<div class="next-item">${escapeHtml(q.title)}</div>`).join('');
@@ -169,17 +157,16 @@ function render(data, elapsed) {
       </div>
       ${next ? `<div class="next"><div class="next-label">Up next</div>${next}</div>` : ''}
     `;
-    // Rebuilt fresh above, so opacity starts at 0 — nudge it to 1 on the
-    // next frame so the CSS transition actually has something to animate.
+    // Rebuilt fresh above with opacity 0 — bump to 1 next frame so the
+    // fade-in transition actually has something to animate from.
     requestAnimationFrame(() => {
       const t = document.getElementById('t-title');
       if (t) t.style.opacity = '1';
     });
   }
 
-  // Runs every frame (~60/sec via tick()) — only touch the two nodes that
-  // actually change per-frame, not a full innerHTML rebuild, which would
-  // wipe out the thumbnail/title/fade-in above 60 times a second.
+  // Runs every frame via tick() — only touches the two per-frame-changing
+  // nodes, not a full innerHTML rebuild (which would undo the fade-in above).
   const pct = data.duration_seconds > 0 ? Math.min(100, (elapsed / data.duration_seconds) * 100) : 0;
   const fillEl = document.getElementById('t-fill');
   const elapsedEl = document.getElementById('t-elapsed');
@@ -188,26 +175,17 @@ function render(data, elapsed) {
 }
 
 function escapeHtml(s) {
-  // Deliberately NOT the textContent/innerHTML round-trip trick — that
-  // only escapes &, <, > (correct for text-node content, which is most
-  // uses below) but leaves both quote characters untouched. thumbnail_url
-  // is spliced into an HTML *attribute* (style="...url('...')..."), where
-  // an un-escaped " can close the attribute early and inject a new one —
-  // e.g. a crafted thumbnail_url of `x" onmouseover="..."` would break out
-  // and run script. Escaping quotes here too makes this one function safe
-  // for both contexts, text and attribute, rather than silently depending
-  // on every call site happening to only ever use it as text.
+  // Not the textContent/innerHTML round-trip trick — that leaves quotes
+  // unescaped, which is unsafe here since thumbnail_url is spliced into an
+  // HTML attribute, not just text content (see the call site above).
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[c]));
 }
 
 async function poll() {
-  // Fallback path only — the WebSocket connection below is the primary
-  // source of truth and pushes a fresh snapshot on every change; this just
-  // keeps the overlay working if WebSocket is unavailable or its
-  // connection is currently down (skipped while it's open, so it's a
-  // once-per-2s no-op fetch the rest of the time, not real polling).
+  // Fallback only — skipped whenever the WebSocket below is open, so this
+  // is a once-per-2s no-op except when that connection is down or unsupported.
   if (ws && ws.readyState === WebSocket.OPEN) return;
   try {
     const res = await fetch('/nowplaying.json');
@@ -223,16 +201,14 @@ function connectWs() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     socket = new WebSocket(`${proto}//${location.host}/ws/nowplaying`);
   } catch (e) {
-    // No WebSocket support at all (unlikely, but some embedded browser
-    // sources are old) — poll() above just keeps running unattended.
-    return;
+    return;  // no WebSocket support — poll() carries the whole load
   }
   ws = socket;
   socket.onmessage = (ev) => {
     try {
       last = JSON.parse(ev.data);
       lastFetchedAt = performance.now();
-    } catch (e) { /* malformed frame — next one (or the poll() backstop) recovers */ }
+    } catch (e) { /* malformed frame — next one (or poll()) recovers */ }
   };
   socket.onclose = () => { if (ws === socket) ws = null; setTimeout(connectWs, 2000); };
   socket.onerror = () => { try { socket.close(); } catch (e) {} };
@@ -255,23 +231,16 @@ tick();
 
 
 class _AuthRateLimiter:
-    """Basic Auth has no built-in lockout — without this, /settings is
-    brute-forceable at whatever rate the network allows (the password is
-    normally a machine-generated random string, so this mostly matters if
-    someone's set a memorable custom one). Tracks failed attempts per client
-    IP in a sliding window; once a caller exceeds the threshold, further
-    attempts — even with the correct password — are rejected with 429 until
-    the window rolls over. In-memory only, resets on restart: fine for what
-    this defends against (a sustained guessing script), not meant to survive
-    a determined attacker who can just restart the service.
+    """Sliding-window lockout for /settings — HTTP Basic Auth has no
+    built-in rate limiting, so without this it's brute-forceable at
+    whatever rate the network allows. In-memory only (resets on restart):
+    enough to blunt a sustained guessing script, not meant to survive a
+    determined attacker who can just restart the service.
 
-    Caveat: keyed by request.remote, which is the direct TCP peer as aiohttp
-    sees it — behind a reverse proxy (README suggests one for TLS), every
-    request arrives from the proxy's own address, so this degrades to one
-    shared bucket for all callers rather than one per real client. Trusting
-    X-Forwarded-For instead would fix that but opens a spoofing vector of
-    its own unless paired with a proxy allowlist, which felt like more
-    surface than this warranted.
+    Keyed by request.remote — the direct TCP peer as aiohttp sees it, so
+    behind a reverse proxy every request shares one bucket rather than one
+    per real client. Trusting X-Forwarded-For instead would fix that but
+    opens a spoofing vector without a proxy allowlist to go with it.
     """
 
     def __init__(self, max_attempts: int = 10, window_seconds: float = 300.0) -> None:
@@ -337,11 +306,9 @@ class AdminServer:
         return hmac.compare_digest(password, self._settings_password)
 
     def _authorize(self, request: web.Request) -> web.Response | None:
-        """Combines the password check above with the rate limiter — the
-        single thing every /settings handler should call. Returns None if
-        the request may proceed, otherwise the exact response to return
-        (401 for a bad/missing password, 429 if this IP's been locked out).
-        """
+        """Password check + rate limiter combined — the one thing every
+        /settings handler should call. None means proceed; otherwise the
+        response to return as-is (401 bad/missing password, 429 locked out)."""
         if self._settings_password is None:
             return None
         ip = request.remote or "unknown"
@@ -358,19 +325,16 @@ class AdminServer:
         return self._unauthorized()
 
     def _check_origin(self, request: web.Request) -> bool:
-        """CSRF defense for POST /settings. Basic Auth credentials are
-        browser-cached per-origin and get attached automatically to a
-        cross-site form POST — unlike cookies, there's no SameSite-style
-        protection for Basic Auth — so without this, a malicious page could
-        submit settings changes on a logged-in admin's behalf just by
-        auto-submitting a hidden form. Verifies Origin (falling back to
-        Referer) matches the request's own Host: the standard
-        OWASP-recommended "Verifying Origin With Standard Headers" defense.
-        Only enforced when one of those headers is actually present, so
-        non-browser callers that don't send either (curl, a Stream Deck
-        script hitting this on purpose) aren't broken by it — every modern
-        browser sends Origin on a cross-site POST regardless, so this still
-        stops the actual attack.
+        """CSRF defense for POST /settings: Basic Auth credentials are
+        browser-cached per-origin and attach automatically to a cross-site
+        form POST (no SameSite-style protection the way cookies have), so
+        without this a malicious page could submit settings changes on a
+        logged-in admin's behalf. Verifies Origin (falling back to Referer)
+        matches the request's own Host — the OWASP "Verifying Origin With
+        Standard Headers" defense. Only enforced when one of those headers
+        is present, so non-browser callers (curl, a Stream Deck script)
+        aren't broken by it; every real browser sends Origin on a
+        cross-site POST regardless, so the actual attack is still stopped.
         """
         source = request.headers.get("Origin")
         if source is None:
@@ -416,13 +380,10 @@ class AdminServer:
 
     async def handle_ws_nowplaying(self, request: web.Request) -> web.WebSocketResponse:
         """Push-based counterpart to /nowplaying.json — the overlay prefers
-        this (see _OVERLAY_HTML's connectWs()) and falls back to polling
-        /nowplaying.json if this connection is unavailable or drops. Sends
-        one full snapshot on connect, then another every time RadioPlayer
-        reports something changed (new track, track ended, queue edited) —
-        the client computes the smoothly-ticking elapsed-time display itself
-        from elapsed_seconds + a local clock, so this doesn't need to push
-        every second, only on actual state changes."""
+        this and falls back to polling /nowplaying.json if it's unavailable
+        (see connectWs() above). Sends one snapshot on connect, then another
+        whenever RadioPlayer reports a change; the client ticks elapsed time
+        between pushes itself, so this doesn't need to send every second."""
         ws = web.WebSocketResponse(heartbeat=30)
         await ws.prepare(request)
         state_queue = self._player.subscribe_state()
@@ -432,12 +393,7 @@ class AdminServer:
                 try:
                     await asyncio.wait_for(state_queue.get(), timeout=30)
                 except TimeoutError:
-                    # Nothing changed — just a periodic wakeup so a dead
-                    # connection (no clean close frame received) still gets
-                    # noticed via ws.closed below in reasonable time, not
-                    # only whenever the next real state change happens to
-                    # occur.
-                    pass
+                    pass  # just a periodic wakeup so a dead connection is noticed via ws.closed below
                 if ws.closed:
                     break
                 await ws.send_json(self._nowplaying_payload())
@@ -448,9 +404,9 @@ class AdminServer:
         return ws
 
     async def handle_blocklist(self, request: web.Request) -> web.Response:
-        """Full blocklist contents, gated the same as /settings — the
-        !blocklist chat command only gives counts (keeping chat short), so
-        this is where a mod actually reviews or audits what's blocked."""
+        """Full blocklist contents, gated like /settings — !blocklist in
+        chat only gives counts, so this is where a mod actually audits
+        what's blocked."""
         denied = self._authorize(request)
         if denied is not None:
             return denied
@@ -479,9 +435,9 @@ class AdminServer:
             while True:
                 chunk = await queue.get()
                 if not chunk:
-                    # Empty-bytes sentinel from RadioPlayer._pump_encoder_output
-                    # — this subscriber was dropped for falling behind;
-                    # nothing more will ever arrive on this queue.
+                    # Empty-bytes sentinel from _pump_encoder_output — this
+                    # subscriber was dropped for falling behind; nothing more
+                    # will arrive on this queue.
                     break
                 await response.write(chunk)
         except (ConnectionResetError, asyncio.CancelledError):
@@ -545,10 +501,9 @@ class AdminServer:
                 if raw is not None:
                     updated[field] = str(raw)
             # Routed through from_dict()/to_dict() so the strip+length-clamp
-            # (and the fixed set of known fields) is applied in one place —
-            # specs.py — rather than duplicated here. Free-text fields have
-            # no failure mode the way tunable bounds do, so unlike _mutate
-            # above there's nothing to add to `errors`; this always saves.
+            # lives in one place (specs.py). Free-text fields have no
+            # failure mode the way tunable bounds do, so unlike _mutate
+            # above, nothing here ever adds to `errors`.
             return {**PCSpecs.from_dict(updated).to_dict(), **Peripherals.from_dict(updated).to_dict()}
 
         specs_result = await self._specs_store.update(_mutate_specs)

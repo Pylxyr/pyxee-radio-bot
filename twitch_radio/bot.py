@@ -47,10 +47,9 @@ async def _async_run(settings: Settings) -> None:
         audio_bitrate_kbps=settings.audio_bitrate_kbps,
         pause_when_no_listeners=settings.pause_when_no_listeners,
     )
-    # player.start() spawns a persistent background task before anything
-    # else here exists — nested try/finally per resource, not one big try
-    # around just the chat bot, so a failure acquiring a *later* resource
-    # still tears down everything already acquired.
+    # Nested try/finally per resource (not one big try around just the chat
+    # bot) so a failure acquiring a *later* resource still tears down
+    # everything already acquired.
     player.start()
     try:
         admin_runner = await run_admin_server(
@@ -150,7 +149,7 @@ def _check_config() -> int:
         print("Config check FAILED: ffmpeg not found on PATH.")
         return 1
 
-    # Deliberately doesn't print client_secret or settings_password.
+    # Deliberately never prints client_secret or settings_password.
     print("Config OK:")
     print(f"  Twitch: bot_id={settings.bot_id} owner_id={settings.owner_id} prefix={settings.prefix!r}")
     print(f"  Audio: {settings.audio_bitrate_kbps} kbps, pause_when_no_listeners={settings.pause_when_no_listeners}")

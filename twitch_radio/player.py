@@ -25,18 +25,13 @@ _MIN_BACKOFF = 5.0
 _MAX_BACKOFF = 300.0
 _STABLE_UPTIME_SECONDS = 30.0
 _DECODER_START_TIMEOUT = 20.0
-# Separate from _DECODER_START_TIMEOUT above: that one guards getting the
-# *first* chunk out of a freshly-spawned decoder; this one guards every
-# read for the rest of the track. Without it, a decoder that stops
-# producing output mid-track (source's connection drops, a CDN stalls,
-# ffmpeg itself hangs on a flaky socket) just sits in `await stdout.read()`
-# forever — no more audio is written to the encoder, !skip still works
-# (the decoder process is still there to kill), but nothing recovers on
-# its own and the stream just goes silent indefinitely until a mod
-# notices and skips it by hand. 20s is generous: normal chunks arrive
-# roughly every _CHUNK_DURATION thanks to ffmpeg's -re real-time pacing,
-# so a real 20s gap means the source is actually stuck, not just briefly
-# slow.
+# Guards every stdout read for the rest of a track (separate from
+# _DECODER_START_TIMEOUT, which only covers the first chunk). Without it, a
+# decoder that stops producing output mid-track just hangs in
+# `await stdout.read()` forever — !skip still works, but nothing recovers
+# on its own. 20s is generous: chunks normally arrive every _CHUNK_DURATION
+# via ffmpeg's -re real-time pacing, so a real 20s gap means the source is
+# actually stuck.
 _STALL_TIMEOUT_SECONDS = 20.0
 
 
@@ -70,8 +65,8 @@ class RadioPlayer:
     """Owns one persistent ffmpeg encoder producing a continuous MP3 stream
     from resolved tracks + silence between them, fanned out to any number of
     HTTP subscribers (see subscribe()/unsubscribe()) — e.g. an OBS Media
-    Source on the streamer's own machine. Nothing is pushed anywhere on its
-    own; playback only happens where something is actually listening.
+    Source. Nothing is pushed anywhere on its own; playback only happens
+    where something is actually listening.
     """
 
     def __init__(
@@ -91,13 +86,10 @@ class RadioPlayer:
         self._current_decoder: asyncio.subprocess.Process | None = None
         self._now_playing: NowPlaying | None = None
         # The request currently occupying the player's one "slot" — set the
-        # instant it's dequeued, cleared when it's done playing (or fails).
-        # now_playing alone isn't enough to identify it: it stays None for
-        # the whole resolve/decoder-startup window (which the README notes
-        # can be 15-20s cold, up to YTDLP_EXTRACT_TIMEOUT_SECONDS on a slow
-        # one) — active_requester_id below covers that gap too, so a
-        # chatter can !skip their own song before it's technically
-        # "playing" yet, not just after.
+        # instant it's dequeued, cleared when done (or failed). now_playing
+        # alone isn't enough: it stays None through the whole resolve/decoder-
+        # startup window, so active_requester_id covers that gap too, letting
+        # a chatter !skip their own song before it's technically "playing" yet.
         self._active_request: QueuedRequest | None = None
         self._stopping = False
         self._resolving = False
@@ -105,15 +97,12 @@ class RadioPlayer:
         self._notify_failure: Callable[[str], Awaitable[None]] | None = None
         self._duration_limit_getter: Callable[[], Awaitable[int]] | None = None
         self._subscribers: set[asyncio.Queue[bytes]] = set()
-        # Unique voter IDs for a !voteskip on whatever's currently active —
-        # cleared every time a new request becomes active (see _play_one),
+        # Cleared every time a new request becomes active (see _play_one),
         # so votes never carry over from one song to the next.
         self._skip_votes: set[int] = set()
-        # Pub-sub for "something about now-playing/queue changed" — mirrors
-        # the _subscribers pattern above but carries no payload (just a
-        # wakeup); consumers (the admin server's /ws/nowplaying) re-fetch
-        # full current state themselves rather than this class trying to
-        # track per-connection what's already been sent.
+        # Pub-sub for "something about now-playing/queue changed" — carries
+        # no payload; consumers (the admin server's /ws/nowplaying) re-fetch
+        # full current state themselves.
         self._state_subscribers: set[asyncio.Queue[None]] = set()
 
     # -- public interface used by the chat bot / admin server ------------
@@ -125,9 +114,7 @@ class RadioPlayer:
     @property
     def active_requester_id(self) -> int | None:
         """Who the player's current "slot" belongs to — playing or still
-        resolving/loading — or None if it's idle. Lets the chat bot's !skip
-        allow a chatter to skip their own song during the resolve window
-        too, not just once now_playing is actually set."""
+        resolving/loading — or None if idle."""
         if self._now_playing is not None:
             return self._now_playing.requester_id
         if self._active_request is not None:
@@ -152,10 +139,8 @@ class RadioPlayer:
 
     def positions_for(self, requester_id: int) -> list[int]:
         """1-indexed queue positions, in play order, for every one of
-        requester_id's requests still waiting (not yet dequeued) — empty if
-        they have none waiting (whether because they have nothing queued,
-        or because their one request is the one currently active — check
-        active_requester_id for that case)."""
+        requester_id's requests still waiting — empty if they have none
+        waiting (check active_requester_id for the "up now" case)."""
         return [i + 1 for i, r in enumerate(self._pending) if r.requester_id == requester_id]
 
     def enqueue(self, request: QueuedRequest) -> None:
@@ -178,11 +163,10 @@ class RadioPlayer:
         self._subscribers.discard(q)
 
     def subscribe_state(self) -> asyncio.Queue[None]:
-        """A queue that receives a wakeup (no payload — just call
-        active_requester_id/now_playing/queued_items() again) every time
-        now-playing or the queue changes. Small maxsize is fine: consumers
-        only care that *something* changed, not how many times, and a full
-        queue just means a wakeup is already pending."""
+        """A queue that receives a wakeup (no payload) every time now-
+        playing or the queue changes. Small maxsize is fine: consumers only
+        care that *something* changed, and a full queue just means a
+        wakeup is already pending."""
         q: asyncio.Queue[None] = asyncio.Queue(maxsize=4)
         self._state_subscribers.add(q)
         return q
@@ -210,12 +194,10 @@ class RadioPlayer:
         return None
 
     def purge_pending(self, predicate: Callable[[QueuedRequest], bool]) -> list[QueuedRequest]:
-        """Removes every not-yet-playing request matching predicate —
-        used for mod tooling (!clearqueue, and !block pulling out an
-        already-queued copy of what it just blocked). Doesn't touch
-        whatever's currently playing/resolving; same on_start-firing
-        behavior as cancel_pending_for, so each removed requester's
-        pending count is released correctly."""
+        """Removes every not-yet-playing request matching predicate — used
+        for mod tooling (!clearqueue, and !block pulling out an already-
+        queued copy of what it just blocked). Doesn't touch whatever's
+        currently playing/resolving."""
         removed = []
         for request in list(self._pending):
             if not predicate(request):
@@ -243,14 +225,11 @@ class RadioPlayer:
         return False
 
     def register_skip_vote(self, voter_id: int, threshold: int) -> tuple[bool, int, bool] | None:
-        """Registers one vote to skip whatever's currently active (playing
-        or still resolving). Returns (skipped, vote_count, is_new_vote), or
-        None if nothing's currently active to vote on. `skipped` is True if
-        this vote reached `threshold` and triggered an actual skip (votes
-        are cleared immediately in that case — same-track revoting starts
-        fresh). `is_new_vote` is False if this voter had already voted for
-        this same track (still reports the current count either way, so a
-        repeat !voteskip isn't a dead end for the caller)."""
+        """Registers one vote to skip whatever's currently active. Returns
+        (skipped, vote_count, is_new_vote), or None if nothing's active to
+        vote on. `skipped` is True if this vote reached `threshold` (votes
+        are cleared immediately in that case). `is_new_vote` is False if
+        this voter already voted for this same track."""
         if self.active_requester_id is None:
             return None
         is_new = voter_id not in self._skip_votes
@@ -353,34 +332,26 @@ class RadioPlayer:
         while True:
             chunk = await stdout.read(_STREAM_CHUNK_BYTES)
             if not chunk:
-                # EOF on the encoder's own stdout — the ffmpeg process
-                # itself has exited (crashed, OOM-killed, etc), not just a
-                # normal graceful shutdown: during stop(), this task gets
-                # cancelled directly by _run_one_session()'s finally block
-                # (see below) before a read like this would ever return
-                # empty, so reaching here at all means something killed the
-                # encoder out from under us. Raising — instead of returning
-                # cleanly — makes _run_one_session()/_run_forever() treat
-                # this the same as any other encoder failure: logged with
-                # exc_info and subject to the backoff/restart loop. Returning
-                # cleanly here (the previous behavior) meant a crashed
-                # encoder just silently respawned with no log line at all
-                # explaining why — indistinguishable in the logs from
-                # nothing having gone wrong.
+                # EOF here means the ffmpeg process itself exited (crashed,
+                # OOM-killed) — during a normal stop(), this task is
+                # cancelled directly before a read like this could return
+                # empty. Raising (not returning cleanly) routes this through
+                # the same backoff/restart path as any other encoder failure,
+                # with a log line explaining why, instead of silently
+                # respawning with no trace of what happened.
                 returncode = self._encoder.returncode if self._encoder is not None else None
                 raise RuntimeError(f"Encoder stdout closed unexpectedly (exit code {returncode})")
             for q in list(self._subscribers):
                 try:
                     q.put_nowait(chunk)
                 except asyncio.QueueFull:
-                    # Dropping this subscriber — but its handle_stream()
-                    # HTTP handler is still `await queue.get()`-ing, and
-                    # nothing will ever be pushed to this queue again once
-                    # it's out of self._subscribers. Without waking it, that
-                    # coroutine (and its socket) hangs forever instead of
-                    # closing. Evict one old chunk to make room, then queue
-                    # an empty-bytes sentinel — never produced by a real
-                    # read here — that handle_stream() treats as "stop".
+                    # This subscriber's handle_stream() is still awaiting
+                    # queue.get(), and nothing more will ever be queued for
+                    # it once it's out of self._subscribers — evict one old
+                    # chunk to make room, then push an empty-bytes sentinel
+                    # (never produced by a real read) that handle_stream()
+                    # treats as "stop", so its coroutine and socket actually
+                    # close instead of hanging forever.
                     self._subscribers.discard(q)
                     with contextlib.suppress(asyncio.QueueEmpty):
                         q.get_nowait()
@@ -398,17 +369,9 @@ class RadioPlayer:
                 self._backoff_reset_done = True
             try:
                 if self._pause_when_no_listeners and not self._subscribers:
-                    # Track-boundary pause only — deliberately not trying to
-                    # pause mid-track (that would mean pausing the decoder
-                    # subprocess and the real-time write pacing in
-                    # _play_one_inner without leaving stream state
-                    # inconsistent, which is a lot more moving parts for a
-                    # narrow benefit). A track already playing when the last
-                    # listener disconnects always finishes normally; this
-                    # only holds off *starting the next one* until someone's
-                    # listening again — checked fresh every loop tick, so it
-                    # resumes on its own the moment a subscriber (re)connects,
-                    # no separate signal needed.
+                    # Track-boundary pause only (not mid-track) — checked
+                    # fresh every loop tick, so playback resumes on its own
+                    # the instant a subscriber (re)connects.
                     await self._write_silence_chunk(encoder_stdin)
                     await asyncio.sleep(_CHUNK_DURATION)
                     continue
@@ -507,13 +470,10 @@ class RadioPlayer:
 
             decoder = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
-                # Without these, a dropped/hiccuping CDN connection just
-                # corrupts the stream instead of recovering — the likely
-                # cause of the "Error parsing Opus packet header" lines
-                # seen in the logs. -probesize/-analyzeduration also cut
-                # ffmpeg's own startup latency by skipping its default
-                # multi-second format probe before it starts producing
-                # output. Matches PyxeeBot's FFMPEG_BEFORE_OPTIONS.
+                # Reconnect flags recover from a dropped/hiccuping CDN
+                # connection instead of corrupting the stream. -probesize/
+                # -analyzeduration skip ffmpeg's default multi-second format
+                # probe, cutting startup latency.
                 "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
                 "-reconnect_on_network_error", "1", "-reconnect_on_http_error", "429,500,502,503,504",
                 "-probesize", "128k", "-analyzeduration", "0",

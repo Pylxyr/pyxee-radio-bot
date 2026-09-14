@@ -1,61 +1,38 @@
 """Twitch chat bot — handles !sr <query> and hands resolved requests to the radio player.
 
-Built against twitchio 3.x's EventSub-based Bot (verified against the actual
-installed twitchio==3.3.2 API by inspecting the library directly, not just
-its docs — this is NOT the old IRC-token pattern from twitchio 2.x).
+Built against twitchio 3.x's EventSub-based Bot (verified against the
+installed twitchio==3.3.2 API directly — this is NOT the old IRC-token
+pattern from twitchio 2.x).
 
-Auth model used here is the simplest supported one ("Installed Chatbot" style,
-per Twitch's own chat bot guide): a single Twitch account (recommended: a
-dedicated account named after the bot, made a moderator in your channel) with
-a User Access Token carrying `user:read:chat` + `user:write:chat`. That
-moderator status is what satisfies the ChatMessageSubscription requirement
-without needing a separate broadcaster-side `channel:bot` grant (confirmed
-against Twitch's own EventSub docs: a user-token subscription only needs
-`user:read:chat` from the chatting user; `channel:bot`-or-moderator is only
-required when using an app access token instead).
+Auth model: the simplest one Twitch's own chat bot guide supports
+("Installed Chatbot") — a single Twitch account (recommended: a dedicated
+account, made a moderator in your channel) with a User Access Token
+carrying `user:read:chat` + `user:write:chat`. Moderator status is what
+satisfies the ChatMessageSubscription requirement without a separate
+broadcaster-side `channel:bot` grant.
 
-ONE-TIME SETUP — this part doesn't happen automatically and isn't optional:
-    Neither `client_id`/`client_secret` below nor anything else in this repo
-    can, by itself, obtain the User Access Token this bot needs — a
-    client-credentials ("app") token has no user scopes and can't read or send
-    chat as a specific account. TwitchIO 3.x handles the missing piece with a
-    small built-in web server (twitchio.web.AiohttpAdapter), started
-    automatically by commands.Bot when no custom adapter is supplied, that
-    listens on http://localhost:4343 and persists whatever token you
-    authorize through it (see load_tokens/save_tokens below for exactly
-    where — verified against the real Client.load_tokens/save_tokens source,
-    which take an optional `path` and default to ".tio.tokens.json" in the
-    process's working directory if you don't override them, which is exactly
-    why this class does). To complete it:
+One-time OAuth setup is required before chat commands work — TwitchIO's
+built-in web server (twitchio.web.AiohttpAdapter, started automatically by
+commands.Bot) listens on http://localhost:4343 and persists whatever token
+you authorize through it (see load_tokens/save_tokens below for exactly
+where). Full walkthrough in README.md; short version:
 
-      1. Start the bot once with valid TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET
-         / TWITCH_BOT_ID / TWITCH_OWNER_ID set.
-      2. The adapter binds to localhost only, so on a remote VPS you'll need
-         an SSH tunnel to reach it: `ssh -L 4343:localhost:4343 <user>@<host>`
-         from your own machine, kept open while you do steps 3-4.
-      3. In a browser, logged in as the BOT's own Twitch account, visit:
-         http://localhost:4343/oauth?scopes=user:read:chat+user:write:chat+user:bot&force_verify=true
-      4. In a browser, logged in as the BROADCASTER's account (i.e. the
-         channel this bot will post in), visit:
-         http://localhost:4343/oauth?scopes=channel:bot&force_verify=true
-         (Optional if the bot account is already a moderator in that channel
-         — see the auth-model paragraph above — but costs nothing to do
-         anyway and removes the "is it still a mod" dependency.)
+  1. Start the bot once with valid TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET
+     / TWITCH_BOT_ID / TWITCH_OWNER_ID set.
+  2. On a remote host, tunnel the adapter's port first:
+     `ssh -L 4343:localhost:4343 <user>@<host>`
+  3. In a browser, logged in as the BOT's own account:
+     http://localhost:4343/oauth?scopes=user:read:chat+user:write:chat+user:bot&force_verify=true
+  4. In a SEPARATE browser session, logged in as the BROADCASTER's account:
+     http://localhost:4343/oauth?scopes=channel:bot&force_verify=true
 
-      Use two SEPARATE browser sessions for steps 3 and 4 (e.g. a normal
-      window + a private/incognito one) — reusing the same already-logged-in
-      session for both is the most common way this goes wrong: Twitch just
-      authorizes whichever account is currently logged in, `force_verify`
-      or not, so it's easy to end up with both tokens saved under the same
-      (wrong) account without any error at all. Chat subscription then
-      fails with no token on file for the *other* ID; see
-      `_log_token_diagnostics` below, which checks for exactly this at
-      startup.
+  Reusing the same already-logged-in session for both steps 3 and 4 is the
+  most common way this goes wrong — Twitch just authorizes whichever
+  account is currently logged in, with no error either way. See
+  `_log_token_diagnostics` below, which checks for exactly that at startup.
 
-    Once both are done, the tokens are saved to TWITCH_TOKEN_FILE (default:
-    data/twitch_tokens.json) and reloaded automatically on every future
-    start. You will not need to repeat this unless that file is deleted or
-    Twitch revokes the token.
+  Tokens save to TWITCH_TOKEN_FILE (default: data/twitch_tokens.json) and
+  reload automatically on every future start.
 """
 
 from __future__ import annotations
@@ -93,10 +70,9 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 # Per-command usage strings for event_command_error's MissingRequiredArgument
-# handler below — !sr, !setlimit, and !block/!unblock are the commands with
-# a required argument today. Keyed by command name (not alias) since
-# ctx.command.name always resolves to the canonical name even when invoked
-# via an alias like !songrequest.
+# handler below. Keyed by canonical command name, not alias — ctx.command.name
+# always resolves to the canonical name even when invoked via an alias like
+# !songrequest.
 _USAGE = {
     "sr": "Usage: !sr <song name or URL>",
     "setlimit": "Usage: !setlimit <key> <value> — keys: " + ", ".join(TUNABLE_BOUNDS),
@@ -105,18 +81,14 @@ _USAGE = {
 }
 
 # Every @commands.is_moderator() below (and the manual `chatter.moderator`
-# check in skip()) also admits the broadcaster themselves, even though
-# is_moderator()'s own docstring reads as if it doesn't ("See also
-# is_elevated() to allow broadcaster, moderator, or VIP") — verified
-# directly against the actual pinned dependency: twitchio==3.3.2's
-# Chatter.moderator property is `_is_moderator or _is_lead_moderator or
-# self.broadcaster`, i.e. it already folds broadcaster status in. That
-# fallback isn't part of is_moderator()'s documented contract, so if a
-# future twitchio upgrade ever tightens .moderator to match its own
-# docstring, every mod-only command here would silently start rejecting
-# the broadcaster. If that ever happens, the fix is NOT
-# commands.is_elevated() (that also admits VIPs, a lower trust tier Twitch
-# doesn't grant moderation powers to) — it's a custom guard checking
+# check in skip()) also admits the broadcaster, even though is_moderator()'s
+# own docstring reads as if it doesn't — verified directly against
+# twitchio==3.3.2: Chatter.moderator is `_is_moderator or _is_lead_moderator
+# or self.broadcaster`. That fallback isn't part of is_moderator()'s
+# documented contract, so if a future twitchio upgrade tightens .moderator
+# to match its docstring, every mod-only command here would silently start
+# rejecting the broadcaster. The fix then is NOT commands.is_elevated()
+# (that also admits VIPs) — it's a custom guard checking
 # `chatter.moderator or chatter.broadcaster` explicitly.
 
 
@@ -128,7 +100,7 @@ class SongRequestComponent(commands.Component):
     async def song_request(self, ctx: commands.Context, *, query: str) -> None:
         query = query.strip()
         if not query:
-            await ctx.reply("Usage: !sr <song name or URL>")
+            await ctx.reply(_USAGE["sr"])
             return
 
         chatter_key = str(ctx.chatter.id)
@@ -161,21 +133,17 @@ class SongRequestComponent(commands.Component):
             try:
                 requester_id = int(ctx.chatter.id)
             except (TypeError, ValueError):
-                # Same "bail out, don't invent an identity" handling as
-                # !remove/!position/!voteskip below — falling back to a
-                # fixed sentinel (e.g. 0) here would let two different
-                # chatters who both hit this branch collide under the same
-                # fake requester_id, able to !skip/!remove each other's
-                # request.
+                # Bail out rather than fall back to a fixed sentinel (e.g.
+                # 0) — that would let two different chatters hitting this
+                # branch collide under the same fake requester_id.
                 await ctx.reply("Couldn't identify you — try again.")
                 return
 
             # Cheap pre-resolve check for a direct link to something already
-            # blocked — skips the network round-trip entirely for the common
-            # case of someone re-pasting a link a mod just blocked. Doesn't
-            # replace the full post-resolve check below: a search query or
-            # an uploader-name block can't be caught until we know what it
-            # actually resolved to.
+            # blocked — skips the network round trip for the common case of
+            # re-pasting a link a mod just blocked. Doesn't replace the
+            # post-resolve check below: a search query or an uploader-name
+            # block can't be caught until we know what it actually resolved to.
             if normalize_track_key(query) is not None:
                 blocklist_data = await self.bot.blocklist_store.read()
                 reason = blocklist_reason(query, "", blocklist_data)
@@ -220,9 +188,8 @@ class SongRequestComponent(commands.Component):
                 return
 
             # Re-check the cap right before enqueuing (no await between this
-            # check and enqueue() below, so this half is race-free too) — the
-            # resolve above may have taken long enough for the queue to have
-            # filled up in the meantime.
+            # check and enqueue() below) — the resolve above may have taken
+            # long enough for the queue to have filled up meanwhile.
             if self.bot.player.queue_size() >= tunables.queue_cap:
                 await ctx.reply("Queue's full right now — try again in a bit.")
                 return
@@ -255,9 +222,8 @@ class SongRequestComponent(commands.Component):
 
     @commands.command(name="skip")
     # No @commands.is_moderator() guard — mods/broadcaster can always skip
-    # (checked manually below; see the module-level comment above about
-    # .moderator already covering the broadcaster too), but a chatter can
-    # also skip their own currently-playing request without mod status.
+    # (checked manually below), but a chatter can also skip their own
+    # currently-playing request without mod status.
     async def skip(self, ctx: commands.Context) -> None:
         chatter = ctx.chatter
         # ctx.chatter is Chatter | PartialUser; only Chatter has .moderator.
@@ -265,10 +231,7 @@ class SongRequestComponent(commands.Component):
         if not is_mod:
             # active_requester_id (not now_playing) so a chatter can skip
             # their own song during the resolve/load window too — that can
-            # take 15-20s+ (see README), and now_playing stays None the
-            # whole time, so checking it alone would leave a non-mod unable
-            # to skip their own request until it actually starts audibly
-            # playing.
+            # take 15-20s+, and now_playing stays None the whole time.
             active_id = self.bot.player.active_requester_id
             if active_id is None:
                 await ctx.reply("Nothing's playing right now.")
@@ -406,8 +369,7 @@ class SongRequestComponent(commands.Component):
     async def set_limit(self, ctx: commands.Context, *, args: str) -> None:
         """Mod-only: adjust one request-limit tunable live, without needing
         the /settings page — e.g. !setlimit queue_cap 100. Same keys and
-        ranges as /settings; takes effect on the very next command, no
-        restart needed."""
+        ranges as /settings; takes effect on the very next command."""
         args = args.strip()
         parts = args.split(maxsplit=1)
         if len(parts) != 2:
@@ -543,17 +505,14 @@ class TwitchChatBot(commands.Bot):
         self._owner_id = owner_id
         self._bot_id = bot_id
         self._token_storage_path = token_storage_path
-        # Set once subscribe_websocket() succeeds — save_tokens() retries
-        # the subscription on every call until this is True, so completing
-        # OAuth (or fixing a scope problem) while the bot's already running
-        # takes effect immediately instead of needing a restart. Guards
-        # against re-subscribing on every later token *refresh* too, which
-        # save_tokens() is also called for.
+        # Set once subscribe_websocket() succeeds — save_tokens() retries the
+        # subscription on every call until this is True, so completing OAuth
+        # (or fixing a scope problem) while already running takes effect
+        # immediately instead of needing a restart.
         self._chat_subscribed = False
-        # Per-chatter state — deliberately in-memory only (not persisted):
-        # losing cooldown/pending tracking across a restart is harmless (worst
-        # case someone gets one extra request right after a restart), and
-        # persisting it would add complexity for no real benefit.
+        # Per-chatter state — deliberately in-memory only: losing cooldown/
+        # pending tracking across a restart is harmless, and persisting it
+        # would add complexity for no real benefit.
         self.last_request_at: dict[str, float] = {}
         self.pending_by_chatter: Counter[str] = Counter()
 
@@ -566,23 +525,17 @@ class TwitchChatBot(commands.Bot):
         self._token_storage_path.parent.mkdir(parents=True, exist_ok=True)
         target = path or str(self._token_storage_path)
         await super().save_tokens(target)
-        # twitchio's own save() (Client.save() -> ... -> open(name, "w+"))
-        # writes this file with no explicit mode, so it inherits whatever
-        # the process umask gives it — commonly 644 (world-readable) on a
-        # default Ubuntu install. This file holds live OAuth access +
-        # refresh tokens for both the bot and (optionally) the broadcaster
-        # account, so lock it down the same way setup.sh already does for
-        # .env (chmod 600) — anyone else with a login on a shared box
-        # shouldn't be able to read it straight off disk. Re-applied after
-        # every save since a fresh write can reset permissions depending on
-        # the umask at the time.
+        # twitchio's own save() writes with no explicit mode, so this file
+        # (live OAuth tokens for both accounts) inherits the process umask —
+        # commonly world-readable. Locked down the same way setup.sh already
+        # locks down .env. Re-applied after every save since a fresh write
+        # can reset permissions.
         with contextlib.suppress(OSError):
             Path(target).chmod(0o600)
-        # Called both right after the OAuth callback saves a fresh token
-        # and on every routine background refresh of an existing one —
-        # _try_subscribe_chat() is a no-op once already subscribed, so this
-        # is what makes completing OAuth while the bot's already running
-        # work without a restart.
+        # Called both right after the OAuth callback saves a fresh token and
+        # on every routine background refresh — _try_subscribe_chat() is a
+        # no-op once already subscribed, so this is what makes completing
+        # OAuth while already running work without a restart.
         await self._try_subscribe_chat()
 
     def _oauth_complete(self) -> bool:
@@ -631,15 +584,8 @@ class TwitchChatBot(commands.Bot):
     def _log_token_diagnostics(self) -> None:
         # Catches the single most common cause of "OAuth said success but
         # chat still doesn't work": the saved token belongs to a different
-        # Twitch account than TWITCH_BOT_ID/TWITCH_OWNER_ID — easy to do by
-        # accident if the same already-logged-in browser was used for both
-        # the bot and broadcaster authorization steps. The OAuth flow has
-        # no way to know that happened; it saves whatever account was
-        # actually logged in and reports success regardless. Checked
-        # directly against the token file's on-disk keys (verified against
-        # twitchio's actual save/load implementation —
-        # {"<user_id>": {"token": ..., "refresh": ...}, ...}) rather than
-        # any private in-memory attribute.
+        # Twitch account than TWITCH_BOT_ID/TWITCH_OWNER_ID, from reusing an
+        # already-logged-in browser session for both authorization steps.
         if not self._token_storage_path.exists():
             return
         try:
@@ -673,9 +619,8 @@ class TwitchChatBot(commands.Bot):
         to tell chat about a track it had to drop. Not tied to a command
         Context, so this goes through PartialUser.send_message directly."""
         # commands.Bot types _owner_id/_bot_id as `str | None` since the base
-        # class allows constructing without them — this subclass's __init__
-        # requires both (they come from load_settings()'s _required()), so
-        # they're never actually None here; just narrowing for mypy.
+        # class allows constructing without them — this subclass requires
+        # both, so they're never actually None here; just narrowing for mypy.
         assert self._owner_id is not None
         assert self._bot_id is not None
         channel = self.create_partialuser(user_id=self._owner_id)
@@ -685,21 +630,18 @@ class TwitchChatBot(commands.Bot):
         exc = payload.exception
         ctx = payload.context
         if isinstance(exc, commands.CommandNotFound):
-            # Fires for *every* chat message that starts with our prefix but
-            # isn't one of ours — which, in a channel running Nightbot/
-            # StreamElements/Moobot alongside this bot (all "!"-prefixed
-            # too), is most of them. Not an error worth logging at all,
-            # let alone at ERROR with a traceback on every occurrence.
+            # Fires for every chat message starting with our prefix that
+            # isn't one of ours — with another "!"-prefixed bot in the same
+            # channel (Nightbot, StreamElements, Moobot), that's most of
+            # them. Not worth logging, let alone at ERROR with a traceback.
             return
         if isinstance(exc, commands.GuardFailure):
             with contextlib.suppress(Exception):
                 await ctx.reply("You don't have permission to use that command.")
             return
         if isinstance(exc, commands.MissingRequiredArgument):
-            # ctx.command.name is the canonical name even when invoked via
-            # an alias (e.g. !songrequest resolves to "sr") — falls back to
-            # the !sr message if for some reason ctx.command is unset,
-            # since that's the far more common command to hit this.
+            # ctx.command.name is the canonical name even via an alias (e.g.
+            # !songrequest resolves to "sr").
             name = ctx.command.name if ctx.command is not None else "sr"
             usage = _USAGE.get(name, _USAGE["sr"])
             with contextlib.suppress(Exception):

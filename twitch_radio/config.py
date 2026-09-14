@@ -20,23 +20,28 @@ def _int_env(name: str, default: int) -> int:
     try:
         return int(raw)
     except ValueError:
+        # print(), not log — this runs before configure_logging() exists.
+        print(f"WARNING: {name}={raw!r} is not a valid integer — using {default}.")
         return default
+
+
+_TRUE_TOKENS = {"1", "true", "yes", "on"}
+_FALSE_TOKENS = {"0", "false", "no", "off"}
 
 
 def _bool_env(name: str, default: bool) -> bool:
     raw = os.getenv(name, "").strip().lower()
     if not raw:
         return default
-    return raw in {"1", "true", "yes", "on"}
+    if raw in _TRUE_TOKENS:
+        return True
+    if raw in _FALSE_TOKENS:
+        return False
+    print(f"WARNING: {name}={raw!r} is not a recognized boolean — using {default}.")
+    return default
 
 
 def _clamped_int_env(name: str, default: int, lo: int, hi: int) -> int:
-    # _int_env alone silently clamps out-of-range values with no trace of
-    # it anywhere — e.g. AUDIO_BITRATE_KBPS=999999 would just quietly
-    # become 320 with nothing in the logs explaining the mismatch between
-    # what's in .env and what the service actually runs with. Same
-    # print()-not-log rationale as _log_level_env above: this runs before
-    # configure_logging() exists.
     value = _int_env(name, default)
     clamped = max(lo, min(hi, value))
     if clamped != value:
@@ -48,7 +53,6 @@ _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
 
 def _log_level_env(name: str, default: str) -> str:
-    # print() is deliberate — this runs before configure_logging() exists.
     raw = os.getenv(name, "").strip().upper()
     if not raw:
         return default
@@ -59,10 +63,9 @@ def _log_level_env(name: str, default: str) -> str:
 
 
 def _check_cookies_path_writable(raw: str, path: Path) -> None:
-    # yt-dlp saves this file back on every single extraction once configured
-    # at all, and only data/ and logs/ are writable under the systemd unit's
-    # hardening — checked here so a bad path fails loudly at startup instead
-    # of on every !sr.
+    # Only data/ and logs/ are writable under the systemd unit's hardening,
+    # and yt-dlp rewrites this file on every extraction — fail loudly at
+    # startup instead of on every !sr.
     cookies_dir = path.parent
     try:
         cookies_dir.mkdir(parents=True, exist_ok=True)
@@ -79,11 +82,10 @@ def _check_cookies_path_writable(raw: str, path: Path) -> None:
         )
 
 
-# YouTube player_client names and whether each accepts cookie auth, per
-# yt_dlp.extractor.youtube._base.INNERTUBE_CLIENTS[*]["SUPPORTS_COOKIES"] —
-# hardcoded rather than imported since that's a private yt-dlp module that
-# can change shape across versions; re-verify against the pinned yt-dlp
-# version in requirements.txt if this ever needs updating.
+# yt-dlp player_client names and whether each accepts cookie auth (mirrors
+# yt_dlp.extractor.youtube._base.INNERTUBE_CLIENTS[*]["SUPPORTS_COOKIES"]).
+# Hardcoded since that's a private yt-dlp module; re-verify against the
+# pinned yt-dlp version in requirements.txt if this needs updating.
 # Checked against yt-dlp==2026.08.19.
 _VALID_PLAYER_CLIENTS = {
     "web": True, "web_safari": True, "web_embedded": True, "web_music": True,
@@ -122,14 +124,11 @@ class Settings:
 
     # Audio
     audio_bitrate_kbps: int
-    # When True, the player won't start a new track while nobody's
-    # subscribed to /stream.mp3 (0 active listeners) — it just holds at the
-    # current silence/track boundary and resumes normally once someone
-    # (re)connects. A track already playing when the last listener
-    # disconnects still finishes normally; this only holds off *starting*
-    # the next one. Off by default to match existing behavior (the queue
-    # has always run on a continuous real-time clock regardless of
-    # listeners) — opt in via PAUSE_QUEUE_WHEN_NO_LISTENERS=true.
+    # If True, don't start a new track while nobody's subscribed to
+    # /stream.mp3 — holds at the current boundary and resumes once someone
+    # (re)connects. A track already playing finishes normally either way.
+    # Off by default (the queue has always run on a real-time clock
+    # regardless of listeners); opt in via PAUSE_QUEUE_WHEN_NO_LISTENERS=true.
     pause_when_no_listeners: bool
 
     # Local HTTP surface — serves /stream.mp3, /overlay, /nowplaying.json, /settings
@@ -137,8 +136,8 @@ class Settings:
     nowplaying_port: int
     settings_password: str | None
 
-    # Persistence — both under DATA_DIR so a single ReadWritePaths entry in
-    # the systemd unit covers everything this process needs to write.
+    # Persistence — all under DATA_DIR so one ReadWritePaths entry in the
+    # systemd unit covers everything this process writes.
     token_path: Path
     tunables_path: Path
     blocklist_path: Path
@@ -171,9 +170,9 @@ def load_settings() -> Settings:
         return value
 
     def _required_numeric_id(name: str) -> str:
-        # Real production failure this guards against: TWITCH_BOT_ID pasted
-        # as "Twitch ID:1536026185" instead of just the digits — Helix
-        # rejects that with a bare "Bad Identifiers" error.
+        # Guards against e.g. TWITCH_BOT_ID pasted as "Twitch ID:1536026185"
+        # instead of just the digits — Helix rejects that with a bare
+        # "Bad Identifiers" error.
         value = _required(name)
         if not value.isdigit():
             raise RuntimeError(
@@ -196,10 +195,9 @@ def load_settings() -> Settings:
     player_client_raw = os.getenv("YTDLP_PLAYER_CLIENT", "").strip()
     if not player_client_raw and cookies_path is not None:
         # yt-dlp's own default client list when cookies are set (verified
-        # against yt-dlp==2026.08.19) is
-        # ('web_embedded', 'tv_downgraded', 'web') — tv_downgraded has a
-        # known open bug (yt-dlp#17389, "The page needs to be reloaded").
-        # Pinning to the other two already-default clients avoids it.
+        # against yt-dlp==2026.08.19) is ('web_embedded', 'tv_downgraded',
+        # 'web') — tv_downgraded has a known open bug (yt-dlp#17389). Pin
+        # to the other two already-default clients to avoid it.
         player_client_raw = "web_embedded,web"
     ytdlp_player_client = tuple(c.strip() for c in player_client_raw.split(",") if c.strip())
     _check_player_clients(ytdlp_player_client, cookies_configured=cookies_path is not None)
@@ -235,12 +233,11 @@ def load_settings() -> Settings:
         ytdlp_extract_timeout_seconds=_clamped_int_env("YTDLP_EXTRACT_TIMEOUT_SECONDS", 45, 10, 120),
         ytdlp_player_client=ytdlp_player_client,
         # Skips the player's second extraction (chat resolves once to queue,
-        # then it re-resolves right before playing) for anything near the
-        # front of the queue. 0 disables caching.
+        # then re-resolves right before playing) for anything near the front
+        # of the queue. 0 disables caching.
         ytdlp_cache_ttl_seconds=_clamped_int_env("YTDLP_CACHE_TTL_SECONDS", 300, 0, 3600),
-        # Only used if you've separately set up a bgutil-ytdlp-pot-provider
-        # instance (see README) — points yt-dlp's PO-token plugin at it.
-        # None means "no PO token provider configured", not an error.
+        # Points yt-dlp's PO-token plugin at a bgutil-ytdlp-pot-provider
+        # instance, if one's set up (see README). None is a no-op.
         ytdlp_pot_provider_url=os.getenv("YTDLP_POT_PROVIDER_URL", "").strip() or None,
         log_level=_log_level_env("LOG_LEVEL", "INFO"),
         log_to_file=_bool_env("LOG_TO_FILE", True),

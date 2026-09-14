@@ -7,10 +7,8 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 # Single source of truth for each tunable's valid range — shared by the
-# /settings HTTP form (admin_server.py), the chat-based !setlimit mod
-# command (chatbot.py), and from_dict()'s own defense-in-depth clamp below,
-# so all three enforce identical limits instead of three copies quietly
-# drifting apart.
+# /settings form (admin_server.py), the chat !setlimit command (chatbot.py),
+# and from_dict()'s own clamp below, so all three enforce identical limits.
 TUNABLE_BOUNDS: dict[str, tuple[int, int]] = {
     "max_pending_per_chatter": (1, 10),
     "request_cooldown_seconds": (0, 3600),
@@ -23,8 +21,7 @@ TUNABLE_BOUNDS: dict[str, tuple[int, int]] = {
 @dataclass(slots=True)
 class TwitchTunables:
     """Request-limit knobs adjustable at runtime from the /settings page or
-    chat mod commands, without restarting the service. Defaults here are the
-    fallback when nothing has been saved to the JSON store yet."""
+    chat mod commands, without restarting the service."""
 
     max_pending_per_chatter: int = 2
     request_cooldown_seconds: int = 0
@@ -37,14 +34,8 @@ class TwitchTunables:
         defaults = cls()
 
         def _field(name: str, default: int) -> int:
-            # admin_server and the chat !setlimit command both already
-            # enforce TUNABLE_BOUNDS before ever writing to the store, so
-            # this only ever matters for a hand-edited or corrupted
-            # tunables.json, or one left over from a version with different
-            # limits — but "!sr crashes with no reply because someone
-            # typo'd the file" is a worse failure mode than "one bad field
-            # reverts to its default", so this degrades per-field instead
-            # of raising.
+            # Degrades per-field instead of raising — a hand-edited or
+            # corrupted tunables.json shouldn't take !sr down with it.
             if name not in data:
                 return default
             try:

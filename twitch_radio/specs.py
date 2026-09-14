@@ -3,19 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-# A single field a chatter might paste something long into — clamped the
-# same way regardless of write path (settings form today; hand-edited
-# specs.json always), same defense-in-depth philosophy as tunables.py
-# clamping TUNABLE_BOUNDS in from_dict(). Keeps a fully-filled-in !specs or
-# !peripherals reply comfortably under Twitch's 500-character chat message
-# limit even with every field maxed out.
+# Clamped the same way regardless of write path (the /settings form today;
+# a hand-edited specs.json always) — keeps a fully-filled-in !specs or
+# !peripherals reply comfortably under Twitch's 500-character chat limit
+# even with every field maxed out.
 MAX_FIELD_LENGTH = 40
 
 # Single source of truth for each field's storage key -> chat/web display
 # label and display order — shared by the /settings form (admin_server.py)
-# and the !specs / !peripherals chat replies (chatbot.py), so all three
-# can't drift apart on what fields exist or what order they show in.
-# Mirrors tunables.py's TUNABLE_BOUNDS for the same reason.
+# and the !specs / !peripherals chat replies (chatbot.py).
 PC_SPEC_FIELDS: list[tuple[str, str]] = [
     ("cpu", "CPU"),
     ("cooler", "Cooler"),
@@ -36,11 +32,9 @@ PERIPHERAL_FIELDS: list[tuple[str, str]] = [
 
 
 def _fields_from_dict(data: dict[str, Any], field_names: list[str]) -> dict[str, str]:
-    """Shared by PCSpecs.from_dict / Peripherals.from_dict below. Same
-    degrade-per-field philosophy as tunables.py: a hand-edited or corrupted
-    specs.json shouldn't take down !specs or !peripherals — a bad field
-    just reads as blank (and blank fields are simply omitted from the chat
-    reply; see display_lines() on both dataclasses)."""
+    """Shared by PCSpecs.from_dict / Peripherals.from_dict below — a bad
+    field degrades to blank rather than raising, same philosophy as
+    tunables.py. Blank fields are simply omitted from display_lines()."""
     out: dict[str, str] = {}
     for name in field_names:
         raw = data.get(name, "")
@@ -50,10 +44,9 @@ def _fields_from_dict(data: dict[str, Any], field_names: list[str]) -> dict[str,
 
 @dataclass(slots=True)
 class PCSpecs:
-    """The streamer's PC hardware, shown to viewers via !specs. Set from the
-    /settings page, adjustable live without a restart — every field is
-    optional and starts blank; !specs only lists whichever fields have
-    actually been filled in, not every field with placeholder text."""
+    """The streamer's PC hardware, shown to viewers via !specs. Set from
+    the /settings page; every field is optional and starts blank —
+    !specs only lists whichever fields have actually been filled in."""
 
     cpu: str = ""
     cooler: str = ""
@@ -77,7 +70,7 @@ class PCSpecs:
 @dataclass(slots=True)
 class Peripherals:
     """The streamer's peripherals, shown to viewers via !peripherals. Same
-    shape and behavior as PCSpecs above — see its docstring."""
+    shape and behavior as PCSpecs above."""
 
     mouse: str = ""
     monitor: str = ""
