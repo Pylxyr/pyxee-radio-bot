@@ -54,6 +54,7 @@ async def _async_run(settings: Settings) -> None:
         resolver=resolver.resolve,
         audio_bitrate_kbps=settings.audio_bitrate_kbps,
         pause_when_no_listeners=settings.pause_when_no_listeners,
+        prefetch_enabled=settings.ytdlp_cache_ttl_seconds > 0,
     )
     # Nested try/finally per resource (not one big try around just the chat
     # bot) so a failure acquiring a *later* resource still tears down
