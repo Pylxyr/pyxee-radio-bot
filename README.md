@@ -353,15 +353,36 @@ an ordinary search. Two ways to deal with it:
 
 `YTDLP_PLAYER_CLIENT` defaults to a cookie-compatible client pair whenever
 cookies are configured, and an incompatible combination is rejected at
-startup rather than failing silently on every `!sr`.
+startup rather than failing silently on every `!sr`. Without cookies, the
+resolver also tries a single fast, JS-less client first (falling back
+automatically to the normal default if that comes back empty) — see the
+next section.
+
+### Every resolve needs one JS-runtime call, by design
+
+YouTube's throttling parameter ("n") is generated per-video specifically so
+it can't be reused — confirmed in yt-dlp's own source (unlike the signature
+*cipher*, which is genuinely cached to disk under `YTDLP_CACHE_TTL_SECONDS`
+`data/yt-dlp-cache/` and shared across videos on the same YouTube player
+version). So one JS-runtime invocation per resolve is unavoidable; what
+varies is how fast that invocation is. Deno spawns a fresh process every
+time — full V8 startup, no persistent/warm mode — which is where most of
+the remaining cost sits. `setup.sh` also installs
+[quickjs-ng](https://github.com/quickjs-ng/quickjs), a JIT-less runtime
+with far lower per-invocation startup cost; the resolver tries it first
+automatically when installed (`command -v qjs`), falling back to Deno if
+it's missing or fails, so nothing breaks if it isn't there — it's a pure
+speed optimization, not a requirement.
 
 ### Why the first request after a restart feels slower
 
-Every extraction is a real network round trip plus, for YouTube, a JS
-challenge — roughly 15–20s cold. A `!sr` triggers this twice: once in chat
-to confirm/queue it, again right before it plays (stream URLs expire).
-`YTDLP_CACHE_TTL_SECONDS` (default 300) makes the second resolve nearly
-free for anything near the front of the queue.
+A `!sr` triggers a resolve twice: once in chat to confirm/queue it, again
+right before it plays (stream URLs expire). `YTDLP_CACHE_TTL_SECONDS`
+(default 300) makes the second resolve nearly free for anything near the
+front of the queue. The very first resolve after a restart is the slowest
+of all — the signature-cipher disk cache above starts out empty — which is
+why the bot warms up a throwaway resolve on every worker thread at startup,
+before any real listener's request arrives.
 
 ## License
 
