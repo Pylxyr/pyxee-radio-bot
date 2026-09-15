@@ -54,6 +54,39 @@ _ALLOWED_EXTRACTORS = ["youtube(:.*)?", "soundcloud(:.*)?"]
 # _fast_client_enabled below; config.py already forces cookie deployments
 # onto a fixed, cookie-compatible client list before this ever sees them).
 _FAST_PLAYER_CLIENT: tuple[str, ...] = ("visionos",)
+
+# The signature *cipher* is cacheable (shared across videos on the same
+# YouTube player version), but the "n" throttling parameter is generated
+# per-video by design specifically so it *can't* be reused — confirmed in
+# _video.py's solve_js_challenges(): unlike the sig-challenge cache check,
+# n_challenges are solved unconditionally on every resolve. So even with a
+# warm cache, some JS execution is unavoidable per resolve — the lever left
+# is how fast that one execution is.
+#
+# yt-dlp's own JS-challenge params key is "js_runtimes", a dict of
+# {runtime_name: {config}}, defaulting to {"deno": {}} when unset —
+# confirmed directly against the installed yt_dlp.YoutubeDL: passing only
+# {"quickjs": {}} genuinely excludes deno from the candidate pool (deno's
+# own preference score is hardcoded higher than quickjs's, so simply
+# *adding* quickjs alongside deno would never actually get it tried first —
+# confirmed in extractor/youtube/jsc/_builtin/{deno,quickjs}.py's
+# @register_preference values, 1000 vs 850). Deno spawns a fresh OS process
+# with a full V8 startup and (per yt-dlp's own hardcoded flags) a full JS
+# reparse on every single invocation; QuickJS has no JIT to warm up, so its
+# process-spawn cost is far lower — a real win specifically because nothing
+# here runs long enough for Deno's JIT to ever pay for itself.
+#
+# Real risk, confirmed in the same solve_js_challenges(): if the only
+# enabled runtime can't solve a challenge, yt-dlp does NOT raise — it warns
+# ("some formats may be missing") and continues with whatever formats don't
+# need it. So an unavailable/broken quickjs can silently degrade instead of
+# cleanly failing. _has_playable_url() below is the actual safety net (no
+# usable stream_url -> treated as a fast-path miss, falls back to deno) —
+# but it can't catch a *worse-but-still-present* format, only a missing one.
+# Only applies when the user hasn't already pinned a specific runtime
+# themselves (YTDLP_JS_RUNTIME_PATH) — see _fast_runtime_enabled below.
+_FAST_JS_RUNTIMES: dict[str, dict[str, str]] = {"quickjs": {}}
+
 _FAST_EXTRACT_TIMEOUT_SECONDS = 15.0
 
 
@@ -110,6 +143,10 @@ class Resolver:
         # Nothing else has already pinned the client list for us — see the
         # module comment above _FAST_PLAYER_CLIENT.
         self._fast_client_enabled = not settings.ytdlp_player_client
+        # Nothing else has already pinned a specific runtime binary for us
+        # — see the module comment above _FAST_JS_RUNTIMES.
+        self._fast_runtime_enabled = not settings.ytdlp_js_runtime_path
+        self._fast_path_enabled = self._fast_client_enabled or self._fast_runtime_enabled
 
         self._ytdl_options: dict[str, Any] | None = None
         self._fast_ytdl_options: dict[str, Any] | None = None
@@ -118,9 +155,10 @@ class Resolver:
         # signature challenge is solved once and cached on the extractor
         # instance itself. A fresh YoutubeDL() every call throws that away,
         # so the ~6s Deno JS-challenge solve would rerun from scratch on
-        # every !sr, even for a song played minutes earlier. Fast-client and
-        # full-client attempts use different extractor_args, so each thread
-        # gets up to two instances (one per attribute below), not one.
+        # every !sr, even for a song played minutes earlier. Fast and
+        # fallback attempts can differ in player_client and/or js_runtimes
+        # (see _get_ytdl_options), so each thread gets up to two instances
+        # (one per attribute below), not one.
         self._ytdl_tlocal = threading.local()
 
     def close(self) -> None:
@@ -147,7 +185,12 @@ class Resolver:
         await asyncio.gather(*(_one() for _ in range(self._settings.ytdlp_concurrency)))
         log.info("Resolver warm-up finished in %.1fs.", time.monotonic() - start)
 
-    def _build_options(self, *, player_client_override: tuple[str, ...] | None = None) -> dict[str, Any]:
+    def _build_options(
+        self,
+        *,
+        player_client_override: tuple[str, ...] | None = None,
+        js_runtimes_override: dict[str, dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
         verbose = self._settings.log_level == "DEBUG"
         options: dict[str, Any] = {
             # Audio-only when available — this pipeline decodes to raw PCM
@@ -191,16 +234,22 @@ class Resolver:
             options["extractor_args"] = extractor_args
         if self._settings.ytdlp_cookies_file is not None:
             options["cookiefile"] = str(self._settings.ytdlp_cookies_file)
-        if self._settings.ytdlp_js_runtime_path:
+        if js_runtimes_override is not None:
+            options["js_runtimes"] = js_runtimes_override
+        elif self._settings.ytdlp_js_runtime_path:
             options["js_runtimes"] = {
                 self._settings.ytdlp_js_runtime_name: {"path": self._settings.ytdlp_js_runtime_path}
             }
+        # else: leave unset — yt-dlp's own default ({"deno": {}}) applies.
         return options
 
     def _get_ytdl_options(self, *, fast: bool) -> dict[str, Any]:
         if fast:
             if self._fast_ytdl_options is None:
-                self._fast_ytdl_options = self._build_options(player_client_override=_FAST_PLAYER_CLIENT)
+                self._fast_ytdl_options = self._build_options(
+                    player_client_override=_FAST_PLAYER_CLIENT if self._fast_client_enabled else None,
+                    js_runtimes_override=_FAST_JS_RUNTIMES if self._fast_runtime_enabled else None,
+                )
             return self._fast_ytdl_options
         if self._ytdl_options is None:
             self._ytdl_options = self._build_options()
@@ -245,7 +294,7 @@ class Resolver:
         return bool(item and item.get("url"))
 
     async def _extract_info(self, query: str) -> dict[str, Any]:
-        if self._fast_client_enabled:
+        if self._fast_path_enabled:
             start = time.monotonic()
             try:
                 info = await self._extract_info_via(
@@ -253,15 +302,15 @@ class Resolver:
                 )
             except DownloadError as exc:
                 log.info(
-                    "Fast resolve (visionos) failed for %r after %.1fs (%s) — falling back.",
+                    "Fast resolve failed for %r after %.1fs (%s) — falling back.",
                     query, time.monotonic() - start, exc,
                 )
             else:
                 if self._has_playable_url(info):
-                    log.debug("Fast resolve (visionos) for %r took %.1fs.", query, time.monotonic() - start)
+                    log.debug("Fast resolve for %r took %.1fs.", query, time.monotonic() - start)
                     return info
                 log.info(
-                    "Fast resolve (visionos) returned no playable format for %r after %.1fs — falling back.",
+                    "Fast resolve returned no playable format for %r after %.1fs — falling back.",
                     query, time.monotonic() - start,
                 )
 
