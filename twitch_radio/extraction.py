@@ -85,6 +85,19 @@ _FAST_PLAYER_CLIENT: tuple[str, ...] = ("visionos",)
 # but it can't catch a *worse-but-still-present* format, only a missing one.
 # Only applies when the user hasn't already pinned a specific runtime
 # themselves (YTDLP_JS_RUNTIME_PATH) — see _fast_runtime_enabled below.
+#
+# IMPORTANT — this only ever gets *used* when _FAST_PLAYER_CLIENT is also in
+# play (see _fast_path_enabled in __init__): a runtime swap alone doesn't
+# change which network requests get made, only which engine solves the
+# challenge in them. If player_client is already pinned to the same list on
+# both attempts (typically because YTDLP_COOKIES_FILE forces one — see
+# config.py), "fast" and "fallback" issue *identical* requests, so a failed/
+# timed-out fast attempt has already paid the fallback's full network cost
+# before the fallback even starts, taking ~2x as long as just doing the one
+# real attempt. Confirmed against a live deployment's logs: quickjs's own
+# solve time (~13-15s) rode right at _FAST_EXTRACT_TIMEOUT_SECONDS on this
+# particular host, so the fast attempt timed out on effectively every
+# resolve, turning a ~15-18s fallback into a ~30s round trip every time.
 _FAST_JS_RUNTIMES: dict[str, dict[str, str]] = {"quickjs": {}}
 
 _FAST_EXTRACT_TIMEOUT_SECONDS = 15.0
@@ -146,7 +159,32 @@ class Resolver:
         # Nothing else has already pinned a specific runtime binary for us
         # — see the module comment above _FAST_JS_RUNTIMES.
         self._fast_runtime_enabled = not settings.ytdlp_js_runtime_path
-        self._fast_path_enabled = self._fast_client_enabled or self._fast_runtime_enabled
+        # Deliberately NOT "self._fast_client_enabled or self._fast_runtime_enabled".
+        # The fast attempt is only cheaper than the fallback when it does
+        # structurally less work — i.e. when _fast_client_enabled lets it use
+        # _FAST_PLAYER_CLIENT (visionos), which skips the JS challenge
+        # entirely. A *runtime-only* difference (_fast_runtime_enabled alone,
+        # with _fast_client_enabled False) still issues the exact same
+        # requests as the fallback, since the player_client list — usually
+        # forced by YTDLP_COOKIES_FILE, see config.py — is unchanged between
+        # the two attempts. Running that "fast" attempt first buys nothing
+        # even when it succeeds (no work was skipped) and, on a failure or a
+        # timeout — the normal case whenever quickjs isn't meaningfully
+        # faster than deno on the host, as one deployment's logs showed —
+        # it means paying the fallback's full network + JS-challenge cost
+        # twice in a row instead of once. So only a genuine client swap
+        # enables the two-attempt dance. When only _fast_runtime_enabled is
+        # set, the single fallback attempt below still runs — just once,
+        # with yt-dlp's own default runtime (deno) rather than a forced
+        # quickjs — since we have no evidence on this deployment that
+        # quickjs actually resolves faster than deno once the redundant
+        # attempt is removed (its own solve time rode right at the fast-path
+        # timeout, same ballpark as deno's). If you want to try quickjs as
+        # the *one* runtime for every resolve on a cookie-enabled deployment,
+        # set YTDLP_JS_RUNTIME_NAME=quickjs and YTDLP_JS_RUNTIME_PATH=<path
+        # to qjs> explicitly (see config.py) — that's an existing knob, not
+        # something this fast-path logic should guess at.
+        self._fast_path_enabled = self._fast_client_enabled
 
         self._ytdl_options: dict[str, Any] | None = None
         self._fast_ytdl_options: dict[str, Any] | None = None
