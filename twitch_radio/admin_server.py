@@ -9,6 +9,7 @@ from html import escape
 from typing import Any
 from urllib.parse import urlsplit
 
+import aiohttp
 from aiohttp import web
 
 from twitch_radio.blocklist import clean_list
@@ -23,6 +24,22 @@ log = logging.getLogger(__name__)
 # Derived from tunables.py's TUNABLE_BOUNDS (not re-hardcoded here) so this
 # and the chat !setlimit command can never drift apart on allowed ranges.
 _FIELDS = [(name, name, lo, hi) for name, (lo, hi) in TUNABLE_BOUNDS.items()]
+
+# Hostnames /thumb-proxy will actually fetch from — see handle_thumb_proxy()
+# for why this exists at all (it's not optional). Covers YouTube's thumbnail
+# CDN (ytimg.com), YouTube channel/avatar images (ggpht.com,
+# googleusercontent.com — yt-dlp occasionally surfaces these for a video's
+# "thumbnail" too), and SoundCloud's artwork CDN (sndcdn.com). Suffix-matched
+# the same way extraction.py's _ALLOWED_URL_HOSTS is: host == suffix or
+# host.endswith("." + suffix).
+_THUMB_HOST_SUFFIXES = ("ytimg.com", "ggpht.com", "googleusercontent.com", "sndcdn.com")
+_THUMB_FETCH_TIMEOUT = aiohttp.ClientTimeout(total=5)
+_THUMB_MAX_BYTES = 3 * 1024 * 1024  # real thumbnails run tens-to-low-hundreds of KB; generous ceiling, not a target
+
+
+def _is_allowed_thumb_host(host: str) -> bool:
+    host = host.lower()
+    return any(host == suffix or host.endswith("." + suffix) for suffix in _THUMB_HOST_SUFFIXES)
 
 _OVERLAY_HTML = """<!doctype html>
 <html><head><meta charset="utf-8">
@@ -39,17 +56,19 @@ _OVERLAY_HTML = """<!doctype html>
   }
   .panel {
     width: 420px; padding: 14px 18px;
-    background: rgba(15, 17, 23, 0.82);
+    background: var(--panel-bg, rgba(15, 17, 23, 0.82));
     border-radius: 16px;
     backdrop-filter: blur(6px);
     box-shadow: 0 8px 24px rgba(0,0,0,0.35);
-    --accent: #E8A33D;
+    --accent-primary: #E8A33D;
+    --accent-secondary: #E85D75;
+    transition: background 0.5s ease;
   }
   .now { display: flex; gap: 12px; align-items: center; }
   .thumb {
     width: 56px; height: 56px; border-radius: 10px; flex-shrink: 0;
     background: rgba(255,255,255,0.08) center/cover no-repeat;
-    box-shadow: 0 0 0 1px rgba(255,255,255,0.10), 0 0 16px -4px var(--accent);
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.10), 0 0 16px -4px var(--accent-primary);
     transition: box-shadow 0.4s ease;
   }
   .info { min-width: 0; flex: 1; }
@@ -63,7 +82,10 @@ _OVERLAY_HTML = """<!doctype html>
   .time { font-size: 11px; color: #9B9FB3; width: 34px; flex-shrink: 0; }
   .time.right { text-align: right; }
   .bar { flex: 1; height: 4px; border-radius: 2px; background: rgba(255,255,255,0.12); overflow: hidden; }
-  .fill { height: 100%; width: 0%; background: var(--accent); border-radius: 2px; transition: background 0.4s ease; }
+  .fill {
+    height: 100%; width: 0%; background: var(--accent-secondary); border-radius: 2px;
+    transition: background 0.4s ease;
+  }
   .idle { font-size: 13px; color: #9B9FB3; padding: 6px 2px; }
   .next { margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.10); }
   .next-label { font-size: 11px; color: #9B9FB3; margin-bottom: 4px; }
@@ -75,47 +97,148 @@ _OVERLAY_HTML = """<!doctype html>
 <body><div class="panel" id="panel"></div>
 <script>
 const panel = document.getElementById('panel');
-let last = null, lastFetchedAt = 0, lastThumb = null, lastTrackKey = null;
+let last = null, lastFetchedAt = 0, lastThumb = null, lastTrackKey = null, lastNextKey = null;
 
 function fmt(s) {
   s = Math.max(0, Math.floor(s));
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
 }
 
-const DEFAULT_ACCENT = '#E8A33D';
+const DEFAULT_PRIMARY = [232, 163, 61];    // #E8A33D
+const DEFAULT_SECONDARY = [232, 93, 117];  // #E85D75
+const PANEL_BASE = [15, 17, 23];           // matches .panel's default rgba(15,17,23,...) base
 
-function applyAccent(url) {
+function rgbStr(c) { return `rgb(${c[0]},${c[1]},${c[2]})`; }
+function rgbaStr(c, a) { return `rgba(${c[0]},${c[1]},${c[2]},${a})`; }
+
+function mix(base, accent, amount) {
+  return base.map((v, i) => Math.round(v * (1 - amount) + accent[i] * amount));
+}
+
+// Boost toward legible against the dark panel — raw thumbnail colors skew muddy.
+function legibilize(c) {
+  const max = Math.max(c[0], c[1], c[2]) || 1;
+  const boost = 255 / max * 0.75;
+  return c.map((v) => Math.min(255, Math.round(v * boost + 40)));
+}
+
+function rgbToHsl([r, g, b]) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  const l = (max + min) / 2;
+  if (d === 0) return [0, 0, l];
+  const s = d / (1 - Math.abs(2 * l - 1));
+  let h;
+  if (max === r) h = ((g - b) / d) % 6;
+  else if (max === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  h *= 60;
+  if (h < 0) h += 360;
+  return [h, s, l];
+}
+
+function hslToRgb([h, s, l]) {
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs((h / 60) % 2 - 1));
+  const m = l - c / 2;
+  let rgb;
+  if (h < 60) rgb = [c, x, 0];
+  else if (h < 120) rgb = [x, c, 0];
+  else if (h < 180) rgb = [0, c, x];
+  else if (h < 240) rgb = [0, x, c];
+  else if (h < 300) rgb = [x, 0, c];
+  else rgb = [c, 0, x];
+  return rgb.map((v) => Math.round((v + m) * 255));
+}
+
+function hueOf(c) { return rgbToHsl(c)[0]; }
+
+// Used when the artwork doesn't hand us a second color distinct enough from
+// the primary (near-monochrome art) — guarantees the two accents are never
+// near-identical, which is the whole point of having two.
+function rotateHue(c, deg) {
+  const [h, s, l] = rgbToHsl(c);
+  return hslToRgb([(h + deg) % 360, Math.max(s, 0.55), Math.min(0.62, Math.max(l, 0.45))]);
+}
+
+function applyPalette(url) {
   if (!url) {
-    panel.style.setProperty('--accent', DEFAULT_ACCENT);
+    panel.style.setProperty('--accent-primary', rgbStr(DEFAULT_PRIMARY));
+    panel.style.setProperty('--accent-secondary', rgbStr(DEFAULT_SECONDARY));
+    panel.style.removeProperty('--panel-bg');
     return;
   }
   const img = new Image();
   img.crossOrigin = 'anonymous';
   img.onload = () => {
     try {
+      const size = 32;
       const c = document.createElement('canvas');
-      c.width = 16; c.height = 16;
+      c.width = size; c.height = size;
       const ctx = c.getContext('2d');
-      ctx.drawImage(img, 0, 0, 16, 16);
-      const px = ctx.getImageData(0, 0, 16, 16).data;
-      let r = 0, g = 0, b = 0, n = 0;
+      ctx.drawImage(img, 0, 0, size, size);
+      const px = ctx.getImageData(0, 0, size, size).data;
+
+      // Coarse RGB histogram (32-wide buckets: 8x8x8 = 512 cells) to find
+      // the dominant color, skipping near-white/near-black/near-gray
+      // pixels so a plain border or letterboxing in the artwork doesn't
+      // win the "dominant color" slot just by being the most common pixel.
+      const buckets = new Map();
       for (let i = 0; i < px.length; i += 4) {
-        r += px[i]; g += px[i + 1]; b += px[i + 2]; n++;
+        const r = px[i], g = px[i + 1], b = px[i + 2];
+        const max = Math.max(r, g, b), min = Math.min(r, g, b);
+        if (max - min < 18) continue;
+        if (max > 245 && min > 225) continue;
+        if (max < 20) continue;
+        const key = (r >> 5) + ',' + (g >> 5) + ',' + (b >> 5);
+        const entry = buckets.get(key);
+        if (entry) { entry.count++; entry.r += r; entry.g += g; entry.b += b; }
+        else buckets.set(key, { count: 1, r, g, b });
       }
-      r = Math.round(r / n); g = Math.round(g / n); b = Math.round(b / n);
-      // Boost toward legible against the dark panel — raw thumbnail averages skew muddy.
-      const max = Math.max(r, g, b) || 1;
-      const boost = 255 / max * 0.75;
-      r = Math.min(255, Math.round(r * boost + 40));
-      g = Math.min(255, Math.round(g * boost + 40));
-      b = Math.min(255, Math.round(b * boost + 40));
-      panel.style.setProperty('--accent', `rgb(${r},${g},${b})`);
+      const ranked = [...buckets.values()].sort((a, b2) => b2.count - a.count);
+      const toColor = (e) => [Math.round(e.r / e.count), Math.round(e.g / e.count), Math.round(e.b / e.count)];
+
+      let primary, secondary;
+      if (ranked.length === 0) {
+        primary = DEFAULT_PRIMARY;
+        secondary = DEFAULT_SECONDARY;
+      } else {
+        primary = toColor(ranked[0]);
+        const primaryHue = hueOf(primary);
+        // First runner-up bucket at least ~45deg of hue away — a genuinely
+        // distinct color, not just a lighter/darker shade of the primary.
+        const distinct = ranked.slice(1).find((e) => {
+          const h = hueOf(toColor(e));
+          const diff = Math.min(Math.abs(h - primaryHue), 360 - Math.abs(h - primaryHue));
+          return diff > 45;
+        });
+        secondary = distinct ? toColor(distinct) : rotateHue(primary, 150);
+      }
+
+      primary = legibilize(primary);
+      secondary = legibilize(secondary);
+      panel.style.setProperty('--accent-primary', rgbStr(primary));
+      panel.style.setProperty('--accent-secondary', rgbStr(secondary));
+      panel.style.setProperty('--panel-bg', rgbaStr(mix(PANEL_BASE, primary, 0.30), 0.88));
     } catch (e) {
-      // Tainted canvas (no permissive CORS from the CDN) — keep the current accent.
+      // Canvas error (shouldn't happen via the same-origin /thumb-proxy —
+      // see the proxy fetch below — but keep the current accents either way).
     }
   };
   img.onerror = () => {};
-  img.src = url;
+  // Routed through our own /thumb-proxy, not the raw thumbnail_url: YouTube's
+  // CDN doesn't send Access-Control-Allow-Origin, so a direct cross-origin
+  // load here taints the canvas and getImageData() throws — silently
+  // no-op'ing this whole feature. The *visible* <div class="thumb"> below
+  // still loads thumbnail_url directly (display doesn't need CORS at all).
+  img.src = '/thumb-proxy?url=' + encodeURIComponent(url);
+}
+
+function nextHtml(queue) {
+  const items = (queue || []).slice(0, 2);
+  if (items.length === 0) return '';
+  return '<div class="next-label">Up next</div>'
+    + items.map(q => `<div class="next-item">${escapeHtml(q.title)}</div>`).join('');
 }
 
 function render(data, elapsed) {
@@ -124,24 +247,27 @@ function render(data, elapsed) {
       panel.innerHTML = '<div class="idle">Radio\\'s quiet right now</div>';
       lastTrackKey = null;
       lastThumb = null;
+      lastNextKey = null;
     }
     return;
   }
 
   const trackKey = data.webpage_url || data.title;
+  const nextKey = JSON.stringify((data.queue || []).slice(0, 2).map(q => q.title));
+
   if (trackKey !== lastTrackKey) {
     lastTrackKey = trackKey;
+    lastNextKey = nextKey;
     if (data.thumbnail_url !== lastThumb) {
       lastThumb = data.thumbnail_url;
-      applyAccent(data.thumbnail_url);
+      applyPalette(data.thumbnail_url);
     }
     // escapeHtml() here too (not just on title/uploader/requester below): this
     // value lands inside an HTML attribute (style="...url('...')"), where an
     // unescaped quote can break out and inject markup — !sr accepts arbitrary
     // URLs from chat, so thumbnail_url isn't trustworthy input.
     const thumb = data.thumbnail_url ? `style="background-image:url('${escapeHtml(data.thumbnail_url)}')"` : '';
-    const next = (data.queue || []).slice(0, 2)
-      .map(q => `<div class="next-item">${escapeHtml(q.title)}</div>`).join('');
+    const hasNext = (data.queue || []).length > 0;
     panel.innerHTML = `
       <div class="now">
         <div class="thumb" ${thumb}></div>
@@ -155,7 +281,7 @@ function render(data, elapsed) {
           </div>
         </div>
       </div>
-      ${next ? `<div class="next"><div class="next-label">Up next</div>${next}</div>` : ''}
+      <div class="next" id="next-wrap" style="${hasNext ? '' : 'display:none'}">${nextHtml(data.queue)}</div>
     `;
     // Rebuilt fresh above with opacity 0 — bump to 1 next frame so the
     // fade-in transition actually has something to animate from.
@@ -163,6 +289,22 @@ function render(data, elapsed) {
       const t = document.getElementById('t-title');
       if (t) t.style.opacity = '1';
     });
+  } else if (nextKey !== lastNextKey) {
+    // Same track still playing, but the queue itself changed (a new !sr
+    // landed, or a mod cleared/blocked something) — update just the "Up
+    // next" list in place. Without this branch, a queue change while
+    // nothing else changed was silently dropped: the block above is the
+    // *only* thing that ever touched panel.innerHTML, and it's gated on
+    // the now-playing track changing, not the queue — so "Up next" only
+    // ever caught up whenever a new song happened to start next, which
+    // looked like it needed an OBS browser-source refresh to show up.
+    lastNextKey = nextKey;
+    const wrap = document.getElementById('next-wrap');
+    if (wrap) {
+      const hasNext = (data.queue || []).length > 0;
+      wrap.style.display = hasNext ? '' : 'none';
+      wrap.innerHTML = nextHtml(data.queue);
+    }
   }
 
   // Runs every frame via tick() — only touches the two per-frame-changing
@@ -283,6 +425,7 @@ class AdminServer:
         specs_store: JsonStore,
         settings_password: str | None,
         broadcast_info: dict[str, str],
+        thumb_session: aiohttp.ClientSession,
     ) -> None:
         self._player = player
         self._tunables_store = tunables_store
@@ -291,6 +434,11 @@ class AdminServer:
         self._settings_password = settings_password
         self._broadcast_info = broadcast_info
         self._auth_limiter = _AuthRateLimiter()
+        # Owned by run_admin_server() (created/closed alongside the aiohttp
+        # app — see its on_cleanup hook), not by this instance — reused
+        # across every /thumb-proxy request rather than opening a fresh
+        # connection per fetch.
+        self._thumb_session = thumb_session
 
     def _check_auth(self, request: web.Request) -> bool:
         if self._settings_password is None:
@@ -423,6 +571,57 @@ class AdminServer:
 
     async def handle_overlay(self, request: web.Request) -> web.Response:
         return web.Response(text=_OVERLAY_HTML, content_type="text/html")
+
+    async def handle_thumb_proxy(self, request: web.Request) -> web.Response:
+        """Same-origin relay for a track's thumbnail image, fetched only so
+        the overlay's canvas-based color extraction (applyPalette() in
+        _OVERLAY_HTML) can read pixel data back out of it. Loading the
+        thumbnail directly from YouTube's CDN in the browser taints the
+        canvas — it doesn't send Access-Control-Allow-Origin, so
+        getImageData() throws a SecurityError and color extraction silently
+        no-ops. Relaying it through our own origin sidesteps that.
+
+        Restricted to _THUMB_HOST_SUFFIXES rather than proxying whatever URL
+        the query string names: this endpoint is unauthenticated like the
+        rest of the overlay surface (see this class's docstring on 0.0.0.0
+        deployments), so without that allowlist it would be an open SSRF
+        relay for anyone who can reach this port.
+        """
+        url = request.query.get("url", "")
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        if parts.scheme not in ("http", "https") or not _is_allowed_thumb_host(host):
+            return web.Response(status=400, text="URL not allowed")
+        try:
+            async with self._thumb_session.get(url, timeout=_THUMB_FETCH_TIMEOUT) as upstream:
+                if upstream.status != 200:
+                    return web.Response(status=502, text="Upstream fetch failed")
+                content_type = upstream.content_type or "application/octet-stream"
+                if not content_type.startswith("image/"):
+                    return web.Response(status=502, text="Not an image")
+                # Bounded-chunk read, not a single .read(n) call — that
+                # would cap the *size of one read*, not the total, on a
+                # slow/chunked upstream. iter_chunked() lets us check the
+                # running total and bail before ever buffering past the cap.
+                chunks = bytearray()
+                async for chunk in upstream.content.iter_chunked(65536):
+                    chunks.extend(chunk)
+                    if len(chunks) > _THUMB_MAX_BYTES:
+                        return web.Response(status=502, text="Image too large")
+                body = bytes(chunks)
+        except (aiohttp.ClientError, TimeoutError):
+            return web.Response(status=502, text="Upstream fetch failed")
+        return web.Response(
+            body=body,
+            content_type=content_type,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                # Thumbnails for a given video/track ID are effectively
+                # immutable — safe for the browser to cache aggressively
+                # instead of re-hitting this proxy on every track change.
+                "Cache-Control": "public, max-age=3600",
+            },
+        )
 
     async def handle_stream(self, request: web.Request) -> web.StreamResponse:
         response = web.StreamResponse(
@@ -594,18 +793,28 @@ async def run_admin_server(
     host: str,
     port: int,
 ) -> web.AppRunner:
+    thumb_session = aiohttp.ClientSession()
     server = AdminServer(
         player=player, tunables_store=tunables_store, blocklist_store=blocklist_store,
         specs_store=specs_store, settings_password=settings_password, broadcast_info=broadcast_info,
+        thumb_session=thumb_session,
     )
     app = web.Application()
     app.router.add_get("/nowplaying.json", server.handle_nowplaying)
     app.router.add_get("/ws/nowplaying", server.handle_ws_nowplaying)
     app.router.add_get("/blocklist.json", server.handle_blocklist)
     app.router.add_get("/overlay", server.handle_overlay)
+    app.router.add_get("/thumb-proxy", server.handle_thumb_proxy)
     app.router.add_get("/stream.mp3", server.handle_stream)
     app.router.add_get("/settings", server.handle_settings_get)
     app.router.add_post("/settings", server.handle_settings_post)
+    # Ties thumb_session's lifetime to the app's — runner.cleanup() (already
+    # called in bot.py's shutdown path) fires this automatically, so no
+    # separate close() call needs adding anywhere else.
+    async def _close_thumb_session(_app: web.Application) -> None:
+        await thumb_session.close()
+
+    app.on_cleanup.append(_close_thumb_session)
 
     runner = web.AppRunner(app)
     await runner.setup()
