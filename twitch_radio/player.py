@@ -33,6 +33,14 @@ _DECODER_START_TIMEOUT = 20.0
 # via ffmpeg's -re real-time pacing, so a real 20s gap means the source is
 # actually stuck.
 _STALL_TIMEOUT_SECONDS = 20.0
+# How long before a track ends to pre-resolve whatever's next in queue (see
+# _prefetch_next_when_close). Comfortably above the ~8-18s a warm resolve
+# actually takes (see extraction.py's fast-path fix) so the prefetch lands
+# well inside Resolver's TTL cache before _play_one_inner needs the result
+# for real — without this, a queue backlog that outlives
+# YTDLP_CACHE_TTL_SECONDS turns every transition into a full cold resolve
+# again, i.e. audible silence mid-stream, not just at startup.
+_PREFETCH_LEAD_SECONDS = 20.0
 
 
 class TrackResolver(Protocol):
@@ -70,11 +78,23 @@ class RadioPlayer:
     """
 
     def __init__(
-        self, *, resolver: TrackResolver, audio_bitrate_kbps: int, pause_when_no_listeners: bool = False
+        self,
+        *,
+        resolver: TrackResolver,
+        audio_bitrate_kbps: int,
+        pause_when_no_listeners: bool = False,
+        prefetch_enabled: bool = True,
     ) -> None:
         self._resolver = resolver
         self._audio_bitrate_kbps = audio_bitrate_kbps
         self._pause_when_no_listeners = pause_when_no_listeners
+        # Pointless (and wasteful — a redundant resolve for every track,
+        # same anti-pattern the extraction.py fast-path fix removed) when
+        # Resolver's own cache is disabled (YTDLP_CACHE_TTL_SECONDS=0): the
+        # prefetch's result would just be discarded instead of reused. See
+        # bot.py for how this gets computed from settings.
+        self._prefetch_enabled = prefetch_enabled
+        self._prefetch_task: asyncio.Task[None] | None = None
 
         self._queue: asyncio.Queue[QueuedRequest] = asyncio.Queue()
         self._pending: list[QueuedRequest] = []
@@ -413,7 +433,39 @@ class RadioPlayer:
             log.exception("Error playing queued request: %s", request.webpage_url)
         finally:
             self._active_request = None
+            # However this track ended (finished, skipped, stalled, errored),
+            # any prefetch scheduled for it is no longer relevant — the next
+            # _play_one_inner call will schedule its own once it knows the
+            # new track's real duration.
+            task = self._prefetch_task
+            self._prefetch_task = None
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
             self._notify_state_changed()
+
+    async def _prefetch_next_when_close(self, current_duration: int) -> None:
+        """Best-effort: once the currently-playing track is close to
+        ending, resolves whatever is now at the front of the queue so it's
+        already cache-warm by the time _play_one_inner re-resolves it for
+        real (see the module comment above _PREFETCH_LEAD_SECONDS). Never
+        raises and never touches playback state — a failure here just means
+        that transition pays the normal resolve cost, exactly as if this
+        didn't run at all. Deliberately re-checks the queue at fire time
+        (not whatever was next when this task was scheduled), since what's
+        "next" can change — a request ahead of it could get skipped,
+        blocked, or cleared while this was sleeping.
+        """
+        delay = max(0.0, current_duration - _PREFETCH_LEAD_SECONDS)
+        await asyncio.sleep(delay)  # cancelled cleanly by _play_one's finally when the track ends first
+        upcoming = self._pending[0] if self._pending else None
+        if upcoming is None or upcoming.cancelled:
+            return
+        try:
+            await self._resolver(upcoming.webpage_url, upcoming.requester_id)
+        except Exception:
+            log.debug("Prefetch failed for %s (non-fatal).", upcoming.webpage_url, exc_info=True)
 
     async def _current_duration_limit(self) -> int:
         if self._duration_limit_getter is None:
@@ -467,6 +519,10 @@ class RadioPlayer:
             )
             self._notify_state_changed()
             log.info("Now playing: %s (requested by %s)", track.title, request.requester_name)
+            if self._prefetch_enabled:
+                self._prefetch_task = asyncio.create_task(
+                    self._prefetch_next_when_close(track.duration), name="radio-player-prefetch-next"
+                )
 
             decoder = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
