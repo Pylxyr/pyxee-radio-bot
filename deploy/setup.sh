@@ -199,6 +199,35 @@ else
   fi
 fi
 
+# Optional: quickjs-ng, a much lighter JS runtime than Deno (no JIT/V8 to
+# start up). twitch_radio/extraction.py tries it first for every resolve
+# (falling back to Deno automatically if it's missing or fails), since
+# Deno's per-request cost here is dominated by process-spawn + interpreter
+# startup, not actual computation — exactly where a JIT buys nothing. Purely
+# an optimization: everything works with only Deno installed, just slower.
+# Static binary, no package manager needed.
+if command -v qjs >/dev/null 2>&1; then
+  info "quickjs-ng already installed ($(qjs --help 2>&1 | head -n1)) — skipping."
+else
+  case "$(uname -m)" in
+    x86_64)          qjs_asset="qjs-linux-x86_64" ;;
+    aarch64|arm64)   qjs_asset="qjs-linux-aarch64" ;;
+    *)                qjs_asset="" ;;
+  esac
+  if [[ -z "${qjs_asset}" ]]; then
+    warn "No prebuilt quickjs-ng binary for this architecture ($(uname -m)) — not required, the bot will keep using Deno." \
+         "Manual builds: https://github.com/quickjs-ng/quickjs/releases"
+  elif curl -fsSL -o /tmp/qjs "https://github.com/quickjs-ng/quickjs/releases/latest/download/${qjs_asset}" \
+     && sudo install -m 755 /tmp/qjs /usr/local/bin/qjs; then
+    rm -f /tmp/qjs
+    success "quickjs-ng installed to /usr/local/bin ($(qjs --help 2>&1 | head -n1))."
+  else
+    rm -f /tmp/qjs
+    warn "quickjs-ng install failed — not required, the bot will keep using Deno." \
+         "Install manually later if you want the speedup: https://github.com/quickjs-ng/quickjs/releases"
+  fi
+fi
+
 echo "[3/7] Preparing app directories"
 mkdir -p "${APP_DIR}/data" "${APP_DIR}/logs" "${APP_DIR}/data/deno-cache"
 
