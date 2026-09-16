@@ -85,15 +85,19 @@ _USAGE = {
     "unblock": "Usage: !unblock <YouTube/SoundCloud URL, or an uploader name>",
 }
 
-# Twitch silently drops a chat message that's byte-identical to that same
-# account's previous one within roughly the last 30s (see _safe_reply's
-# docstring below) — a real problem here specifically because several
-# status replies (:"already queued.", "Looking up '...'…") are worded
-# identically every time the same situation recurs, e.g. two different
-# chatters requesting the currently-playing song minutes apart. Appended
-# to a repeated message to make it byte-distinct without changing its
-# meaning; cycled rather than reused so three-plus repeats in a row don't
-# collide with each other either.
+# Twitch silently drops a chat message that's byte-identical to one this
+# account sent recently — but "recently" turned out, against a live
+# deployment, to be a genuine server-side rolling window rather than just
+# "the single immediately-previous message": a distinct message sent in
+# between didn't save a same-text repeat 17s later, and a freshly
+# restarted process (with no memory of anything it had sent) still had
+# its first attempt at a given text dropped, because Twitch itself
+# remembered that exact text from just before the restart. That rules out
+# any client-side "have I sent this recently" tracking as reliably
+# predictive — so instead, every reply through _safe_reply below gets a
+# small rotating cosmetic suffix unconditionally, guaranteeing it's never
+# byte-identical to whatever this bot said last time around, without
+# needing to model Twitch's own dedup window at all.
 _DEDUP_SUFFIXES = (" \U0001f3b5", " \U0001f3b6", " \U0001f3a7", " \U0001f50a")
 
 # Every @commands.is_moderator() below (and the manual `chatter.moderator`
@@ -111,18 +115,14 @@ _DEDUP_SUFFIXES = (" \U0001f3b5", " \U0001f3b6", " \U0001f3a7", " \U0001f50a")
 class SongRequestComponent(commands.Component):
     def __init__(self, bot: TwitchChatBot) -> None:
         self.bot = bot
-        # Tracks the last *semantic* (pre-suffix) message this component
-        # sent, and which _DEDUP_SUFFIXES entry (if any) was last appended
-        # — see _safe_reply below. Deliberately in-memory/per-instance:
-        # losing this across a restart is harmless, it just means the very
-        # first reply after a restart can't dedup against anything (fine,
-        # there's nothing to collide with yet).
-        self._last_reply_text: str | None = None
-        self._last_reply_suffix_index = -1
+        # Round-robins through _DEDUP_SUFFIXES on every _safe_reply call —
+        # see that method for why this is unconditional rather than only
+        # applied when a repeat is detected.
+        self._reply_counter = 0
 
     async def _safe_reply(self, ctx: commands.Context, message: str) -> None:
         """ctx.reply() that swallows Twitch's own message-delivery failures
-        — a 429 (chat rate limit) or the 30s exact-duplicate-message rule,
+        — a 429 (chat rate limit) or the exact-duplicate-message rule,
         both TwitchioException — instead of letting them propagate.
 
         Matters most for song_request()'s very first reply below: it's
@@ -136,25 +136,21 @@ class SongRequestComponent(commands.Component):
         (the bot's own "already queued" replies can collide with these
         same Twitch-side limits), not just rapid self-testing.
 
-        Before even attempting delivery, though: if `message` is exactly
-        what this component last sent, Twitch would silently eat it
-        regardless — so a small cosmetic suffix (cycled through
-        _DEDUP_SUFFIXES) is appended first to guarantee it's never
-        byte-identical to the previous reply. Comparison is always against
-        the plain, un-suffixed text, so a run of repeats keeps cycling
-        rather than drifting into ever-longer suffixes.
+        Every message gets a small rotating suffix (see _DEDUP_SUFFIXES
+        above) before delivery is even attempted, unconditionally — not
+        just when a repeat looks likely — since Twitch's own dedup state
+        isn't something this process can reliably reconstruct (its window
+        outlasts a single "previous message" comparison, and survives
+        this bot restarting).
         """
-        text = message
-        if message == self._last_reply_text:
-            self._last_reply_suffix_index = (self._last_reply_suffix_index + 1) % len(_DEDUP_SUFFIXES)
-            text = message + _DEDUP_SUFFIXES[self._last_reply_suffix_index]
-        else:
-            self._last_reply_suffix_index = -1
-        self._last_reply_text = message
+        suffix = _DEDUP_SUFFIXES[self._reply_counter % len(_DEDUP_SUFFIXES)]
+        self._reply_counter += 1
+        text = f"{message}{suffix}"
         try:
             await ctx.reply(text)
         except TwitchioException:
             log.info("Chat reply dropped by Twitch (rate limit or duplicate message): %r", text)
+
 
 
     @commands.command(name="sr", aliases=["songrequest"])
