@@ -130,6 +130,17 @@ class SongRequestComponent(commands.Component):
             return
 
         chatter_key = str(ctx.chatter.id)
+        normalized_query = query.lower()
+
+        # An exact repeat of a query this chatter already has resolving —
+        # most often the same command double-tapped a second or two apart,
+        # sent again before "Looking up..." even lands. Answering distinctly
+        # here (rather than repeating "Looking up...") both avoids Twitch's
+        # duplicate-message drop and skips a second, wholly redundant resolve.
+        if self.bot.inflight_query_by_chatter.get(chatter_key) == normalized_query:
+            await self._safe_reply(ctx, "Still looking that up — hang tight!")
+            return
+
         tunables = TwitchTunables.from_dict(await self.bot.tunables_store.read())
         now = time.monotonic()
 
@@ -177,6 +188,7 @@ class SongRequestComponent(commands.Component):
         # task is ever created — the pending-count reservation made above
         # would leak, and the request would never resolve or queue at all.
         await self._safe_reply(ctx, f"Looking up {query!r}\u2026")
+        self.bot.inflight_query_by_chatter[chatter_key] = normalized_query
 
         requester_name = ctx.chatter.display_name or ctx.chatter.name or "a viewer"
         task = asyncio.create_task(
@@ -289,6 +301,11 @@ class SongRequestComponent(commands.Component):
                     self.bot.pending_by_chatter.pop(chatter_key, None)
                 else:
                     self.bot.pending_by_chatter[chatter_key] = remaining_pending
+            # Only clear if it's still *our* query — a newer !sr from this
+            # same chatter could already have overwritten the marker with a
+            # different query by the time this one finishes.
+            if self.bot.inflight_query_by_chatter.get(chatter_key) == query.lower():
+                self.bot.inflight_query_by_chatter.pop(chatter_key, None)
 
     @commands.command(name="skip")
     # No @commands.is_moderator() guard — mods/broadcaster can always skip
@@ -585,6 +602,15 @@ class TwitchChatBot(commands.Bot):
         # would add complexity for no real benefit.
         self.last_request_at: dict[str, float] = {}
         self.pending_by_chatter: Counter[str] = Counter()
+        # Tracks each chatter's currently-resolving !sr query (case-folded)
+        # so an identical repeat while it's still in flight gets a distinct
+        # reply instead of triggering a second full resolve — Twitch's
+        # exact-duplicate-message rule silently drops the second identical
+        # "Looking up '...'…" anyway (see _safe_reply), so without this a
+        # double-tapped !sr looks like the bot ignored it, while the
+        # resolver quietly redoes the whole yt-dlp + JS-challenge round
+        # trip for nothing. Cleared in _resolve_and_queue's finally.
+        self.inflight_query_by_chatter: dict[str, str] = {}
         # Strong references to in-flight _resolve_and_queue() tasks — without
         # this, asyncio is free to garbage-collect a fire-and-forget task
         # mid-flight (a well-known footgun; see the asyncio docs on
