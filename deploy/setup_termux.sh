@@ -181,13 +181,13 @@ echo ""
 command -v curl >/dev/null 2>&1 || { info "Installing curl"; pkg install -y curl; }
 
 # ── 1. System packages ──────────────────────────────────────────────────
-info "[1/9] Installing Termux packages"
+info "[1/10] Installing Termux packages"
 pkg update -y
 pkg install -y python ffmpeg git curl clang make binutils libffi openssl nodejs 2>/dev/null || true
 success "System packages ready"
 
 # ── 2. JS runtime (Node, not Deno — see header comment) ────────────────
-info "[2/9] Checking the JS runtime (yt-dlp needs one for full YouTube support)"
+info "[2/10] Checking the JS runtime (yt-dlp needs one for full YouTube support)"
 if ! command -v node >/dev/null 2>&1; then
   warn "node not found on PATH even after 'pkg install nodejs' — song requests will still work for"
   warn "plain URLs, but YouTube *searches* and some videos will be degraded or fail."
@@ -206,7 +206,7 @@ else
 fi
 
 # ── 3. Python version ────────────────────────────────────────────────────
-info "[3/9] Checking Python (3.11+ required)"
+info "[3/10] Checking Python (3.11+ required)"
 if ! python -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
   error "Python 3.11+ required. Try: pkg upgrade python"
   exit 1
@@ -214,7 +214,7 @@ fi
 success "Python $(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")')"
 
 # ── 4. Virtual environment ───────────────────────────────────────────────
-info "[4/9] Creating virtual environment"
+info "[4/10] Creating virtual environment"
 mkdir -p "${APP_DIR}/data" "${APP_DIR}/logs"
 [[ -d "${VENV_DIR}" ]] || python -m venv "${VENV_DIR}"
 # shellcheck disable=SC1091
@@ -223,7 +223,7 @@ pip install --upgrade pip -q
 success "venv ready"
 
 # ── 5. Python dependencies ──────────────────────────────────────────────
-info "[5/9] Installing Python dependencies"
+info "[5/10] Installing Python dependencies"
 if ! pip install -r "${REQ_FILE}" -q 2>/tmp/pip_err.log; then
   if grep -qi "curl_cffi\|curl-cffi" /tmp/pip_err.log 2>/dev/null; then
     warn "Full requirements.txt failed, likely on yt-dlp's curl-cffi extra (needs a from-source build"
@@ -243,7 +243,7 @@ rm -f /tmp/pip_err.log /tmp/requirements_no_ytdlp.txt
 success "Python packages installed"
 
 # ── 6. Verify ─────────────────────────────────────────────────────────────
-info "[6/9] Verifying the install"
+info "[6/10] Verifying the install"
 if command -v ffmpeg >/dev/null 2>&1; then
   if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libmp3lame; then
     success "ffmpeg has libmp3lame (needed to encode the MP3 stream)"
@@ -268,7 +268,7 @@ check("aiohttp", "import aiohttp; print(f'    aiohttp {aiohttp.__version__}')")
 PY
 
 # ── 7. .env wizard ────────────────────────────────────────────────────────
-info "[7/9] Configuring .env"
+info "[7/10] Configuring .env"
 if [[ -f "${ENV_PATH}" ]]; then
   info "Found an existing ${ENV_PATH} — keeping it, only filling in anything still blank below."
   chmod 600 "${ENV_PATH}" 2>/dev/null || true
@@ -401,7 +401,7 @@ else
 fi
 
 # ── 8. Auto-start ─────────────────────────────────────────────────────────
-info "[8/9] Setting up auto-start"
+info "[8/10] Setting up auto-start"
 echo "Termux has no systemd. Two options:"
 echo "  1) termux-services (runit) — supervises the bot, restarts it on crash."
 echo "  2) A detached tmux session — simpler, no auto-restart."
@@ -421,6 +421,7 @@ if [[ "${USE_SERVICES}" == true ]]; then
 cd "${APP_DIR}"
 source "${VENV_DIR}/bin/activate"
 set -a; source "${ENV_PATH}"; set +a
+command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock
 exec python bot.py
 RUNEOF
     chmod +x "${SV_DIR}/run"
@@ -449,7 +450,7 @@ if [[ "${BOT_STARTED}" == false ]]; then
   command -v tmux >/dev/null 2>&1 || pkg install -y tmux
   tmux kill-session -t "${SERVICE_NAME}" 2>/dev/null || true
   tmux new-session -d -s "${SERVICE_NAME}" \
-    "cd '${APP_DIR}' && source '${VENV_DIR}/bin/activate' && exec python bot.py"
+    "cd '${APP_DIR}' && source '${VENV_DIR}/bin/activate' && { command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock; }; exec python bot.py"
   sleep 2
   if tmux has-session -t "${SERVICE_NAME}" 2>/dev/null; then
     success "Bot started in tmux session '${SERVICE_NAME}'."
@@ -460,8 +461,96 @@ if [[ "${BOT_STARTED}" == false ]]; then
   fi
 fi
 
-# ── 9. Done ────────────────────────────────────────────────────────────
-info "[9/9] Setup finished"
+# ── 9. Keep-alive: battery, Wi-Fi & background limits ───────────────────
+info "[9/10] Keep-alive: battery, Wi-Fi & background limits"
+echo "Unlike a VPS, Android actively suspends background apps to save power —"
+echo "that's the actual cause of a radio bot going silent overnight on a"
+echo "phone, not a bug in the bot. Three separate mechanisms can each"
+echo "independently stall or kill it, so all three get checked here."
+echo ""
+
+WAKE_LOCK_OK=false
+if command -v termux-wake-lock >/dev/null 2>&1; then
+  termux-wake-lock >/dev/null 2>&1 && WAKE_LOCK_OK=true
+fi
+if [[ "${WAKE_LOCK_OK}" == true ]]; then
+  success "CPU wake lock acquired. Also baked into the service/tmux launch"
+  success "command above, so it's reacquired automatically on every restart —"
+  success "not just this session."
+else
+  warn "termux-wake-lock not available. Install the Termux:API app from the"
+  warn "SAME source as Termux itself (both F-Droid, or both GitHub releases —"
+  warn "mixing sources breaks the two apps' ability to talk to each other),"
+  warn "then: pkg install termux-api"
+  warn "Without it, Doze can suspend the CPU entirely while the screen is"
+  warn "off, pausing playback until the phone is touched."
+fi
+
+echo ""
+echo "A wake lock alone does NOT survive Doze — Android's own docs say the"
+echo "system ignores wake locks unless the app is also exempted from battery"
+echo "optimization. That same exemption is what keeps Wi-Fi alive through"
+echo "Doze too; there's no separate 'Wi-Fi lock' to grant."
+echo ""
+
+ROOT_OK=false
+if command -v su >/dev/null 2>&1 && su -c 'id' >/dev/null 2>&1; then
+  ROOT_OK=true
+fi
+
+if [[ "${ROOT_OK}" == true ]]; then
+  echo "Root detected (Magisk may prompt to grant it — approve that if asked)."
+  echo "Two things can be granted from right here instead of Settings menus:"
+  echo "  1. Doze/battery-optimization exemption for Termux specifically."
+  echo "  2. Raising the whole device's background-process limit — Android"
+  echo "     12+'s 'phantom process killer' has a separate, documented habit"
+  echo "     of killing exactly this bot's shape of process (long-running,"
+  echo "     backgrounded) even with #1 already granted. This one is"
+  echo "     device-wide, not Termux-specific; undo any time with:"
+  echo "     su -c \"device_config delete activity_manager max_phantom_processes\""
+  echo ""
+  read -rp "Apply both now? [Y/n] " apply_root
+  if [[ ! "${apply_root}" =~ ^[Nn]$ ]]; then
+    if su -c "dumpsys deviceidle whitelist +com.termux" >/dev/null 2>&1; then
+      success "Doze/battery-optimization exemption granted."
+    else
+      warn "Doze whitelist command failed — grant it by hand instead:"
+      warn "  Settings > Apps > Termux > Battery > Unrestricted"
+    fi
+    if su -c "/system/bin/device_config put activity_manager max_phantom_processes 2147483647" >/dev/null 2>&1; then
+      success "Phantom-process limit raised."
+    else
+      warn "Phantom-process command failed (some builds restrict it even with"
+      warn "root). If the bot still gets killed hours into a stream with #1"
+      warn "already granted, this is the next thing to chase — from a computer"
+      warn "with adb: adb shell device_config put activity_manager"
+      warn "max_phantom_processes 2147483647  (no root needed for that path)."
+    fi
+  else
+    info "Skipped — grant it later with:"
+    info "  su -c \"dumpsys deviceidle whitelist +com.termux\""
+  fi
+else
+  warn "No root access from this session — grant the exemption by hand:"
+  warn "  Settings > Apps > Termux > Battery > Unrestricted"
+  warn "(exact wording/path varies by Android build — search Settings for"
+  warn "'Termux', then look for 'Battery' or 'Battery optimization')"
+fi
+
+echo ""
+echo "Also worth doing regardless of root:"
+echo "  - Install Termux:Boot (F-Droid) so Termux restarts the service after a"
+echo "    phone reboot on its own — nothing above survives an actual reboot."
+echo "  - Never enable Android's Battery Saver / Power Saving Mode while"
+echo "    streaming — it overrides the exemption above and throttles the CPU."
+echo "  - LineageOS doesn't ship MIUI's own aggressive background-app killer"
+echo "    (that's Xiaomi's addition, removed along with the rest of MIUI) —"
+echo "    but check Settings > Battery for any LineageOS-specific battery"
+echo "    feature of its own before assuming it's fully clear."
+echo ""
+
+# ── 10. Done ────────────────────────────────────────────────────────────
+info "[10/10] Setup finished"
 LOCAL_IP="$(python3 -c "
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -530,8 +619,4 @@ else
   echo "  tmux attach -t ${SERVICE_NAME}   — view the running bot / logs (Ctrl+B, D to detach)"
 fi
 echo "  tail -f ${APP_DIR}/logs/*.log   — follow the log file (if LOG_TO_FILE=true)"
-echo ""
-echo "Optional: install Termux:Boot (F-Droid) to start Termux automatically on"
-echo "phone reboot, and Termux:API (F-Droid) + 'pkg install termux-api', then"
-echo "'termux-wake-lock', so Android doesn't kill the session in the background."
 echo ""
