@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from twitchio import Chatter, eventsub
+from twitchio.exceptions import TwitchioException
 from twitchio.ext import commands
 
 from twitch_radio.blocklist import (
@@ -100,11 +101,32 @@ class SongRequestComponent(commands.Component):
     def __init__(self, bot: TwitchChatBot) -> None:
         self.bot = bot
 
+    async def _safe_reply(self, ctx: commands.Context, message: str) -> None:
+        """ctx.reply() that swallows Twitch's own message-delivery failures
+        — a 429 (chat rate limit) or the 30s exact-duplicate-message rule,
+        both TwitchioException — instead of letting them propagate.
+
+        Matters most for song_request()'s very first reply below: it's
+        called before _resolve_and_queue's own try/except exists, so an
+        uncaught failure there aborts song_request() on the spot and the
+        asyncio.create_task(...) call right after it never runs — the
+        whole request silently vanishes, no queue, no error, nothing,
+        purely because Twitch declined to deliver an acknowledgement
+        message. Two different chatters requesting the same
+        currently-playing song back to back is a normal way to hit this
+        (the bot's own "already queued" replies can collide with these
+        same Twitch-side limits), not just rapid self-testing.
+        """
+        try:
+            await ctx.reply(message)
+        except TwitchioException:
+            log.info("Chat reply dropped by Twitch (rate limit or duplicate message): %r", message)
+
     @commands.command(name="sr", aliases=["songrequest"])
     async def song_request(self, ctx: commands.Context, *, query: str) -> None:
         query = query.strip()
         if not query:
-            await ctx.reply(_USAGE["sr"])
+            await self._safe_reply(ctx, _USAGE["sr"])
             return
 
         chatter_key = str(ctx.chatter.id)
@@ -117,16 +139,16 @@ class SongRequestComponent(commands.Component):
         last = self.bot.last_request_at.get(chatter_key, 0.0)
         if tunables.request_cooldown_seconds > 0 and (now - last) < tunables.request_cooldown_seconds:
             remaining = tunables.request_cooldown_seconds - (now - last)
-            await ctx.reply(f"Slow down — try again in {remaining:.0f}s.")
+            await self._safe_reply(ctx, f"Slow down — try again in {remaining:.0f}s.")
             return
 
         pending = self.bot.pending_by_chatter.get(chatter_key, 0)
         if pending >= tunables.max_pending_per_chatter:
-            await ctx.reply(f"You already have {pending} request(s) queued — wait for one to play first.")
+            await self._safe_reply(ctx, f"You already have {pending} request(s) queued — wait for one to play first.")
             return
 
         if self.bot.player.queue_size() >= tunables.queue_cap:
-            await ctx.reply("Queue's full right now — try again in a bit.")
+            await self._safe_reply(ctx, "Queue's full right now — try again in a bit.")
             return
 
         try:
@@ -135,7 +157,7 @@ class SongRequestComponent(commands.Component):
             # Bail out rather than fall back to a fixed sentinel (e.g.
             # 0) — that would let two different chatters hitting this
             # branch collide under the same fake requester_id.
-            await ctx.reply("Couldn't identify you — try again.")
+            await self._safe_reply(ctx, "Couldn't identify you — try again.")
             return
 
         self.bot.last_request_at[chatter_key] = now
@@ -148,7 +170,13 @@ class SongRequestComponent(commands.Component):
         # actual "Queued: ..." or an error once resolution finishes; it owns
         # releasing the pending-count reservation made just above, on every
         # exit path, the same way this method used to.
-        await ctx.reply(f"Looking up {query!r}\u2026")
+        #
+        # _safe_reply, not ctx.reply, specifically here: this runs before
+        # the create_task() call right below it, so an uncaught delivery
+        # failure on THIS message would abort song_request() before the
+        # task is ever created — the pending-count reservation made above
+        # would leak, and the request would never resolve or queue at all.
+        await self._safe_reply(ctx, f"Looking up {query!r}\u2026")
 
         requester_name = ctx.chatter.display_name or ctx.chatter.name or "a viewer"
         task = asyncio.create_task(
@@ -178,25 +206,25 @@ class SongRequestComponent(commands.Component):
                 blocklist_data = await self.bot.blocklist_store.read()
                 reason = blocklist_reason(query, "", blocklist_data)
                 if reason:
-                    await ctx.reply(f"That's blocked by a moderator ({reason}).")
+                    await self._safe_reply(ctx, f"That's blocked by a moderator ({reason}).")
                     return
 
             try:
                 track = await self.bot.resolver(query, requester_id)
             except UnsupportedSourceError as exc:
-                await ctx.reply(str(exc))
+                await self._safe_reply(ctx, str(exc))
                 return
             except Exception:
                 log.exception("Failed to resolve Twitch song request: %s", query)
-                await ctx.reply("Couldn't fetch that — try a different search or link.")
+                await self._safe_reply(ctx, "Couldn't fetch that — try a different search or link.")
                 return
 
             if track is None:
-                await ctx.reply("No results for that.")
+                await self._safe_reply(ctx, "No results for that.")
                 return
 
             if track.is_live:
-                await ctx.reply("Can't queue a livestream — sorry!")
+                await self._safe_reply(ctx, "Can't queue a livestream — sorry!")
                 return
 
             # Re-read rather than reuse whatever song_request() read before
@@ -206,27 +234,27 @@ class SongRequestComponent(commands.Component):
 
             if 0 < tunables.max_request_duration_seconds < track.duration:
                 minutes = tunables.max_request_duration_seconds // 60
-                await ctx.reply(f"That's too long to queue — max is {minutes} minute(s).")
+                await self._safe_reply(ctx, f"That's too long to queue — max is {minutes} minute(s).")
                 return
 
             blocklist_data = await self.bot.blocklist_store.read()
             reason = blocklist_reason(track.webpage_url, track.uploader, blocklist_data)
             if reason:
-                await ctx.reply(f"That's blocked by a moderator ({reason}).")
+                await self._safe_reply(ctx, f"That's blocked by a moderator ({reason}).")
                 return
 
             already_queued = track.webpage_url == self.bot.player.active_webpage_url or any(
                 item.webpage_url == track.webpage_url for item in self.bot.player.queued_items()
             )
             if already_queued:
-                await ctx.reply(f"{track.title} is already queued.")
+                await self._safe_reply(ctx, f"{track.title} is already queued.")
                 return
 
             # Re-check the cap right before enqueuing (no await between this
             # check and enqueue() below) — the resolve above may have taken
             # long enough for the queue to have filled up meanwhile.
             if self.bot.player.queue_size() >= tunables.queue_cap:
-                await ctx.reply("Queue's full right now — try again in a bit.")
+                await self._safe_reply(ctx, "Queue's full right now — try again in a bit.")
                 return
 
             def _on_start(key: str = chatter_key) -> None:
@@ -246,7 +274,7 @@ class SongRequestComponent(commands.Component):
                 )
             )
             reserved = False  # ownership of the reservation now belongs to on_start's eventual decrement
-            await ctx.reply(f"Queued: {track.title} (#{self.bot.player.queue_size()} in queue)")
+            await self._safe_reply(ctx, f"Queued: {track.title} (#{self.bot.player.queue_size()} in queue)")
         except Exception:
             # Catch-all so a bug here can't silently eat the chatter's
             # pending-count reservation forever, or fail with no reply at
