@@ -150,7 +150,8 @@ class Resolver:
         )
         # A !sr resolves once in chat (to confirm/queue it) and again in the
         # player right before it plays — see resolve()'s docstring. Keyed by
-        # resolved webpage_url, the only value both call sites share.
+        # both the resolved webpage_url (shared by those two call sites) and,
+        # for non-URL queries, the case-folded search text itself.
         self._cache: dict[str, tuple[Track, float]] = {}
 
         # Nothing else has already pinned the client list for us — see the
@@ -374,21 +375,38 @@ class Resolver:
         found. Never raises for "not found" — only for actual failures
         (timeout, network error), which the caller is expected to catch.
 
-        Cached briefly (YTDLP_CACHE_TTL_SECONDS) so the player's re-resolve
-        right before playback reuses this result instead of a second full
-        extraction. A cache hit still returns a fresh Track with the
-        requested requester_id; treat a cached result as informational, not
-        gospel, for anything genuinely safety-relevant (e.g. is_live).
+        Cached briefly (YTDLP_CACHE_TTL_SECONDS), keyed on both the
+        resolved webpage_url (so the player's re-resolve right before
+        playback, and the prefetch of the next track, reuse this result
+        instead of a second full extraction) and, for non-URL queries, the
+        case-folded search text itself (so a second !sr for the same song
+        by name — from the same or a different chatter — within the TTL
+        also skips the full resolve). A cache hit still returns a fresh
+        Track with the requested requester_id; treat a cached result as
+        informational, not gospel, for anything genuinely safety-relevant
+        (e.g. is_live).
         """
         now = time.monotonic()
         raw = query.strip()
         if _URL_RE.match(raw) and not _is_allowed_url(raw):
             raise UnsupportedSourceError("Only YouTube and SoundCloud links are supported.")
 
+        # Search text gets its own, case-folded cache key, separate from the
+        # webpage_url key below. A YouTube video ID is case-sensitive, so
+        # URLs are never folded — only non-URL search text is. Without this,
+        # two different chatters (or the same one) requesting the same song
+        # by name within YTDLP_CACHE_TTL_SECONDS each pay the full
+        # resolve+JS-challenge cost, even though the first request just
+        # resolved that exact text seconds earlier — a real cost on a
+        # request-heavy stream (hype trains, a popular song requested
+        # repeatedly), not just a hypothetical one.
+        is_url = bool(_URL_RE.match(raw))
+        search_key = raw.lower() if not is_url else None
+
         ttl = self._settings.ytdlp_cache_ttl_seconds
         if ttl > 0:
             self._prune_cache(now)
-            cached = self._cache.get(query.strip())
+            cached = self._cache.get(raw) or (self._cache.get(search_key) if search_key else None)
             if cached is not None:
                 track, cached_at = cached
                 if now - cached_at < ttl:
@@ -441,4 +459,6 @@ class Resolver:
         )
         if ttl > 0:
             self._cache[webpage_url] = (track, now)
+            if search_key:
+                self._cache[search_key] = (track, now)
         return track
