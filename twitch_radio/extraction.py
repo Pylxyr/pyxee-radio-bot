@@ -154,6 +154,17 @@ class Resolver:
         # for non-URL queries, the case-folded search text itself.
         self._cache: dict[str, tuple[Track, float]] = {}
 
+        # Coalesces concurrent resolves of the *same* query (same chatter
+        # firing !sr twice before the first has even started, or two
+        # different chatters requesting the same song within moments of
+        # each other) into one real extraction. Without this, each caller
+        # arrives before the other has populated `_cache` above, sees no
+        # hit, and independently pays the full yt-dlp + JS-challenge round
+        # trip for what's about to be an identical result. Keyed the same
+        # way `_cache` is looked up in resolve() below. Entries remove
+        # themselves once the shared task finishes (success or failure).
+        self._inflight: dict[str, asyncio.Task[Track | None]] = {}
+
         # Nothing else has already pinned the client list for us — see the
         # module comment above _FAST_PLAYER_CLIENT.
         self._fast_client_enabled = not settings.ytdlp_player_client
@@ -402,6 +413,11 @@ class Resolver:
         # repeatedly), not just a hypothetical one.
         is_url = bool(_URL_RE.match(raw))
         search_key = raw.lower() if not is_url else None
+        # Same value resolve() would cache the eventual result under for a
+        # non-URL query (search_key); for a URL query, the URL itself —
+        # there's no separate case-folded form to key on, but two callers
+        # passing the exact same URL string still coalesce correctly.
+        dedup_key = search_key if search_key is not None else raw
 
         ttl = self._settings.ytdlp_cache_ttl_seconds
         if ttl > 0:
@@ -412,6 +428,31 @@ class Resolver:
                 if now - cached_at < ttl:
                     return dataclasses.replace(track, requester_id=requester_id)
 
+        existing = self._inflight.get(dedup_key)
+        if existing is not None:
+            track = await existing
+            return dataclasses.replace(track, requester_id=requester_id) if track is not None else None
+
+        task = asyncio.ensure_future(self._do_resolve(query, dedup_key, now))
+        self._inflight[dedup_key] = task
+        try:
+            track = await task
+        finally:
+            # Only clear our own entry — a concurrent resolve() call for a
+            # *different* query could have already claimed dedup_key again
+            # by the time we get here in a pathological ordering, and we
+            # must not evict someone else's still-running task.
+            if self._inflight.get(dedup_key) is task:
+                del self._inflight[dedup_key]
+        return dataclasses.replace(track, requester_id=requester_id) if track is not None else None
+
+    async def _do_resolve(self, query: str, dedup_key: str, started_at: float) -> Track | None:
+        """The actual extraction + Track-building work, run at most once per
+        dedup_key at a time — every concurrent resolve() call for the same
+        query awaits this single task rather than re-running it. requester_id
+        is deliberately NOT baked in here; resolve() applies it per-caller via
+        dataclasses.replace() on the shared result.
+        """
         info = await self._extract_info(self._query_for(query))
 
         # A bare "ytsearchN:" query wraps its one hit in an "entries" list;
@@ -452,13 +493,14 @@ class Resolver:
             # which would otherwise read as 0s and slip past the max-duration
             # check — is_live is what actually flags that case.
             duration=int(item.get("duration") or 0),
-            requester_id=requester_id,
+            requester_id=0,  # placeholder — each awaiting caller applies its own via resolve()
             thumbnail_url=item.get("thumbnail"),
             query=query,
             is_live=bool(item.get("is_live")),
         )
+        ttl = self._settings.ytdlp_cache_ttl_seconds
         if ttl > 0:
-            self._cache[webpage_url] = (track, now)
-            if search_key:
-                self._cache[search_key] = (track, now)
+            self._cache[webpage_url] = (track, started_at)
+            if dedup_key != webpage_url:
+                self._cache[dedup_key] = (track, started_at)
         return track
