@@ -15,7 +15,14 @@ Environment="PYTHONMALLOC=malloc"
 # unit can actually write, so it doesn't need to fall back to re-fetching/
 # recompiling on every run. Harmless if Node/Bun/QuickJS is used instead.
 Environment="DENO_DIR=/home/ubuntu/twitch-radio-bot/data/deno-cache"
-EnvironmentFile=/home/ubuntu/twitch-radio-bot/.env
+# No EnvironmentFile= for .env on purpose. config.py already loads it via
+# python-dotenv, so systemd reading it too was pure duplication — and the
+# two parsers don't agree: systemd treats the whole unit as failed-to-start
+# on a line it can't parse and handles quoting differently, so a .env that
+# works fine when the bot is run by hand can make the service refuse to
+# start with a message that points at systemd rather than at the file.
+# Anything that genuinely must be in the unit's own environment belongs in
+# an Environment= line above (see DENO_DIR).
 ExecStart=/home/ubuntu/twitch-radio-bot/.venv/bin/python /home/ubuntu/twitch-radio-bot/bot.py
 Restart=on-failure
 RestartSec=5
