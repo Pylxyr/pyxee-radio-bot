@@ -49,22 +49,22 @@ class ModerationComponent(commands.Component):
         parts = args.split(maxsplit=1)
         if len(parts) != 2:
             keys = ", ".join(TUNABLE_BOUNDS)
-            await ctx.reply(f"Usage: !setlimit <key> <value> — keys: {keys}")
+            await self.bot.safe_reply(ctx, f"Usage: !setlimit <key> <value> — keys: {keys}")
             return
         key, raw_value = parts[0].strip(), parts[1].strip()
         bounds = TUNABLE_BOUNDS.get(key)
         if bounds is None:
             keys = ", ".join(TUNABLE_BOUNDS)
-            await ctx.reply(f"Unknown key {key!r} — keys: {keys}")
+            await self.bot.safe_reply(ctx, f"Unknown key {key!r} — keys: {keys}")
             return
         lo, hi = bounds
         try:
             value = int(raw_value)
         except ValueError:
-            await ctx.reply(f"{key}: not a number.")
+            await self.bot.safe_reply(ctx, f"{key}: not a number.")
             return
         if not (lo <= value <= hi):
-            await ctx.reply(f"{key}: must be between {lo} and {hi}.")
+            await self.bot.safe_reply(ctx, f"{key}: must be between {lo} and {hi}.")
             return
 
         def _mutate(current: dict[str, object]) -> dict[str, object]:
@@ -74,7 +74,7 @@ class ModerationComponent(commands.Component):
 
         await self.bot.tunables_store.update(_mutate)
         log.info("%s = %s set via chat by %s (%s)", key, value, ctx.chatter.display_name, ctx.chatter.id)
-        await ctx.reply(f"{key} = {value}")
+        await self.bot.safe_reply(ctx, f"{key} = {value}")
 
     @commands.is_moderator()
     @commands.command(name="toggle")
@@ -83,11 +83,11 @@ class ModerationComponent(commands.Component):
         (!radio on/off is a shortcut for the radio_autoplay_enabled key specifically.)"""
         parts = args.strip().split(maxsplit=1)
         if len(parts) != 2 or parts[1].lower() not in ("on", "off"):
-            await ctx.reply(USAGE["toggle"])
+            await self.bot.safe_reply(ctx, USAGE["toggle"])
             return
         key, value = parts[0].strip(), parts[1].lower() == "on"
         if key not in TOGGLE_KEYS:
-            await ctx.reply(f"Unknown key {key!r} — keys: {', '.join(TOGGLE_KEYS)}")
+            await self.bot.safe_reply(ctx, f"Unknown key {key!r} — keys: {', '.join(TOGGLE_KEYS)}")
             return
 
         def _mutate(current: dict[str, object]) -> dict[str, object]:
@@ -97,19 +97,19 @@ class ModerationComponent(commands.Component):
 
         await self.bot.toggles_store.update(_mutate)
         log.info("%s = %s set via chat by %s (%s)", key, value, ctx.chatter.display_name, ctx.chatter.id)
-        await ctx.reply(f"{key} = {'on' if value else 'off'}")
+        await self.bot.safe_reply(ctx, f"{key} = {'on' if value else 'off'}")
 
     @commands.is_moderator()
     @commands.command(name="block")
     async def block(self, ctx: commands.Context, *, args: str) -> None:
         """Mod-only: blocks a track (by URL) or an uploader (by name) from
-        being requested again, and pulls any already-queued copy of that
-        same track out of the queue too (an uploader block can't purge the
-        queue the same way — a queued request's uploader isn't known until
-        it's actually resolved)."""
+        being requested again, and pulls any already-queued copy out of the
+        queue too — by URL for a track block, and by uploader name for an
+        uploader block (QueuedRequest carries the uploader from the resolve
+        that created it, so this needs no re-resolution)."""
         target = args.strip()
         if not target:
-            await ctx.reply(USAGE["block"])
+            await self.bot.safe_reply(ctx, USAGE["block"])
             return
         key = normalize_track_key(target)
 
@@ -126,11 +126,17 @@ class ModerationComponent(commands.Component):
 
         if key:
             purged = self.bot.player.purge_pending(lambda r: normalize_track_key(r.webpage_url) == key)
-            if purged:
-                noun = "copy" if len(purged) == 1 else "copies"
-                reply += f" Also removed {len(purged)} already-queued {noun} of it."
+        else:
+            # Uploader block. Matches the same way blocklist_reason() does
+            # (case-folded, stripped) so a request that would now be
+            # rejected at !sr time doesn't sit in the queue and play anyway.
+            wanted = target.strip().lower()
+            purged = self.bot.player.purge_pending(lambda r: r.uploader.strip().lower() == wanted)
+        if purged:
+            noun = "request" if len(purged) == 1 else "requests"
+            reply += f" Also removed {len(purged)} already-queued {noun}."
 
-        await ctx.reply(reply)
+        await self.bot.safe_reply(ctx, reply)
 
     @commands.is_moderator()
     @commands.command(name="unblock")
@@ -139,7 +145,7 @@ class ModerationComponent(commands.Component):
         name)."""
         target = args.strip()
         if not target:
-            await ctx.reply(USAGE["unblock"])
+            await self.bot.safe_reply(ctx, USAGE["unblock"])
             return
         key = normalize_track_key(target)
 
@@ -149,7 +155,7 @@ class ModerationComponent(commands.Component):
         result = await self.bot.blocklist_store.update(_mutate)
         log.info("Unblocked %r via chat by %s (%s)", target, ctx.chatter.display_name, ctx.chatter.id)
         tracks, uploaders = blocklist_counts(result)
-        await ctx.reply(f"Unblocked. ({tracks} tracks, {uploaders} uploaders still blocked)")
+        await self.bot.safe_reply(ctx, f"Unblocked. ({tracks} tracks, {uploaders} uploaders still blocked)")
 
     @commands.is_moderator()
     @commands.command(name="blocklist")
@@ -157,7 +163,7 @@ class ModerationComponent(commands.Component):
         """Mod-only: shows how many tracks/uploaders are currently blocked
         (not the full list — that can get long for chat)."""
         tracks, uploaders = blocklist_counts(await self.bot.blocklist_store.read())
-        await ctx.reply(f"{tracks} track(s) and {uploaders} uploader(s) currently blocked.")
+        await self.bot.safe_reply(ctx, f"{tracks} track(s) and {uploaders} uploader(s) currently blocked.")
 
     @commands.is_moderator()
     @commands.command(name="clearqueue")
@@ -166,6 +172,6 @@ class ModerationComponent(commands.Component):
         playing — use !skip for that."""
         removed = self.bot.player.purge_pending(lambda r: True)
         if not removed:
-            await ctx.reply("Queue's already empty.")
+            await self.bot.safe_reply(ctx, "Queue's already empty.")
             return
-        await ctx.reply(f"Cleared {len(removed)} queued request(s).")
+        await self.bot.safe_reply(ctx, f"Cleared {len(removed)} queued request(s).")
