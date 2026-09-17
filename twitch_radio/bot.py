@@ -118,7 +118,18 @@ async def _async_run(settings: Settings) -> None:
 
             loop = asyncio.get_running_loop()
 
+            shutting_down = False
+
             def _handle_shutdown_signal(signum: int) -> None:
+                # systemd sends SIGTERM and an impatient operator adds
+                # Ctrl-C; without this guard each one spawned its own
+                # bot.close() task, and two concurrent closes race over the
+                # same websocket/token teardown.
+                nonlocal shutting_down
+                if shutting_down:
+                    log.info("%s received — shutdown already in progress.", signal.Signals(signum).name)
+                    return
+                shutting_down = True
                 log.info("%s received — initiating graceful shutdown.", signal.Signals(signum).name)
                 task = asyncio.create_task(bot.close())
                 _bg_tasks.add(task)
@@ -133,6 +144,15 @@ async def _async_run(settings: Settings) -> None:
         finally:
             await admin_runner.cleanup()
     finally:
+        # Order matters and is the reverse of setup: the HTTP surface is
+        # already down (inner finally above), so nothing can still be
+        # serving a request against the player or the database by now.
+        # TwitchChatBot.close() deliberately no longer closes the database
+        # for exactly this reason — see its docstring.
+        if not warmup_task.done():
+            warmup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await warmup_task
         await player.stop()
         resolver.close()
         await db.close()
