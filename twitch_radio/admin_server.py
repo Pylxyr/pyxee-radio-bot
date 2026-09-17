@@ -14,9 +14,12 @@ from aiohttp import web
 
 from twitch_radio.blocklist import clean_list
 from twitch_radio.blocklist import counts as blocklist_counts
+from twitch_radio.db import Database
 from twitch_radio.player import RadioPlayer
 from twitch_radio.specs import MAX_FIELD_LENGTH, PC_SPEC_FIELDS, PERIPHERAL_FIELDS, PCSpecs, Peripherals
 from twitch_radio.store import JsonStore
+from twitch_radio.telemetry import counters
+from twitch_radio.toggles import TOGGLE_KEYS, FeatureToggles
 from twitch_radio.tunables import TUNABLE_BOUNDS, TwitchTunables
 
 log = logging.getLogger(__name__)
@@ -423,6 +426,8 @@ class AdminServer:
         tunables_store: JsonStore,
         blocklist_store: JsonStore,
         specs_store: JsonStore,
+        toggles_store: JsonStore,
+        db: Database,
         settings_password: str | None,
         broadcast_info: dict[str, str],
         thumb_session: aiohttp.ClientSession,
@@ -431,9 +436,12 @@ class AdminServer:
         self._tunables_store = tunables_store
         self._blocklist_store = blocklist_store
         self._specs_store = specs_store
+        self._toggles_store = toggles_store
+        self._db = db
         self._settings_password = settings_password
         self._broadcast_info = broadcast_info
         self._auth_limiter = _AuthRateLimiter()
+        self._started_at = time.monotonic()
         # Owned by run_admin_server() (created/closed alongside the aiohttp
         # app — see its on_cleanup hook), not by this instance — reused
         # across every /thumb-proxy request rather than opening a fresh
@@ -525,6 +533,24 @@ class AdminServer:
 
     async def handle_nowplaying(self, request: web.Request) -> web.Response:
         return web.json_response(self._nowplaying_payload())
+
+    async def handle_healthz(self, request: web.Request) -> web.Response:
+        """Unauthenticated on purpose (matches /nowplaying.json's own
+        exposure level — nothing here is sensitive) — for an uptime monitor
+        or just eyeballing "is this thing actually healthy" without opening
+        /settings. Resolve counts are since-process-start rolling windows
+        (telemetry.py), not persisted."""
+        return web.json_response(
+            {
+                "uptime_seconds": round(time.monotonic() - self._started_at, 1),
+                "player_state": self._player.state.value,
+                "queue_size": self._player.queue_size(),
+                "resolves_last_hour": {
+                    "success": counters.count_last_hour("resolve_success"),
+                    "failure": counters.count_last_hour("resolve_failure"),
+                },
+            }
+        )
 
     async def handle_ws_nowplaying(self, request: web.Request) -> web.WebSocketResponse:
         """Push-based counterpart to /nowplaying.json — the overlay prefers
@@ -653,9 +679,21 @@ class AdminServer:
         specs_data = await self._specs_store.read()
         pc_specs = PCSpecs.from_dict(specs_data)
         peripherals = Peripherals.from_dict(specs_data)
+        toggles = FeatureToggles.from_dict(await self._toggles_store.read())
+        community = await self._community_snapshot()
         return web.Response(
-            text=self._render_page(tunables, pc_specs, peripherals, message=None), content_type="text/html"
+            text=self._render_page(tunables, pc_specs, peripherals, toggles, community, message=None),
+            content_type="text/html",
         )
+
+    async def _community_snapshot(self) -> dict[str, Any]:
+        """Read-only dashboard data for /settings — management itself stays
+        in chat (!addcom, !addquote, etc.); this is just visibility so a mod
+        doesn't need a second tool to see what's accumulated."""
+        top = await self._db.top_points(limit=5)
+        commands_count = len(await self._db.list_commands())
+        quotes_count = await self._db.count_quotes()
+        return {"top_points": top, "commands_count": commands_count, "quotes_count": quotes_count}
 
     async def handle_settings_post(self, request: web.Request) -> web.Response:
         denied = self._authorize(request)
@@ -709,22 +747,39 @@ class AdminServer:
         pc_specs = PCSpecs.from_dict(specs_result)
         peripherals = Peripherals.from_dict(specs_result)
 
+        def _mutate_toggles(current: dict[str, Any]) -> dict[str, Any]:
+            toggles = FeatureToggles.from_dict(current)
+            # Absent from the form == unchecked — standard HTML checkbox
+            # behavior, safe here specifically because every toggle always
+            # renders as a checkbox on this form (see _render_page), so
+            # "missing" never means "this field wasn't offered".
+            for key in TOGGLE_KEYS:
+                setattr(toggles, key, form.get(key) is not None)
+            return toggles.to_dict()
+
+        toggles_result = await self._toggles_store.update(_mutate_toggles)
+        toggles = FeatureToggles.from_dict(toggles_result)
+        community = await self._community_snapshot()
+
         if errors:
             tunables = TwitchTunables.from_dict(preview or result)
             return web.Response(
                 text=self._render_page(
-                    tunables, pc_specs, peripherals, message="Tunables not saved — " + "; ".join(errors)
+                    tunables, pc_specs, peripherals, toggles, community,
+                    message="Tunables not saved — " + "; ".join(errors),
                 ),
                 content_type="text/html",
                 status=400,
             )
 
         log.info(
-            "Settings updated via /settings from %s: tunables=%s specs=%s", request.remote, result, specs_result
+            "Settings updated via /settings from %s: tunables=%s specs=%s toggles=%s",
+            request.remote, result, specs_result, toggles_result,
         )
         tunables = TwitchTunables.from_dict(result)
         return web.Response(
-            text=self._render_page(tunables, pc_specs, peripherals, message="Saved."), content_type="text/html"
+            text=self._render_page(tunables, pc_specs, peripherals, toggles, community, message="Saved."),
+            content_type="text/html",
         )
 
     def _text_field_rows(self, fields: list[tuple[str, str]], values: dict[str, str]) -> str:
@@ -736,7 +791,14 @@ class AdminServer:
         )
 
     def _render_page(
-        self, tunables: TwitchTunables, pc_specs: PCSpecs, peripherals: Peripherals, *, message: str | None
+        self,
+        tunables: TwitchTunables,
+        pc_specs: PCSpecs,
+        peripherals: Peripherals,
+        toggles: FeatureToggles,
+        community: dict[str, Any],
+        *,
+        message: str | None,
     ) -> str:
         info_rows = "".join(
             f"<tr><td>{escape(k)}</td><td>{escape(v)}</td></tr>" for k, v in self._broadcast_info.items()
@@ -744,11 +806,22 @@ class AdminServer:
         message_html = f'<p class="msg">{escape(message)}</p>' if message else ""
         pc_spec_rows = self._text_field_rows(PC_SPEC_FIELDS, pc_specs.to_dict())
         peripheral_rows = self._text_field_rows(PERIPHERAL_FIELDS, peripherals.to_dict())
+        toggle_rows = "".join(
+            f'<label class="toggle"><input type="checkbox" name="{escape(key)}" '
+            f'{"checked" if getattr(toggles, key) else ""}> {escape(desc)}</label>\n'
+            for key, desc in TOGGLE_KEYS.items()
+        )
+        leaderboard_rows = "".join(
+            f"<tr><td>{i}</td><td>{escape(name)}</td><td>{pts}</td></tr>"
+            for i, (name, pts) in enumerate(community["top_points"], start=1)
+        ) or '<tr><td colspan="3">No points earned yet.</td></tr>'
         return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Twitch Radio Settings</title>
 <style>
 body {{ font-family: sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }}
 label {{ display: block; margin-top: 1rem; }}
+label.toggle {{ display: flex; align-items: center; gap: 0.5rem; font-weight: normal; }}
+label.toggle input {{ width: auto; }}
 input {{ width: 100%; padding: 0.4rem; box-sizing: border-box; }}
 table {{ margin-top: 1.5rem; border-collapse: collapse; }}
 td {{ padding: 0.2rem 0.6rem; border-bottom: 1px solid #ddd; }}
@@ -769,6 +842,11 @@ h2 {{ margin-top: 2rem; border-top: 1px solid #ddd; padding-top: 1rem; }}
 <input type="number" name="max_request_duration_seconds" value="{tunables.max_request_duration_seconds}"></label>
 <label>Vote-skip threshold (unique !voteskip votes needed)
 <input type="number" name="vote_skip_threshold" value="{tunables.vote_skip_threshold}"></label>
+<label>Points per active minute (0 disables the points economy)
+<input type="number" name="points_per_active_minute" value="{tunables.points_per_active_minute}"></label>
+
+<h2>Features</h2>
+{toggle_rows}
 
 <h2>PC specs (shown to viewers via !specs)</h2>
 {pc_spec_rows}
@@ -778,6 +856,11 @@ h2 {{ margin-top: 2rem; border-top: 1px solid #ddd; padding-top: 1rem; }}
 
 <button type="submit">Save</button>
 </form>
+
+<h2>Community (read-only — managed via chat commands)</h2>
+<p>{community["commands_count"]} custom command(s), {community["quotes_count"]} quote(s) saved.</p>
+<table><tr><th>#</th><th>Viewer</th><th>Points</th></tr>{leaderboard_rows}</table>
+
 <table>{info_rows}</table>
 </body></html>"""
 
@@ -788,6 +871,8 @@ async def run_admin_server(
     tunables_store: JsonStore,
     blocklist_store: JsonStore,
     specs_store: JsonStore,
+    toggles_store: JsonStore,
+    db: Database,
     settings_password: str | None,
     broadcast_info: dict[str, str],
     host: str,
@@ -796,11 +881,13 @@ async def run_admin_server(
     thumb_session = aiohttp.ClientSession()
     server = AdminServer(
         player=player, tunables_store=tunables_store, blocklist_store=blocklist_store,
-        specs_store=specs_store, settings_password=settings_password, broadcast_info=broadcast_info,
+        specs_store=specs_store, toggles_store=toggles_store, db=db,
+        settings_password=settings_password, broadcast_info=broadcast_info,
         thumb_session=thumb_session,
     )
     app = web.Application()
     app.router.add_get("/nowplaying.json", server.handle_nowplaying)
+    app.router.add_get("/healthz", server.handle_healthz)
     app.router.add_get("/ws/nowplaying", server.handle_ws_nowplaying)
     app.router.add_get("/blocklist.json", server.handle_blocklist)
     app.router.add_get("/overlay", server.handle_overlay)
@@ -822,7 +909,7 @@ async def run_admin_server(
     await site.start()
     log.info(
         "Admin server listening on http://%s:%d (/stream.mp3, /overlay, /nowplaying.json, "
-        "/ws/nowplaying, /blocklist.json, /settings)",
+        "/ws/nowplaying, /blocklist.json, /healthz, /settings)",
         host, port,
     )
     return runner

@@ -23,6 +23,18 @@ TimeoutStopSec=30
 OOMScoreAdjust=-100
 LimitNOFILE=65536
 
+# Cgroup-level ceiling, independent of OOMScoreAdjust above (which only
+# affects the *global* OOM-killer's priority, not what happens if this
+# unit alone runs away) — protects the rest of a small box (Oracle Free
+# Tier, a Termux phone) from a stuck ffmpeg/yt-dlp/Deno subprocess.
+# MemoryHigh throttles (reclaims memory, slows the process) before
+# MemoryMax hits and the kernel OOM-kills it outright. Tune both to the
+# box: these are conservative starting points, not a hard requirement —
+# raise them if the service gets killed under normal (not runaway) load.
+MemoryHigh=512M
+MemoryMax=768M
+CPUQuota=150%
+
 # No MemoryDenyWriteExecute and no SystemCallFilter: yt-dlp needs a working
 # V8 JS runtime (Deno by default) for YouTube, and both directives break it.
 # MDWE: Deno panics on ENOMEM on its very first script under it.

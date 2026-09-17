@@ -1,4 +1,6 @@
-"""Twitch chat bot — handles !sr <query> and hands resolved requests to the radio player.
+"""Twitch chat bot — wires up song requests, moderation, info, and viewer
+engagement commands (split across twitch_radio/components/*) and hands
+resolved song requests to the radio player.
 
 Built against twitchio 3.x's EventSub-based Bot (verified against the
 installed twitchio==3.3.2 API directly — this is NOT the old IRC-token
@@ -33,6 +35,29 @@ where). Full walkthrough in README.md; short version:
 
   Tokens save to TWITCH_TOKEN_FILE (default: data/twitch_tokens.json) and
   reload automatically on every future start.
+
+event_message()'s command-dispatch chain, and the ChatMessage/Chatter
+attributes the engagement-tracking + optional moderation filter below
+depend on (`.chatter`, `.text`, `.moderator`, `.broadcaster`), are now
+verified directly against the installed twitchio==3.3.2 source (not just
+inferred) — including the specific fix that made this correct: the base
+class filters the bot's own messages by `chatter.id == self.bot_id`, not
+by any `.echo`-style attribute (ChatMessage has no such attribute), so
+this file's own filtering uses the same check.
+
+filter_delete_enabled (off by default, toggle via !toggle or /settings)
+additionally deletes a message the link/caps filter flags, via
+PartialUser.delete_chat_messages() — verified to exist, but it requires
+the bot's token to carry the `moderator:manage:chat_messages` scope,
+which the OAuth steps above do NOT request (deleting/timing out chat is a
+meaningfully bigger grant than reading/sending it, so this stays opt-in
+rather than bundled into the default setup). Turning the toggle on
+without that scope granted doesn't break anything — the first delete
+attempt logs the permission failure once and the filter quietly stays
+warn-only from then on (see _run_filter_delete below) — but the delete
+obviously won't happen until the scope's actually there. To grant it,
+redo step 3 above with `+moderator:manage:chat_messages` appended to the
+scopes list.
 """
 
 from __future__ import annotations
@@ -41,32 +66,31 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import time
 from collections import Counter
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from twitchio import Chatter, eventsub
-from twitchio.exceptions import TwitchioException
+from twitchio import eventsub
+from twitchio.exceptions import HTTPException, TwitchioException
 from twitchio.ext import commands
 
-from twitch_radio.blocklist import (
-    add_track_block,
-    add_uploader_block,
-    blocklist_reason,
-    counts as blocklist_counts,
-    looks_like_a_single_track,
-    normalize_track_key,
-    remove_track_block,
-    remove_uploader_block,
-)
-from twitch_radio.extraction import UnsupportedSourceError
-from twitch_radio.player import QueuedRequest, RadioPlayer
-from twitch_radio.specs import PCSpecs, Peripherals
+from twitch_radio.components.engagement import EngagementComponent
+from twitch_radio.components.info import InfoComponent
+from twitch_radio.components.moderation import ModerationComponent
+from twitch_radio.components.moderation import USAGE as _MODERATION_USAGE
+from twitch_radio.components.song_requests import SongRequestComponent
+from twitch_radio.components.song_requests import USAGE as _SONG_REQUEST_USAGE
+from twitch_radio.cooldown import CooldownTracker
+from twitch_radio.db import Database
+from twitch_radio.player import RadioPlayer
 from twitch_radio.store import JsonStore
-from twitch_radio.tunables import TUNABLE_BOUNDS, TwitchTunables
+from twitch_radio.toggles import FeatureToggles
+from twitch_radio.tunables import TwitchTunables
 
 if TYPE_CHECKING:
+    from twitchio import ChatMessage
     from twitchio.authentication import ValidateTokenPayload
     from twitchio.payloads import TokenRefreshedPayload
 
@@ -78,12 +102,7 @@ log = logging.getLogger(__name__)
 # handler below. Keyed by canonical command name, not alias — ctx.command.name
 # always resolves to the canonical name even when invoked via an alias like
 # !songrequest.
-_USAGE = {
-    "sr": "Usage: !sr <song name or URL>",
-    "setlimit": "Usage: !setlimit <key> <value> — keys: " + ", ".join(TUNABLE_BOUNDS),
-    "block": "Usage: !block <YouTube/SoundCloud URL, or an uploader name>",
-    "unblock": "Usage: !unblock <YouTube/SoundCloud URL, or an uploader name>",
-}
+_USAGE = {**_SONG_REQUEST_USAGE, **_MODERATION_USAGE}
 
 # Twitch silently drops a chat message that's byte-identical to one this
 # account sent recently — but "recently" turned out, against a live
@@ -94,501 +113,27 @@ _USAGE = {
 # its first attempt at a given text dropped, because Twitch itself
 # remembered that exact text from just before the restart. That rules out
 # any client-side "have I sent this recently" tracking as reliably
-# predictive — so instead, every reply through _safe_reply below gets a
+# predictive — so instead, every reply through safe_reply below gets a
 # small rotating cosmetic suffix unconditionally, guaranteeing it's never
 # byte-identical to whatever this bot said last time around, without
 # needing to model Twitch's own dedup window at all.
 _DEDUP_SUFFIXES = (" \U0001f3b5", " \U0001f3b6", " \U0001f3a7", " \U0001f50a")
 
-# Every @commands.is_moderator() below (and the manual `chatter.moderator`
-# check in skip()) also admits the broadcaster, even though is_moderator()'s
-# own docstring reads as if it doesn't — verified directly against
-# twitchio==3.3.2: Chatter.moderator is `_is_moderator or _is_lead_moderator
-# or self.broadcaster`. That fallback isn't part of is_moderator()'s
-# documented contract, so if a future twitchio upgrade tightens .moderator
-# to match its docstring, every mod-only command here would silently start
-# rejecting the broadcaster. The fix then is NOT commands.is_elevated()
-# (that also admits VIPs) — it's a custom guard checking
-# `chatter.moderator or chatter.broadcaster` explicitly.
+# How long a chatter needs to have gone quiet before they stop counting as
+# "active" for passive points/watch-time, and how often the award loop
+# ticks. A chatter who never sends a second message just gets one tick's
+# worth of credit and then ages out of last_seen below.
+_ACTIVE_WINDOW_SECONDS = 300.0
+_AWARD_TICK_SECONDS = 60.0
+_LAST_SEEN_PRUNE_SECONDS = 3600.0
+
+_LINK_RE = re.compile(r"(https?://|www\.)\S+", re.IGNORECASE)
+_CUSTOM_COMMAND_COOLDOWN_SECONDS = 3.0
 
 
-class SongRequestComponent(commands.Component):
-    def __init__(self, bot: TwitchChatBot) -> None:
-        self.bot = bot
-        # Round-robins through _DEDUP_SUFFIXES on every _safe_reply call —
-        # see that method for why this is unconditional rather than only
-        # applied when a repeat is detected.
-        self._reply_counter = 0
-
-    async def _safe_reply(self, ctx: commands.Context, message: str) -> None:
-        """ctx.reply() that swallows Twitch's own message-delivery failures
-        — a 429 (chat rate limit) or the exact-duplicate-message rule,
-        both TwitchioException — instead of letting them propagate.
-
-        Matters most for song_request()'s very first reply below: it's
-        called before _resolve_and_queue's own try/except exists, so an
-        uncaught failure there aborts song_request() on the spot and the
-        asyncio.create_task(...) call right after it never runs — the
-        whole request silently vanishes, no queue, no error, nothing,
-        purely because Twitch declined to deliver an acknowledgement
-        message. Two different chatters requesting the same
-        currently-playing song back to back is a normal way to hit this
-        (the bot's own "already queued" replies can collide with these
-        same Twitch-side limits), not just rapid self-testing.
-
-        Every message gets a small rotating suffix (see _DEDUP_SUFFIXES
-        above) before delivery is even attempted, unconditionally — not
-        just when a repeat looks likely — since Twitch's own dedup state
-        isn't something this process can reliably reconstruct (its window
-        outlasts a single "previous message" comparison, and survives
-        this bot restarting).
-        """
-        suffix = _DEDUP_SUFFIXES[self._reply_counter % len(_DEDUP_SUFFIXES)]
-        self._reply_counter += 1
-        text = f"{message}{suffix}"
-        try:
-            await ctx.reply(text)
-        except TwitchioException:
-            log.info("Chat reply dropped by Twitch (rate limit or duplicate message): %r", text)
-
-
-
-    @commands.command(name="sr", aliases=["songrequest"])
-    async def song_request(self, ctx: commands.Context, *, query: str) -> None:
-        query = query.strip()
-        if not query:
-            await self._safe_reply(ctx, _USAGE["sr"])
-            return
-
-        chatter_key = str(ctx.chatter.id)
-        normalized_query = query.lower()
-
-        # An exact repeat of a query this chatter already has resolving —
-        # most often the same command double-tapped a second or two apart,
-        # sent again before "Looking up..." even lands. Answering distinctly
-        # here (rather than repeating "Looking up...") both avoids Twitch's
-        # duplicate-message drop and skips a second, wholly redundant resolve.
-        if self.bot.inflight_query_by_chatter.get(chatter_key) == normalized_query:
-            await self._safe_reply(ctx, "Still looking that up — hang tight!")
-            return
-
-        tunables = TwitchTunables.from_dict(await self.bot.tunables_store.read())
-        now = time.monotonic()
-
-        # No `await` between checking limits and reserving the slot below —
-        # keeps check-and-reserve atomic so rapid-fire !sr can't race past
-        # the cooldown/pending/queue caps before the resolver's network call.
-        last = self.bot.last_request_at.get(chatter_key, 0.0)
-        if tunables.request_cooldown_seconds > 0 and (now - last) < tunables.request_cooldown_seconds:
-            remaining = tunables.request_cooldown_seconds - (now - last)
-            await self._safe_reply(ctx, f"Slow down — try again in {remaining:.0f}s.")
-            return
-
-        pending = self.bot.pending_by_chatter.get(chatter_key, 0)
-        if pending >= tunables.max_pending_per_chatter:
-            await self._safe_reply(ctx, f"You already have {pending} request(s) queued — wait for one to play first.")
-            return
-
-        if self.bot.player.queue_size() >= tunables.queue_cap:
-            await self._safe_reply(ctx, "Queue's full right now — try again in a bit.")
-            return
-
-        try:
-            requester_id = int(ctx.chatter.id)
-        except (TypeError, ValueError):
-            # Bail out rather than fall back to a fixed sentinel (e.g.
-            # 0) — that would let two different chatters hitting this
-            # branch collide under the same fake requester_id.
-            await self._safe_reply(ctx, "Couldn't identify you — try again.")
-            return
-
-        self.bot.last_request_at[chatter_key] = now
-        self.bot.pending_by_chatter[chatter_key] = pending + 1
-
-        # Resolving is a real network round trip — anywhere from under a
-        # second to ~15-20s cold — so !sr replies right away instead of
-        # leaving chat wondering whether the bot even saw the command.
-        # _resolve_and_queue (a background task, not awaited here) sends the
-        # actual "Queued: ..." or an error once resolution finishes; it owns
-        # releasing the pending-count reservation made just above, on every
-        # exit path, the same way this method used to.
-        #
-        # _safe_reply, not ctx.reply, specifically here: this runs before
-        # the create_task() call right below it, so an uncaught delivery
-        # failure on THIS message would abort song_request() before the
-        # task is ever created — the pending-count reservation made above
-        # would leak, and the request would never resolve or queue at all.
-        await self._safe_reply(ctx, f"Looking up {query!r}\u2026")
-        self.bot.inflight_query_by_chatter[chatter_key] = normalized_query
-
-        requester_name = ctx.chatter.display_name or ctx.chatter.name or "a viewer"
-        task = asyncio.create_task(
-            self._resolve_and_queue(ctx, query, chatter_key, requester_id, requester_name),
-            name=f"song-request-{chatter_key}",
-        )
-        self.bot.background_tasks.add(task)
-        task.add_done_callback(self.bot.background_tasks.discard)
-
-    async def _resolve_and_queue(
-        self, ctx: commands.Context, query: str, chatter_key: str, requester_id: int, requester_name: str
-    ) -> None:
-        """The slow half of !sr, split out of song_request() so a slow
-        resolve can't delay that command's own reply (see the comment
-        there). ctx.reply() has no dependency on the originating command's
-        coroutine still being alive — it's a plain API call keyed off
-        already-captured channel/message-id attributes — so replying from
-        here, well after song_request() has returned, is safe."""
-        reserved = True
-        try:
-            # Cheap pre-resolve check for a direct link to something already
-            # blocked — skips the network round trip for the common case of
-            # re-pasting a link a mod just blocked. Doesn't replace the
-            # post-resolve check below: a search query or an uploader-name
-            # block can't be caught until we know what it actually resolved to.
-            if normalize_track_key(query) is not None:
-                blocklist_data = await self.bot.blocklist_store.read()
-                reason = blocklist_reason(query, "", blocklist_data)
-                if reason:
-                    await self._safe_reply(ctx, f"That's blocked by a moderator ({reason}).")
-                    return
-
-            try:
-                track = await self.bot.resolver(query, requester_id)
-            except UnsupportedSourceError as exc:
-                await self._safe_reply(ctx, str(exc))
-                return
-            except Exception:
-                log.exception("Failed to resolve Twitch song request: %s", query)
-                await self._safe_reply(ctx, "Couldn't fetch that — try a different search or link.")
-                return
-
-            if track is None:
-                await self._safe_reply(ctx, "No results for that.")
-                return
-
-            if track.is_live:
-                await self._safe_reply(ctx, "Can't queue a livestream — sorry!")
-                return
-
-            # Re-read rather than reuse whatever song_request() read before
-            # resolving — a mod could easily adjust /settings during a
-            # multi-second resolve.
-            tunables = TwitchTunables.from_dict(await self.bot.tunables_store.read())
-
-            if 0 < tunables.max_request_duration_seconds < track.duration:
-                minutes = tunables.max_request_duration_seconds // 60
-                await self._safe_reply(ctx, f"That's too long to queue — max is {minutes} minute(s).")
-                return
-
-            blocklist_data = await self.bot.blocklist_store.read()
-            reason = blocklist_reason(track.webpage_url, track.uploader, blocklist_data)
-            if reason:
-                await self._safe_reply(ctx, f"That's blocked by a moderator ({reason}).")
-                return
-
-            already_queued = track.webpage_url == self.bot.player.active_webpage_url or any(
-                item.webpage_url == track.webpage_url for item in self.bot.player.queued_items()
-            )
-            if already_queued:
-                await self._safe_reply(ctx, f"{track.title} is already queued.")
-                return
-
-            # Re-check the cap right before enqueuing (no await between this
-            # check and enqueue() below) — the resolve above may have taken
-            # long enough for the queue to have filled up meanwhile.
-            if self.bot.player.queue_size() >= tunables.queue_cap:
-                await self._safe_reply(ctx, "Queue's full right now — try again in a bit.")
-                return
-
-            def _on_start(key: str = chatter_key) -> None:
-                remaining_pending = self.bot.pending_by_chatter.get(key, 1) - 1
-                if remaining_pending <= 0:
-                    self.bot.pending_by_chatter.pop(key, None)
-                else:
-                    self.bot.pending_by_chatter[key] = remaining_pending
-
-            self.bot.player.enqueue(
-                QueuedRequest(
-                    webpage_url=track.webpage_url,
-                    requester_id=requester_id,
-                    requester_name=requester_name,
-                    title=track.title,
-                    on_start=_on_start,
-                )
-            )
-            reserved = False  # ownership of the reservation now belongs to on_start's eventual decrement
-            await self._safe_reply(ctx, f"Queued: {track.title} (#{self.bot.player.queue_size()} in queue)")
-        except Exception:
-            # Catch-all so a bug here can't silently eat the chatter's
-            # pending-count reservation forever, or fail with no reply at
-            # all — create_task() has no caller left to propagate to.
-            log.exception("Unhandled error resolving/queuing song request: %s", query)
-            with contextlib.suppress(Exception):
-                await ctx.reply("Something went wrong queuing that — try again.")
-        finally:
-            if reserved:
-                remaining_pending = self.bot.pending_by_chatter.get(chatter_key, 1) - 1
-                if remaining_pending <= 0:
-                    self.bot.pending_by_chatter.pop(chatter_key, None)
-                else:
-                    self.bot.pending_by_chatter[chatter_key] = remaining_pending
-            # Only clear if it's still *our* query — a newer !sr from this
-            # same chatter could already have overwritten the marker with a
-            # different query by the time this one finishes.
-            if self.bot.inflight_query_by_chatter.get(chatter_key) == query.lower():
-                self.bot.inflight_query_by_chatter.pop(chatter_key, None)
-
-    @commands.command(name="skip")
-    # No @commands.is_moderator() guard — mods/broadcaster can always skip
-    # (checked manually below), but a chatter can also skip their own
-    # currently-playing request without mod status.
-    async def skip(self, ctx: commands.Context) -> None:
-        chatter = ctx.chatter
-        # ctx.chatter is Chatter | PartialUser; only Chatter has .moderator.
-        is_mod = isinstance(chatter, Chatter) and chatter.moderator
-        if not is_mod:
-            # active_requester_id (not now_playing) so a chatter can skip
-            # their own song during the resolve/load window too — that can
-            # take 15-20s+, and now_playing stays None the whole time.
-            active_id = self.bot.player.active_requester_id
-            if active_id is None:
-                await ctx.reply("Nothing's playing right now.")
-                return
-            try:
-                requester_id = int(ctx.chatter.id)
-            except (TypeError, ValueError):
-                requester_id = -1
-            if requester_id != active_id:
-                await ctx.reply("You can only skip your own song — mods can skip anything.")
-                return
-        if self.bot.player.skip_current():
-            await ctx.reply("Skipped.")
-        else:
-            await ctx.reply("Nothing's playing right now.")
-
-    @commands.command(name="voteskip", aliases=["vs"])
-    async def vote_skip(self, ctx: commands.Context) -> None:
-        """Anyone can vote to skip whatever's currently playing (or still
-        loading) — once enough unique chatters have voted (vote_skip_threshold,
-        adjustable via /settings or !setlimit), it's skipped automatically.
-        Votes are per-track and don't carry over to the next one."""
-        if self.bot.player.active_requester_id is None:
-            await ctx.reply("Nothing's playing right now.")
-            return
-        try:
-            voter_id = int(ctx.chatter.id)
-        except (TypeError, ValueError):
-            await ctx.reply("Couldn't identify you — try again.")
-            return
-        tunables = TwitchTunables.from_dict(await self.bot.tunables_store.read())
-        result = self.bot.player.register_skip_vote(voter_id, tunables.vote_skip_threshold)
-        if result is None:
-            await ctx.reply("Nothing's playing right now.")
-            return
-        skipped, count, is_new = result
-        if skipped:
-            await ctx.reply("Vote-skipped!")
-        elif not is_new:
-            await ctx.reply(f"You've already voted to skip this one ({count}/{tunables.vote_skip_threshold}).")
-        else:
-            needed = tunables.vote_skip_threshold - count
-            await ctx.reply(f"Skip vote registered ({count}/{tunables.vote_skip_threshold}) — {needed} more needed.")
-
-    @commands.command(name="remove", aliases=["cancel", "unqueue"])
-    async def remove(self, ctx: commands.Context) -> None:
-        """Lets a chatter pull their own most-recently-queued request back
-        out — for requests still waiting in the queue, not the one currently
-        playing (that's what !skip is for)."""
-        try:
-            requester_id = int(ctx.chatter.id)
-        except (TypeError, ValueError):
-            await ctx.reply("Couldn't identify you — try again.")
-            return
-        removed = self.bot.player.cancel_pending_for(requester_id)
-        if removed is None:
-            await ctx.reply("You don't have anything waiting in the queue.")
-            return
-        title = removed.title or "your request"
-        await ctx.reply(f"Removed: {title}")
-
-    @commands.command(name="position", aliases=["pos"])
-    async def position(self, ctx: commands.Context) -> None:
-        """Shows where the chatter's own request(s) sit in the queue."""
-        try:
-            requester_id = int(ctx.chatter.id)
-        except (TypeError, ValueError):
-            await ctx.reply("Couldn't identify you — try again.")
-            return
-        positions = self.bot.player.positions_for(requester_id)
-        if not positions:
-            if self.bot.player.active_requester_id == requester_id:
-                await ctx.reply("Your song is up now!")
-            else:
-                await ctx.reply("You don't have anything queued.")
-            return
-        if len(positions) == 1:
-            await ctx.reply(f"You're #{positions[0]} in the queue.")
-        else:
-            spots = ", ".join(f"#{p}" for p in positions)
-            await ctx.reply(f"You're at {spots} in the queue.")
-
-    @commands.command(name="queue")
-    async def queue_cmd(self, ctx: commands.Context) -> None:
-        items = self.bot.player.queued_items()
-        if not items:
-            await ctx.reply("Queue is empty.")
-            return
-        upcoming = ", ".join(item.title or "an unnamed track" for item in items[:3])
-        more = f" (+{len(items) - 3} more)" if len(items) > 3 else ""
-        await ctx.reply(f"{len(items)} queued: {upcoming}{more}")
-
-    @commands.command(name="nowplaying", aliases=["np"])
-    async def now_playing(self, ctx: commands.Context) -> None:
-        np = self.bot.player.now_playing
-        if np is None:
-            await ctx.reply("Nothing's playing right now.")
-            return
-        elapsed = max(0, int(time.monotonic() - np.started_at))
-        await ctx.reply(f"Now playing: {np.title} — requested by {np.requester_name} ({elapsed}s in)")
-
-    @commands.command(name="specs")
-    async def specs_cmd(self, ctx: commands.Context) -> None:
-        """Shows the streamer's PC specs — set from the /settings page,
-        not from chat (there's nothing to type here beyond !specs itself)."""
-        specs = PCSpecs.from_dict(await self.bot.specs_store.read())
-        lines = specs.display_lines()
-        if not lines:
-            await ctx.reply("Specs haven't been set up yet.")
-            return
-        await ctx.reply(" | ".join(lines))
-
-    @commands.command(name="peripherals", aliases=["periphs"])
-    async def peripherals_cmd(self, ctx: commands.Context) -> None:
-        """Shows the streamer's peripherals — same deal as !specs above."""
-        peripherals = Peripherals.from_dict(await self.bot.specs_store.read())
-        lines = peripherals.display_lines()
-        if not lines:
-            await ctx.reply("Peripherals haven't been set up yet.")
-            return
-        await ctx.reply(" | ".join(lines))
-
-    @commands.command(name="commands", aliases=["help"])
-    async def commands_list(self, ctx: commands.Context) -> None:
-        p = self.bot.prefix
-        await ctx.reply(
-            f"{p}sr <song/URL> — queue a song (YouTube/SoundCloud)  |  {p}skip / {p}voteskip — "
-            f"skip it  |  {p}remove — pull back your request  |  {p}position — where you are in "
-            f"line  |  {p}queue  |  {p}nowplaying  |  {p}specs  |  {p}peripherals  |  mods: "
-            f"{p}setlimit, {p}block/{p}unblock, {p}blocklist, {p}clearqueue"
-        )
-
-    @commands.is_moderator()
-    @commands.command(name="setlimit")
-    async def set_limit(self, ctx: commands.Context, *, args: str) -> None:
-        """Mod-only: adjust one request-limit tunable live, without needing
-        the /settings page — e.g. !setlimit queue_cap 100. Same keys and
-        ranges as /settings; takes effect on the very next command."""
-        args = args.strip()
-        parts = args.split(maxsplit=1)
-        if len(parts) != 2:
-            keys = ", ".join(TUNABLE_BOUNDS)
-            await ctx.reply(f"Usage: !setlimit <key> <value> — keys: {keys}")
-            return
-        key, raw_value = parts[0].strip(), parts[1].strip()
-        bounds = TUNABLE_BOUNDS.get(key)
-        if bounds is None:
-            keys = ", ".join(TUNABLE_BOUNDS)
-            await ctx.reply(f"Unknown key {key!r} — keys: {keys}")
-            return
-        lo, hi = bounds
-        try:
-            value = int(raw_value)
-        except ValueError:
-            await ctx.reply(f"{key}: not a number.")
-            return
-        if not (lo <= value <= hi):
-            await ctx.reply(f"{key}: must be between {lo} and {hi}.")
-            return
-
-        def _mutate(current: dict[str, object]) -> dict[str, object]:
-            updated: dict[str, object] = dict(TwitchTunables.from_dict(current).to_dict())
-            updated[key] = value
-            return updated
-
-        await self.bot.tunables_store.update(_mutate)
-        log.info("%s = %s set via chat by %s (%s)", key, value, ctx.chatter.display_name, ctx.chatter.id)
-        await ctx.reply(f"{key} = {value}")
-
-    @commands.is_moderator()
-    @commands.command(name="block")
-    async def block(self, ctx: commands.Context, *, args: str) -> None:
-        """Mod-only: blocks a track (by URL) or an uploader (by name) from
-        being requested again, and pulls any already-queued copy of that
-        same track out of the queue too (an uploader block can't purge the
-        queue the same way — a queued request's uploader isn't known until
-        it's actually resolved)."""
-        target = args.strip()
-        if not target:
-            await ctx.reply(_USAGE["block"])
-            return
-        key = normalize_track_key(target)
-
-        def _mutate(current: dict[str, object]) -> dict[str, object]:
-            return add_track_block(current, key) if key else add_uploader_block(current, target)
-
-        result = await self.bot.blocklist_store.update(_mutate)
-        log.info("Blocked %r via chat by %s (%s)", target, ctx.chatter.display_name, ctx.chatter.id)
-        tracks, uploaders = blocklist_counts(result)
-        kind = "track" if key else f"uploader {target!r}"
-        reply = f"Blocked that {kind}. ({tracks} tracks, {uploaders} uploaders blocked)"
-        if target.lower().startswith(("http://", "https://")) and not looks_like_a_single_track(target, key):
-            reply += " (Doesn't look like a single track link, so this won't match anything by URL.)"
-
-        if key:
-            purged = self.bot.player.purge_pending(lambda r: normalize_track_key(r.webpage_url) == key)
-            if purged:
-                noun = "copy" if len(purged) == 1 else "copies"
-                reply += f" Also removed {len(purged)} already-queued {noun} of it."
-
-        await ctx.reply(reply)
-
-    @commands.is_moderator()
-    @commands.command(name="unblock")
-    async def unblock(self, ctx: commands.Context, *, args: str) -> None:
-        """Mod-only: reverses !block for a track (by URL) or uploader (by
-        name)."""
-        target = args.strip()
-        if not target:
-            await ctx.reply(_USAGE["unblock"])
-            return
-        key = normalize_track_key(target)
-
-        def _mutate(current: dict[str, object]) -> dict[str, object]:
-            return remove_track_block(current, key) if key else remove_uploader_block(current, target)
-
-        result = await self.bot.blocklist_store.update(_mutate)
-        log.info("Unblocked %r via chat by %s (%s)", target, ctx.chatter.display_name, ctx.chatter.id)
-        tracks, uploaders = blocklist_counts(result)
-        await ctx.reply(f"Unblocked. ({tracks} tracks, {uploaders} uploaders still blocked)")
-
-    @commands.is_moderator()
-    @commands.command(name="blocklist")
-    async def blocklist_cmd(self, ctx: commands.Context) -> None:
-        """Mod-only: shows how many tracks/uploaders are currently blocked
-        (not the full list — that can get long for chat)."""
-        tracks, uploaders = blocklist_counts(await self.bot.blocklist_store.read())
-        await ctx.reply(f"{tracks} track(s) and {uploaders} uploader(s) currently blocked.")
-
-    @commands.is_moderator()
-    @commands.command(name="clearqueue")
-    async def clear_queue(self, ctx: commands.Context) -> None:
-        """Mod-only: empties the queue. Doesn't touch whatever's currently
-        playing — use !skip for that."""
-        removed = self.bot.player.purge_pending(lambda r: True)
-        if not removed:
-            await ctx.reply("Queue's already empty.")
-            return
-        await ctx.reply(f"Cleared {len(removed)} queued request(s).")
+def _is_excessive_caps(text: str) -> bool:
+    letters = [c for c in text if c.isalpha()]
+    return len(letters) >= 10 and sum(1 for c in letters if c.isupper()) / len(letters) > 0.7
 
 
 class TwitchChatBot(commands.Bot):
@@ -605,6 +150,8 @@ class TwitchChatBot(commands.Bot):
         tunables_store: JsonStore,
         blocklist_store: JsonStore,
         specs_store: JsonStore,
+        toggles_store: JsonStore,
+        db: Database,
         token_storage_path: Path,
     ) -> None:
         super().__init__(
@@ -619,6 +166,8 @@ class TwitchChatBot(commands.Bot):
         self.tunables_store = tunables_store
         self.blocklist_store = blocklist_store
         self.specs_store = specs_store
+        self.toggles_store = toggles_store
+        self.db = db
         self.prefix = prefix
         self._owner_id = owner_id
         self._bot_id = bot_id
@@ -637,7 +186,7 @@ class TwitchChatBot(commands.Bot):
         # so an identical repeat while it's still in flight gets a distinct
         # reply instead of triggering a second full resolve — Twitch's
         # exact-duplicate-message rule silently drops the second identical
-        # "Looking up '...'…" anyway (see _safe_reply), so without this a
+        # "Looking up '...'…" anyway (see safe_reply), so without this a
         # double-tapped !sr looks like the bot ignored it, while the
         # resolver quietly redoes the whole yt-dlp + JS-challenge round
         # trip for nothing. Cleared in _resolve_and_queue's finally.
@@ -647,6 +196,23 @@ class TwitchChatBot(commands.Bot):
         # mid-flight (a well-known footgun; see the asyncio docs on
         # create_task). Entries remove themselves via add_done_callback.
         self.background_tasks: set[asyncio.Task[None]] = set()
+        # Round-robins through _DEDUP_SUFFIXES on every safe_reply call —
+        # shared across every component (not one counter each) so replies
+        # from different commands still can't collide on Twitch's dedup
+        # window back to back.
+        self._reply_counter = 0
+        # Chat-activity tracking for the passive points/watch-time loop —
+        # "active" here means "has sent a chat message recently", not true
+        # viewer presence (that would need viewer-list/EventSub data this
+        # bot doesn't have). Known simplification, not a bug.
+        self.last_seen: dict[str, float] = {}
+        self.last_seen_name: dict[str, str] = {}
+        self._points_task: asyncio.Task[None] | None = None
+        self.custom_command_cooldowns = CooldownTracker()
+        # Sticky "give up" flag for filter_delete_enabled — set on the first
+        # permission failure so a missing scope doesn't mean retrying (and
+        # logging) a failed delete on every single flagged message forever.
+        self._delete_scope_missing = False
 
     async def load_tokens(self, path: str | None = None, /) -> None:
         # Redirects TwitchIO's default token file into DATA_DIR instead.
@@ -734,7 +300,11 @@ class TwitchChatBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.add_component(SongRequestComponent(self))
+        await self.add_component(ModerationComponent(self))
+        await self.add_component(InfoComponent(self))
+        await self.add_component(EngagementComponent(self))
         await self._try_subscribe_chat()
+        self._points_task = asyncio.create_task(self._points_award_loop(), name="points-award-loop")
 
     def _log_token_diagnostics(self) -> None:
         # Catches the single most common cause of "OAuth said success but
@@ -771,8 +341,9 @@ class TwitchChatBot(commands.Bot):
 
     async def announce(self, message: str) -> None:
         """Sends a message to the broadcaster's channel — used by RadioPlayer
-        to tell chat about a track it had to drop. Not tied to a command
-        Context, so this goes through PartialUser.send_message directly."""
+        to tell chat about a track it had to drop, and by the moderation
+        filter below (no command Context to reply() from there). Not tied
+        to a Context, so this goes through PartialUser.send_message directly."""
         # commands.Bot types _owner_id/_bot_id as `str | None` since the base
         # class allows constructing without them — this subclass requires
         # both, so they're never actually None here; just narrowing for mypy.
@@ -781,6 +352,150 @@ class TwitchChatBot(commands.Bot):
         channel = self.create_partialuser(user_id=self._owner_id)
         await channel.send_message(sender=self._bot_id, message=message)
 
+    async def safe_reply(self, ctx: commands.Context, message: str) -> None:
+        """ctx.reply() that swallows Twitch's own message-delivery failures
+        — a 429 (chat rate limit) or the exact-duplicate-message rule,
+        both TwitchioException — instead of letting them propagate.
+
+        Matters most for !sr's very first reply: it's called before
+        _resolve_and_queue's own try/except exists, so an uncaught failure
+        there aborts the command on the spot and the background task right
+        after it never runs — the whole request silently vanishes, no
+        queue, no error, nothing, purely because Twitch declined to
+        deliver an acknowledgement message. Two different chatters
+        requesting the same currently-playing song back to back is a
+        normal way to hit this, not just rapid self-testing.
+
+        Every message gets a small rotating suffix (see _DEDUP_SUFFIXES
+        above) before delivery is even attempted, unconditionally — not
+        just when a repeat looks likely — since Twitch's own dedup state
+        isn't something this process can reliably reconstruct (its window
+        outlasts a single "previous message" comparison, and survives
+        this bot restarting).
+        """
+        suffix = _DEDUP_SUFFIXES[self._reply_counter % len(_DEDUP_SUFFIXES)]
+        self._reply_counter += 1
+        text = f"{message}{suffix}"
+        try:
+            await ctx.reply(text)
+        except TwitchioException:
+            log.info("Chat reply dropped by Twitch (rate limit or duplicate message): %r", text)
+
+    async def event_message(self, message: ChatMessage) -> None:
+        # super() call happens first and unconditionally. Verified directly
+        # against twitchio==3.3.2: Bot.event_message is what dispatches
+        # commands (via process_commands) — an override that skipped it
+        # would silently break every command in the bot, so nothing below
+        # runs until that's already happened.
+        await super().event_message(message)
+        try:
+            await self._track_and_filter(message)
+        except Exception:
+            log.debug("event_message tracking/filter hook failed (non-fatal).", exc_info=True)
+
+    async def _track_and_filter(self, message: ChatMessage) -> None:
+        # Twitch's EventSub delivers the bot's own messages back to it like
+        # any other chat message — there's no `.echo`-style flag on
+        # ChatMessage (confirmed against the installed package); the base
+        # class's own event_message filters these for command-dispatch
+        # purposes the same way, via chatter.id == bot_id, not some
+        # separate "is this mine" attribute.
+        chatter = message.chatter
+        chatter_id = chatter.id
+        if chatter_id == self._bot_id:
+            return
+        self.last_seen[chatter_id] = time.monotonic()
+        self.last_seen_name[chatter_id] = chatter.display_name or chatter_id
+
+        if chatter.moderator:  # covers the broadcaster too — see Chatter.moderator
+            return  # mods/broadcaster exempt from the chat filters below
+        text = message.text
+        if not text:
+            return
+        toggles = FeatureToggles.from_dict(await self.toggles_store.read())
+        display_name = self.last_seen_name[chatter_id]
+        flagged = False
+        if toggles.link_filter_enabled and _LINK_RE.search(text):
+            await self.announce(f"@{display_name} links aren't allowed in chat — ask a mod if that's wrong.")
+            flagged = True
+        elif toggles.caps_filter_enabled and _is_excessive_caps(text):
+            await self.announce(f"@{display_name} easy on the caps!")
+            flagged = True
+        if flagged and toggles.filter_delete_enabled:
+            await self._run_filter_delete(message)
+
+    async def _run_filter_delete(self, message: ChatMessage) -> None:
+        """Deletes a message the filter above just flagged — separate from
+        the warn-only path since it needs a scope (moderator:manage:
+        chat_messages) the default OAuth setup doesn't request; see the
+        module docstring. Fails silently (once loudly, in the log) rather
+        than retrying every flagged message forever once it's clear the
+        scope isn't there."""
+        if self._delete_scope_missing:
+            return
+        try:
+            await message.broadcaster.delete_chat_messages(moderator=self._bot_id, message_id=message.id)
+        except HTTPException as e:
+            if e.status in (401, 403):
+                self._delete_scope_missing = True
+                log.warning(
+                    "filter_delete_enabled is on, but deleting a message failed with HTTP %s — the bot's "
+                    "token is probably missing moderator:manage:chat_messages. Staying warn-only for the "
+                    "rest of this run; see chatbot.py's module docstring for the OAuth step to add it. (%s)",
+                    e.status, e,
+                )
+            else:
+                log.debug("Failed to delete a flagged chat message (non-fatal): %s", e, exc_info=True)
+        except Exception:
+            log.debug("Failed to delete a flagged chat message (non-fatal).", exc_info=True)
+
+    async def _try_custom_command(self, ctx: commands.Context, name: str) -> bool:
+        """Dispatches a mod-defined !addcom response — hooked from
+        event_command_error's CommandNotFound branch below rather than a
+        second command-parsing layer, reusing ctx.content (already
+        referenced in the original event_command_error catch-all, so this
+        attribute's presence is proven, unlike event_message's guesses
+        above)."""
+        remaining = self.custom_command_cooldowns.remaining(name, _CUSTOM_COMMAND_COOLDOWN_SECONDS)
+        if remaining > 0:
+            return True  # swallow silently — don't spam chat about a cooldown on a custom command
+        response = await self.db.get_command(name)
+        if response is None:
+            return False
+        self.custom_command_cooldowns.mark(name)
+        display_name = ctx.chatter.display_name or ctx.chatter.name or "there"
+        text = response.replace("{user}", display_name)
+        with contextlib.suppress(Exception):
+            await ctx.reply(text)
+        return True
+
+    async def _points_award_loop(self) -> None:
+        while True:
+            await asyncio.sleep(_AWARD_TICK_SECONDS)
+            try:
+                await self._run_points_award_tick()
+            except Exception:
+                log.debug("Points award tick failed (non-fatal).", exc_info=True)
+
+    async def _run_points_award_tick(self) -> None:
+        now = time.monotonic()
+        stale = [uid for uid, ts in self.last_seen.items() if now - ts > _LAST_SEEN_PRUNE_SECONDS]
+        for uid in stale:
+            self.last_seen.pop(uid, None)
+            self.last_seen_name.pop(uid, None)
+
+        tunables = TwitchTunables.from_dict(await self.tunables_store.read())
+        if tunables.points_per_active_minute <= 0:
+            return
+        active = [uid for uid, ts in self.last_seen.items() if now - ts <= _ACTIVE_WINDOW_SECONDS]
+        if not active:
+            return
+        entries = [
+            (uid, self.last_seen_name.get(uid, uid), tunables.points_per_active_minute, int(_AWARD_TICK_SECONDS))
+            for uid in active
+        ]
+        await self.db.bulk_award(entries)
+
     async def event_command_error(self, payload: commands.CommandErrorPayload) -> None:
         exc = payload.exception
         ctx = payload.context
@@ -788,7 +503,15 @@ class TwitchChatBot(commands.Bot):
             # Fires for every chat message starting with our prefix that
             # isn't one of ours — with another "!"-prefixed bot in the same
             # channel (Nightbot, StreamElements, Moobot), that's most of
-            # them. Not worth logging, let alone at ERROR with a traceback.
+            # them, so a custom-command lookup happens before giving up
+            # rather than logging every miss.
+            content = getattr(ctx, "content", "") or ""
+            if content.startswith(self.prefix):
+                name = content[len(self.prefix) :].split(maxsplit=1)[0].lower()
+                if name:
+                    with contextlib.suppress(Exception):
+                        if await self._try_custom_command(ctx, name):
+                            return
             return
         if isinstance(exc, commands.GuardFailure):
             with contextlib.suppress(Exception):
@@ -803,3 +526,12 @@ class TwitchChatBot(commands.Bot):
                 await ctx.reply(usage)
             return
         log.error("Command error in %r: %r", getattr(ctx, "content", "<unknown>"), exc, exc_info=exc)
+
+    async def close(self) -> None:
+        if self._points_task is not None:
+            self._points_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._points_task
+            self._points_task = None
+        await self.db.close()
+        await super().close()

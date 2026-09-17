@@ -7,6 +7,7 @@ import shutil
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Protocol
 
 from twitch_radio.models import Track
@@ -47,6 +48,16 @@ class TrackResolver(Protocol):
     async def __call__(self, query: str, requester_id: int) -> Track | None: ...
 
 
+class RadioSuggestFn(Protocol):
+    async def __call__(self, seed_webpage_url: str) -> "QueuedRequest | None": ...
+
+
+# Sliding-window "don't immediately hammer a broken/empty radio mix" guard —
+# a fast-failing suggestion (e.g. no mix data at all) could otherwise refire
+# every ~0.1s idle tick.
+_RADIO_RETRY_BACKOFF_SECONDS = 30.0
+
+
 @dataclass(slots=True)
 class QueuedRequest:
     webpage_url: str
@@ -55,6 +66,19 @@ class QueuedRequest:
     title: str = ""
     cancelled: bool = False
     on_start: Callable[[], None] | None = field(default=None, repr=False)
+
+
+class PlayerState(str, Enum):
+    """Derived, read-only view over the existing _resolving/_now_playing
+    flags below — added for external observability (/healthz, future
+    features that care "what's the player doing") without touching how
+    those flags are actually maintained. Not a real state machine: nothing
+    here is authoritative, it's just a label for whatever the existing
+    flags currently say."""
+
+    IDLE = "idle"
+    RESOLVING = "resolving"
+    PLAYING = "playing"
 
 
 @dataclass(slots=True)
@@ -125,6 +149,13 @@ class RadioPlayer:
         # full current state themselves.
         self._state_subscribers: set[asyncio.Queue[None]] = set()
 
+        # Radio autoplay — see set_radio_suggester()/_maybe_start_radio_fill().
+        self._radio_suggest: RadioSuggestFn | None = None
+        self._radio_enabled_getter: Callable[[], Awaitable[bool]] | None = None
+        self._last_played_webpage_url: str | None = None
+        self._radio_fill_task: asyncio.Task[None] | None = None
+        self._radio_fill_failed_at: float = 0.0
+
     # -- public interface used by the chat bot / admin server ------------
 
     @property
@@ -173,6 +204,20 @@ class RadioPlayer:
 
     def set_duration_limit_getter(self, getter: Callable[[], Awaitable[int]] | None) -> None:
         self._duration_limit_getter = getter
+
+    def set_radio_suggester(self, suggester: RadioSuggestFn | None) -> None:
+        self._radio_suggest = suggester
+
+    def set_radio_enabled_getter(self, getter: Callable[[], Awaitable[bool]] | None) -> None:
+        self._radio_enabled_getter = getter
+
+    @property
+    def state(self) -> PlayerState:
+        if self._now_playing is not None:
+            return PlayerState.PLAYING
+        if self._resolving or self._active_request is not None:
+            return PlayerState.RESOLVING
+        return PlayerState.IDLE
 
     def subscribe(self) -> asyncio.Queue[bytes]:
         q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=_SUBSCRIBER_QUEUE_SIZE)
@@ -280,6 +325,11 @@ class RadioPlayer:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
             self._task = None
+        if self._radio_fill_task is not None:
+            self._radio_fill_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._radio_fill_task
+            self._radio_fill_task = None
         await self._kill_encoder()
 
     # -- internals ---------------------------------------------------------
@@ -397,6 +447,11 @@ class RadioPlayer:
                     continue
                 request = self._queue.get_nowait()
             except asyncio.QueueEmpty:
+                # Catches the case the prefetch-timer hook above doesn't:
+                # a skip or early end that empties the queue before that
+                # timer ever fired. Guarded/deduped inside the method
+                # itself, so calling it every idle tick is cheap.
+                self._maybe_start_radio_fill()
                 await self._write_silence_chunk(encoder_stdin)
                 await asyncio.sleep(_CHUNK_DURATION)
                 continue
@@ -459,6 +514,11 @@ class RadioPlayer:
         """
         delay = max(0.0, current_duration - _PREFETCH_LEAD_SECONDS)
         await asyncio.sleep(delay)  # cancelled cleanly by _play_one's finally when the track ends first
+        # Queue's still empty this close to the end — try to auto-fill it
+        # from radio mode *before* checking what's next, so the freshly
+        # queued pick gets the same pre-warming resolve below instead of a
+        # cold one right when it's needed.
+        self._maybe_start_radio_fill()
         upcoming = self._pending[0] if self._pending else None
         if upcoming is None or upcoming.cancelled:
             return
@@ -466,6 +526,43 @@ class RadioPlayer:
             await self._resolver(upcoming.webpage_url, upcoming.requester_id)
         except Exception:
             log.debug("Prefetch failed for %s (non-fatal).", upcoming.webpage_url, exc_info=True)
+
+    def _maybe_start_radio_fill(self) -> None:
+        """Kicks off a background radio-suggestion lookup when the queue is
+        empty and nothing's already in flight. Called from both the
+        prefetch timer above (pre-warms the common "track ends naturally"
+        case) and _feed_loop's idle branch below (catches a skip/early-end,
+        where the prefetch timer never got to fire). Both funnel through
+        this one guarded entry point so they can't double-queue a pick."""
+        if self._radio_fill_task is not None or self._pending:
+            return
+        if self._radio_suggest is None or self._last_played_webpage_url is None:
+            return
+        if time.monotonic() - self._radio_fill_failed_at < _RADIO_RETRY_BACKOFF_SECONDS:
+            return
+        self._radio_fill_task = asyncio.create_task(self._run_radio_fill(), name="radio-autoplay-fill")
+
+    async def _run_radio_fill(self) -> None:
+        try:
+            if self._radio_enabled_getter is not None:
+                with contextlib.suppress(Exception):
+                    if not await self._radio_enabled_getter():
+                        return
+            seed = self._last_played_webpage_url
+            if seed is None or self._radio_suggest is None:
+                return
+            try:
+                picked = await self._radio_suggest(seed)
+            except Exception:
+                log.debug("Radio autoplay suggestion failed for %s (non-fatal).", seed, exc_info=True)
+                picked = None
+            if picked is None:
+                self._radio_fill_failed_at = time.monotonic()
+                return
+            self.enqueue(picked)
+            log.info("Radio autoplay queued: %s", picked.title)
+        finally:
+            self._radio_fill_task = None
 
     async def _current_duration_limit(self) -> int:
         if self._duration_limit_getter is None:
@@ -517,6 +614,11 @@ class RadioPlayer:
                 started_at=time.monotonic(),
                 duration=track.duration,
             )
+            # Seed for the *next* radio-autoplay pick — set as soon as we
+            # know playback is actually going ahead, so a track that fails
+            # to resolve/decode (returns before this point) never becomes
+            # a seed.
+            self._last_played_webpage_url = track.webpage_url
             self._notify_state_changed()
             log.info("Now playing: %s (requested by %s)", track.title, request.requester_name)
             if self._prefetch_enabled:

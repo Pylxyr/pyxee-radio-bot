@@ -18,6 +18,12 @@ any Discord bot.
 - **`!sr <query>`** — search or paste a YouTube/SoundCloud link to queue a
   track, with per-chatter cooldowns, pending-request limits, and a queue
   cap, all live-adjustable without a restart.
+- **Radio autoplay** — when the queue runs dry, auto-queues a track related
+  to whatever just finished, using YouTube's own "Mix" playlist (the same
+  mechanism behind YouTube Music's autoplay) instead of going to silence.
+  On by default; `!radio [on|off]` or the `/settings` page to toggle. See
+  [Radio autoplay](#radio-autoplay) below for how it actually decides what
+  to play next.
 - **Continuous MP3 stream** (`/stream.mp3`) fed by one persistent `ffmpeg`
   encoder, fanned out to any number of listeners, with silence between
   tracks so the stream never drops.
@@ -25,13 +31,23 @@ any Discord bot.
   elapsed/duration progress bar, and the next two songs, driven by a
   WebSocket with polling fallback.
 - **Moderation tools** — `!skip`, `!voteskip`, `!block`/`!unblock` by track
-  or uploader, `!clearqueue`, and a live blocklist.
-- **`/settings` web page** — adjust request limits and set the streamer's
-  PC specs/peripherals (shown to viewers via `!specs`/`!peripherals`)
-  without touching a config file, optionally password-protected.
+  or uploader, `!clearqueue`, a live blocklist, and an optional link/caps
+  chat filter (warn-only by default; see
+  [Viewer engagement & moderation](#viewer-engagement--moderation)).
+- **Viewer engagement** — passive points and watch-time for active
+  chatters (`!points`, `!leaderboard`, `!watchtime`), mod-managed custom
+  commands (`!addcom`/`!delcom`) and quotes (`!addquote`/`!quote`).
+- **`/settings` web page** — adjust request limits, feature toggles, and
+  the streamer's PC specs/peripherals (shown to viewers via
+  `!specs`/`!peripherals`) without touching a config file, optionally
+  password-protected. Includes a read-only community dashboard (points
+  leaderboard, custom command/quote counts).
 - **Runtime-adjustable request limits** — cooldown, per-chatter pending
-  cap, queue cap, max track duration, and vote-skip threshold, settable
-  from `/settings` or via `!setlimit` in chat.
+  cap, queue cap, max track duration, points-per-active-minute, and
+  vote-skip threshold, settable from `/settings` or via `!setlimit` in
+  chat.
+- **`/healthz`** — player state, queue size, and rolling resolve
+  success/failure counts, for an uptime monitor or a quick sanity check.
 - **`--check-config`** validates `.env` and confirms `ffmpeg` is on `PATH`
   without starting the bot or touching Twitch/yt-dlp — useful before a
   real deploy or in CI.
@@ -118,7 +134,7 @@ required; everything else has a default.
 | `TWITCH_NOWPLAYING_HOST` | `127.0.0.1` | HTTP bind address — `0.0.0.0` to expose beyond localhost |
 | `TWITCH_NOWPLAYING_PORT` | `8098` | HTTP port, 1024–65535 |
 | `TWITCH_SETTINGS_PASSWORD` | unset | Basic Auth password for `/settings` (any username) |
-| `TWITCH_TOKEN_FILE` / `TWITCH_TUNABLES_FILE` / `TWITCH_BLOCKLIST_FILE` / `TWITCH_SPECS_FILE` | see `.env.example` | Filenames under `data/` |
+| `TWITCH_TOKEN_FILE` / `TWITCH_TUNABLES_FILE` / `TWITCH_BLOCKLIST_FILE` / `TWITCH_SPECS_FILE` / `TWITCH_TOGGLES_FILE` / `TWITCH_DB_FILE` | see `.env.example` | Filenames under `data/` |
 | `YTDLP_COOKIES_FILE` | unset | Path under `data/` to a `cookies.txt` — see [notes below](#cookies-and-youtube-blocking-cloud-ips) |
 | `YTDLP_POT_PROVIDER_URL` | unset | URL of a local PO-token provider, if configured |
 | `YTDLP_JS_RUNTIME_PATH` / `YTDLP_JS_RUNTIME_NAME` | unset / `deno` | Pin a specific JS runtime binary |
@@ -165,6 +181,16 @@ Chat comes online automatically the moment both accounts are authorized —
 no restart needed. Tokens save to `data/twitch_tokens.json` and reload on
 every future start; you won't need to repeat this unless that file is
 deleted or Twitch revokes the token.
+
+**Optional extra scope for the moderation filter's delete action:** the
+link/caps chat filter (off by default; see
+[Viewer engagement & moderation](#viewer-engagement--moderation)) can
+warn-only, or also delete the flagged message. Deleting needs
+`moderator:manage:chat_messages`, which the steps above don't request —
+redo step 3's bot-account URL with it appended
+(`...scopes=user:read:chat+user:write:chat+user:bot+moderator:manage:chat_messages&force_verify=true`)
+if you want to enable `filter_delete_enabled`. Skip this if you're happy
+with warn-only, or haven't turned the filter on at all.
 
 ## Adding the stream to OBS
 
@@ -232,14 +258,24 @@ mobile carriers block inbound connections outright.
 | `!position` / `!pos` | anyone | Shows where your request(s) sit in the queue |
 | `!queue` | anyone | Shows how many requests are queued |
 | `!nowplaying` / `!np` | anyone | Shows the current track and who requested it |
+| `!radio [on/off]` | status: anyone; toggling: moderators | Shows or changes whether the queue auto-fills with related tracks when empty |
+| `!points` / `!balance` | anyone | Shows your points and tracked watch-time |
+| `!watchtime` | anyone | Shows your tracked chat-activity time |
+| `!leaderboard` / `!top` | anyone | Shows the top 5 point earners |
+| `!quote [id]` | anyone | Shows a random saved quote, or a specific one by ID |
 | `!specs` | anyone | Shows the streamer's PC specs (set from `/settings`) |
 | `!peripherals` / `!periphs` | anyone | Shows the streamer's peripherals (set from `/settings`) |
 | `!commands` / `!help` | anyone | Lists the commands above |
 | `!setlimit <key> <value>` | moderators | Adjusts one request-limit tunable live — same keys/ranges as `/settings` |
+| `!toggle <key> [on/off]` | moderators | Flips a feature toggle (radio autoplay, chat filters) — same keys as `/settings` |
 | `!block <url or uploader>` | moderators | Blocks a track (by link) or every track from an uploader (by name); a track block also pulls any already-queued copy out |
 | `!unblock <url or uploader>` | moderators | Reverses `!block` |
 | `!blocklist` | moderators | Shows how many tracks/uploaders are currently blocked |
 | `!clearqueue` | moderators | Empties the queue (not the currently-playing track — use `!skip` for that) |
+| `!addcom <name> <response>` / `!editcom` | moderators | Adds or edits a custom command (`{user}` is replaced with the caller's name) |
+| `!delcom <name>` | moderators | Removes a custom command |
+| `!addquote <text>` | moderators | Saves a new quote |
+| `!delquote <id>` | moderators | Removes a quote by ID |
 
 Request limits (`max_pending_per_chatter`, `request_cooldown_seconds`,
 `queue_cap`, `max_request_duration_seconds`, `vote_skip_threshold`) are
@@ -255,6 +291,7 @@ Binds to `127.0.0.1` by default (`TWITCH_NOWPLAYING_HOST`).
 | `GET /overlay` | public | The visual now-playing/up-next widget |
 | `GET /nowplaying.json` | public | Same data as JSON, for a custom overlay |
 | `GET /ws/nowplaying` | public | WebSocket version, pushed on every change |
+| `GET /healthz` | public | Player state, queue size, rolling resolve success/failure counts |
 | `GET /blocklist.json` | password-gated | Full blocklist contents |
 | `GET`/`POST /settings` | password-gated | Request-limit and specs/peripherals editor |
 
@@ -276,6 +313,11 @@ since it's meant to be fetched by OBS or a browser without auth.
   restart).
 - **The OAuth token file** (`data/twitch_tokens.json`) is `chmod 600`
   after every save.
+- **The moderation filter's delete action is opt-in and scope-gated** —
+  `filter_delete_enabled` needs `moderator:manage:chat_messages` on the
+  bot's token (not requested by the base OAuth setup); without it, a
+  permission failure is logged once and the filter quietly stays
+  warn-only rather than retrying forever.
 - **`.env` and `data/` are gitignored**, and the systemd unit's sandbox
   only allows writes under `data/`.
 
@@ -301,17 +343,67 @@ twitch-radio-bot/
     ├── config.py               # Settings dataclass, env var loading
     ├── models.py                # Track dataclass
     ├── extraction.py            # yt-dlp resolver + short-lived cache (YouTube/SoundCloud only)
+    ├── radio.py                  # RadioSuggester: radio-autoplay picks via YouTube's own Mix playlist
     ├── store.py                 # atomic JSON persistence
-    ├── tunables.py               # TwitchTunables dataclass
+    ├── db.py                     # SQLite persistence for per-viewer data (points, custom commands, quotes)
+    ├── tunables.py               # TwitchTunables dataclass (request limits + points rate)
+    ├── toggles.py                 # FeatureToggles dataclass (radio autoplay, chat filters)
+    ├── telemetry.py               # rolling event counters, exposed via /healthz
+    ├── cooldown.py                # reusable per-chatter cooldown tracker
     ├── specs.py                  # PCSpecs/Peripherals dataclasses (!specs, !peripherals)
     ├── blocklist.py               # moderation blocklist normalization/lookup
-    ├── player.py                  # RadioPlayer: MP3 encoder + subscriber fan-out, gapless queue
-    ├── chatbot.py                 # TwitchChatBot + SongRequestComponent
-    ├── admin_server.py            # aiohttp: /stream.mp3, /overlay, /nowplaying.json, /ws/nowplaying, /settings
+    ├── player.py                  # RadioPlayer: MP3 encoder + subscriber fan-out, gapless queue, radio-autoplay hooks
+    ├── chatbot.py                 # TwitchChatBot: OAuth/token lifecycle, component wiring, engagement tracking
+    ├── components/                # chat commands, split by concern
+    │   ├── song_requests.py       #   !sr, !skip, !voteskip, !remove, !position, !queue, !nowplaying, !radio
+    │   ├── moderation.py          #   !setlimit, !toggle, !block/!unblock, !blocklist, !clearqueue
+    │   ├── info.py                #   !specs, !peripherals, !commands
+    │   └── engagement.py          #   !points, !leaderboard, !watchtime, !addcom/!delcom, !quote/!addquote/!delquote
+    ├── admin_server.py            # aiohttp: /stream.mp3, /overlay, /nowplaying.json, /ws/nowplaying, /healthz, /settings
     └── bot.py                     # wires everything together, owns shutdown, --check-config
 ```
 
 ## Notes
+
+### Radio autoplay
+
+When the queue is empty, the bot doesn't build its own "similar songs"
+model — it asks YouTube for one. Every YouTube video has an auto-generated
+"Mix" playlist (`youtube.com/watch?v=<id>&list=RD<id>`, the same one
+YouTube Music's autoplay uses); the resolver flat-extracts that playlist
+(cheap — no per-video format resolution, no JS-challenge solve) and
+queues the first candidate that isn't already blocked or recently played.
+Only works for YouTube seeds — SoundCloud has no equivalent single-call
+"related tracks" endpoint reachable through yt-dlp, so a SoundCloud
+now-playing simply doesn't trigger autoplay for that track.
+
+Picks are attributed to "📻 Radio Mix" in `!nowplaying`/`!queue`/the
+overlay, and — since they're not tied to a real Twitch user — mods can
+always `!skip` one, but a chatter's own `!skip` (which only works on
+their own request) won't match it; `!voteskip` works on it like anything
+else. Timing-wise, a pick is looked up and pre-resolved ~20 seconds before
+the current track ends (piggybacking on the existing prefetch mechanism),
+so it's normally cache-warm by the time it's needed; a skip that empties
+the queue early falls back to the same lookup on the spot instead, with
+the same brief silence-while-resolving as a normal cold `!sr`.
+
+### Viewer engagement & moderation
+
+Points and watch-time are earned passively for chat *activity* — sending
+messages while the stream's live — not true viewer presence (that would
+need viewer-list data this bot doesn't fetch); a chatter who watches
+silently earns nothing, and this is a known simplification, not a bug.
+The rate (`points_per_active_minute`, default 1, adjustable like any
+other tunable) applies per minute of continued activity within a 5-minute
+window; there's no economy yet for spending them beyond `!leaderboard`
+bragging rights.
+
+The link/caps chat filter is off by default (`link_filter_enabled` /
+`caps_filter_enabled`), warns in chat when triggered, and exempts
+moderators and the broadcaster. `filter_delete_enabled` (also off by
+default) additionally deletes the flagged message, but needs an extra
+OAuth scope the base setup doesn't request — see
+[One-time Twitch authorization](#one-time-twitch-authorization).
 
 ### Systemd hardening: `MemoryDenyWriteExecute` and `SystemCallFilter`
 
@@ -326,6 +418,15 @@ hardening directive stays in place. To keep `SystemCallFilter`, switch to
 Node ≥22 instead (Ubuntu's own `apt install nodejs` is usually older —
 use [NodeSource's setup script](https://github.com/nodesource/distributions)
 or `nvm`).
+
+### Resource caps (`MemoryMax`, `MemoryHigh`, `CPUQuota`)
+
+`deploy/twitch-radio.service` sets a cgroup-level memory/CPU ceiling
+(512M/768M/150%) independent of `OOMScoreAdjust` above — that only
+affects the *global* OOM-killer's priority, not what happens if this unit
+alone runs away (a stuck `ffmpeg`/yt-dlp/Deno subprocess on a small VPS or
+a phone). These are conservative starting points, not a hard requirement;
+raise them if the service gets killed under normal, non-runaway load.
 
 ### Cookies and YouTube blocking cloud IPs
 

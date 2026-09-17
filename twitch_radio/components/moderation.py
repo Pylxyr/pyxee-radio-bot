@@ -1,0 +1,171 @@
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+from twitchio.ext import commands
+
+from twitch_radio.blocklist import (
+    add_track_block,
+    add_uploader_block,
+    counts as blocklist_counts,
+    looks_like_a_single_track,
+    normalize_track_key,
+    remove_track_block,
+    remove_uploader_block,
+)
+from twitch_radio.toggles import TOGGLE_KEYS, FeatureToggles
+from twitch_radio.tunables import TUNABLE_BOUNDS, TwitchTunables
+
+if TYPE_CHECKING:
+    from twitch_radio.chatbot import TwitchChatBot
+
+log = logging.getLogger(__name__)
+
+USAGE = {
+    "setlimit": "Usage: !setlimit <key> <value> — keys: " + ", ".join(TUNABLE_BOUNDS),
+    "block": "Usage: !block <YouTube/SoundCloud URL, or an uploader name>",
+    "unblock": "Usage: !unblock <YouTube/SoundCloud URL, or an uploader name>",
+    "toggle": "Usage: !toggle <key> [on|off] — keys: " + ", ".join(TOGGLE_KEYS),
+}
+
+# Every @commands.is_moderator() below also admits the broadcaster — see the
+# note in chatbot.py's module docstring area (unchanged from the original
+# single-file version); repeated per-component since that's the verified
+# behavior each mod-only command here relies on.
+
+
+class ModerationComponent(commands.Component):
+    def __init__(self, bot: TwitchChatBot) -> None:
+        self.bot = bot
+
+    @commands.is_moderator()
+    @commands.command(name="setlimit")
+    async def set_limit(self, ctx: commands.Context, *, args: str) -> None:
+        """Mod-only: adjust one request-limit tunable live, without needing
+        the /settings page — e.g. !setlimit queue_cap 100. Same keys and
+        ranges as /settings; takes effect on the very next command."""
+        args = args.strip()
+        parts = args.split(maxsplit=1)
+        if len(parts) != 2:
+            keys = ", ".join(TUNABLE_BOUNDS)
+            await ctx.reply(f"Usage: !setlimit <key> <value> — keys: {keys}")
+            return
+        key, raw_value = parts[0].strip(), parts[1].strip()
+        bounds = TUNABLE_BOUNDS.get(key)
+        if bounds is None:
+            keys = ", ".join(TUNABLE_BOUNDS)
+            await ctx.reply(f"Unknown key {key!r} — keys: {keys}")
+            return
+        lo, hi = bounds
+        try:
+            value = int(raw_value)
+        except ValueError:
+            await ctx.reply(f"{key}: not a number.")
+            return
+        if not (lo <= value <= hi):
+            await ctx.reply(f"{key}: must be between {lo} and {hi}.")
+            return
+
+        def _mutate(current: dict[str, object]) -> dict[str, object]:
+            updated: dict[str, object] = dict(TwitchTunables.from_dict(current).to_dict())
+            updated[key] = value
+            return updated
+
+        await self.bot.tunables_store.update(_mutate)
+        log.info("%s = %s set via chat by %s (%s)", key, value, ctx.chatter.display_name, ctx.chatter.id)
+        await ctx.reply(f"{key} = {value}")
+
+    @commands.is_moderator()
+    @commands.command(name="toggle")
+    async def toggle(self, ctx: commands.Context, *, args: str) -> None:
+        """Mod-only: flips a feature on/off — e.g. !toggle radio_autoplay_enabled off.
+        (!radio on/off is a shortcut for the radio_autoplay_enabled key specifically.)"""
+        parts = args.strip().split(maxsplit=1)
+        if len(parts) != 2 or parts[1].lower() not in ("on", "off"):
+            await ctx.reply(USAGE["toggle"])
+            return
+        key, value = parts[0].strip(), parts[1].lower() == "on"
+        if key not in TOGGLE_KEYS:
+            await ctx.reply(f"Unknown key {key!r} — keys: {', '.join(TOGGLE_KEYS)}")
+            return
+
+        def _mutate(current: dict[str, object]) -> dict[str, object]:
+            toggles = FeatureToggles.from_dict(current)
+            setattr(toggles, key, value)
+            return toggles.to_dict()
+
+        await self.bot.toggles_store.update(_mutate)
+        log.info("%s = %s set via chat by %s (%s)", key, value, ctx.chatter.display_name, ctx.chatter.id)
+        await ctx.reply(f"{key} = {'on' if value else 'off'}")
+
+    @commands.is_moderator()
+    @commands.command(name="block")
+    async def block(self, ctx: commands.Context, *, args: str) -> None:
+        """Mod-only: blocks a track (by URL) or an uploader (by name) from
+        being requested again, and pulls any already-queued copy of that
+        same track out of the queue too (an uploader block can't purge the
+        queue the same way — a queued request's uploader isn't known until
+        it's actually resolved)."""
+        target = args.strip()
+        if not target:
+            await ctx.reply(USAGE["block"])
+            return
+        key = normalize_track_key(target)
+
+        def _mutate(current: dict[str, object]) -> dict[str, object]:
+            return add_track_block(current, key) if key else add_uploader_block(current, target)
+
+        result = await self.bot.blocklist_store.update(_mutate)
+        log.info("Blocked %r via chat by %s (%s)", target, ctx.chatter.display_name, ctx.chatter.id)
+        tracks, uploaders = blocklist_counts(result)
+        kind = "track" if key else f"uploader {target!r}"
+        reply = f"Blocked that {kind}. ({tracks} tracks, {uploaders} uploaders blocked)"
+        if target.lower().startswith(("http://", "https://")) and not looks_like_a_single_track(target, key):
+            reply += " (Doesn't look like a single track link, so this won't match anything by URL.)"
+
+        if key:
+            purged = self.bot.player.purge_pending(lambda r: normalize_track_key(r.webpage_url) == key)
+            if purged:
+                noun = "copy" if len(purged) == 1 else "copies"
+                reply += f" Also removed {len(purged)} already-queued {noun} of it."
+
+        await ctx.reply(reply)
+
+    @commands.is_moderator()
+    @commands.command(name="unblock")
+    async def unblock(self, ctx: commands.Context, *, args: str) -> None:
+        """Mod-only: reverses !block for a track (by URL) or uploader (by
+        name)."""
+        target = args.strip()
+        if not target:
+            await ctx.reply(USAGE["unblock"])
+            return
+        key = normalize_track_key(target)
+
+        def _mutate(current: dict[str, object]) -> dict[str, object]:
+            return remove_track_block(current, key) if key else remove_uploader_block(current, target)
+
+        result = await self.bot.blocklist_store.update(_mutate)
+        log.info("Unblocked %r via chat by %s (%s)", target, ctx.chatter.display_name, ctx.chatter.id)
+        tracks, uploaders = blocklist_counts(result)
+        await ctx.reply(f"Unblocked. ({tracks} tracks, {uploaders} uploaders still blocked)")
+
+    @commands.is_moderator()
+    @commands.command(name="blocklist")
+    async def blocklist_cmd(self, ctx: commands.Context) -> None:
+        """Mod-only: shows how many tracks/uploaders are currently blocked
+        (not the full list — that can get long for chat)."""
+        tracks, uploaders = blocklist_counts(await self.bot.blocklist_store.read())
+        await ctx.reply(f"{tracks} track(s) and {uploaders} uploader(s) currently blocked.")
+
+    @commands.is_moderator()
+    @commands.command(name="clearqueue")
+    async def clear_queue(self, ctx: commands.Context) -> None:
+        """Mod-only: empties the queue. Doesn't touch whatever's currently
+        playing — use !skip for that."""
+        removed = self.bot.player.purge_pending(lambda r: True)
+        if not removed:
+            await ctx.reply("Queue's already empty.")
+            return
+        await ctx.reply(f"Cleared {len(removed)} queued request(s).")

@@ -15,6 +15,7 @@ import yt_dlp
 
 from twitch_radio.config import DATA_DIR, Settings
 from twitch_radio.models import Track
+from twitch_radio.telemetry import counters
 
 log = logging.getLogger(__name__)
 
@@ -101,6 +102,7 @@ _FAST_PLAYER_CLIENT: tuple[str, ...] = ("visionos",)
 _FAST_JS_RUNTIMES: dict[str, dict[str, str]] = {"quickjs": {}}
 
 _FAST_EXTRACT_TIMEOUT_SECONDS = 15.0
+_RADIO_MIX_TIMEOUT_SECONDS = 15.0
 
 
 def _is_allowed_url(url: str) -> bool:
@@ -369,6 +371,40 @@ class Resolver:
         log.debug("Resolve for %r took %.1fs.", query, time.monotonic() - start)
         return info
 
+    def _extract_flat_sync(self, url: str, options: dict[str, Any]) -> dict[str, Any]:
+        # Fresh YoutubeDL, not the reused thread-local instance above — flat
+        # mode does no JS-challenge solving at all (see resolve_radio_mix's
+        # docstring), so there's no per-thread signature cache worth
+        # preserving here, and mixing this options shape into the
+        # fast/fallback thread-local slots would complicate _get_ytdl_options
+        # for no benefit.
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+        return info if isinstance(info, dict) else {}
+
+    async def resolve_radio_mix(self, mix_url: str) -> list[dict[str, Any]]:
+        """Flat-extracts a YouTube 'watch?v=X&list=RDX' Mix/Radio playlist —
+        YouTube's own auto-generated "more like this" queue, reused here
+        instead of building a recommendation engine from scratch. extract_flat
+        skips per-entry format resolution, so unlike a real resolve this
+        needs no JS-runtime call at all — cheaper than even the fast path
+        above. Returns [] on any failure (no mix available, network error);
+        callers treat that as "no suggestion" and fall back to silence,
+        same best-effort philosophy as warm_up()/prefetch.
+        """
+        loop = asyncio.get_running_loop()
+        options = {**self._build_options(), "extract_flat": "in_playlist", "playlist_items": "1-15"}
+        async with self._semaphore:
+            try:
+                info = await asyncio.wait_for(
+                    loop.run_in_executor(self._executor, functools.partial(self._extract_flat_sync, mix_url, options)),
+                    timeout=_RADIO_MIX_TIMEOUT_SECONDS,
+                )
+            except (TimeoutError, yt_dlp.utils.DownloadError):
+                return []
+        entries = info.get("entries") if isinstance(info, dict) else None
+        return [e for e in (entries or []) if e]
+
     def _query_for(self, raw: str) -> str:
         raw = raw.strip()
         if _URL_RE.match(raw):
@@ -453,7 +489,12 @@ class Resolver:
         is deliberately NOT baked in here; resolve() applies it per-caller via
         dataclasses.replace() on the shared result.
         """
-        info = await self._extract_info(self._query_for(query))
+        try:
+            info = await self._extract_info(self._query_for(query))
+        except Exception:
+            counters.record("resolve_failure")
+            raise
+        counters.record("resolve_success")
 
         # A bare "ytsearchN:" query wraps its one hit in an "entries" list;
         # a direct URL resolves straight to the item itself. entries == []

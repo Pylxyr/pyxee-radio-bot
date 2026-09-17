@@ -9,8 +9,11 @@ from twitch_radio.admin_server import run_admin_server
 from twitch_radio.player import RadioPlayer
 from twitch_radio.chatbot import TwitchChatBot
 from twitch_radio.config import Settings, load_settings
+from twitch_radio.db import Database
 from twitch_radio.extraction import Resolver
+from twitch_radio.radio import RadioSuggester
 from twitch_radio.store import JsonStore
+from twitch_radio.toggles import FeatureToggles
 from twitch_radio.tunables import TwitchTunables
 
 _bg_tasks: set[asyncio.Task[object]] = set()
@@ -41,6 +44,9 @@ async def _async_run(settings: Settings) -> None:
     tunables_store = JsonStore(settings.tunables_path)
     blocklist_store = JsonStore(settings.blocklist_path)
     specs_store = JsonStore(settings.specs_path)
+    toggles_store = JsonStore(settings.toggles_path)
+    db = Database(settings.db_path)
+    await db.connect()
 
     # Fire-and-forget: warms up yt-dlp's worker threads (and, once cached,
     # persists across restarts too) before the first real !sr arrives. Never
@@ -56,6 +62,14 @@ async def _async_run(settings: Settings) -> None:
         pause_when_no_listeners=settings.pause_when_no_listeners,
         prefetch_enabled=settings.ytdlp_cache_ttl_seconds > 0,
     )
+    radio_suggester = RadioSuggester(resolver, blocklist_store)
+    player.set_radio_suggester(radio_suggester.suggest)
+
+    async def _radio_enabled() -> bool:
+        toggles = FeatureToggles.from_dict(await toggles_store.read())
+        return toggles.radio_autoplay_enabled
+
+    player.set_radio_enabled_getter(_radio_enabled)
     # Nested try/finally per resource (not one big try around just the chat
     # bot) so a failure acquiring a *later* resource still tears down
     # everything already acquired.
@@ -66,6 +80,8 @@ async def _async_run(settings: Settings) -> None:
             tunables_store=tunables_store,
             blocklist_store=blocklist_store,
             specs_store=specs_store,
+            toggles_store=toggles_store,
+            db=db,
             settings_password=settings.settings_password,
             broadcast_info={
                 "Audio stream": "/stream.mp3",
@@ -88,6 +104,8 @@ async def _async_run(settings: Settings) -> None:
                 tunables_store=tunables_store,
                 blocklist_store=blocklist_store,
                 specs_store=specs_store,
+                toggles_store=toggles_store,
+                db=db,
                 token_storage_path=settings.token_path,
             )
             player.set_track_failure_notifier(bot.announce)
@@ -117,6 +135,7 @@ async def _async_run(settings: Settings) -> None:
     finally:
         await player.stop()
         resolver.close()
+        await db.close()
 
 
 def _load_settings_or_exit() -> Settings:
@@ -168,6 +187,7 @@ def _check_config() -> int:
     )
     token_status = "found" if settings.token_path.exists() else "missing — run OAuth setup before starting"
     print(f"  Token file: {settings.token_path} ({token_status})")
+    print(f"  Community DB: {settings.db_path}")
     print(
         f"  yt-dlp: concurrency={settings.ytdlp_concurrency} "
         f"timeout={settings.ytdlp_extract_timeout_seconds}s "
