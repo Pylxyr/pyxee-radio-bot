@@ -1,5 +1,13 @@
 # Twitch Radio Bot
 
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+">
+  <img src="https://img.shields.io/badge/twitchio-3.3.2-9146FF?logo=twitch&logoColor=white" alt="TwitchIO 3.3.2">
+  <img src="https://img.shields.io/badge/yt--dlp-2026.08.19-FF0000" alt="yt-dlp 2026.08.19">
+  <img src="https://img.shields.io/badge/ffmpeg-required-007808?logo=ffmpeg&logoColor=white" alt="ffmpeg required">
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20Termux-lightgrey" alt="Platform: Linux or Termux">
+</p>
+
 A standalone Twitch chat bot for song requests. `!sr <query>` searches and
 queues a track from **YouTube or SoundCloud** (see [Security](#security) for
 why nothing else is supported), and the queue plays as a continuous MP3
@@ -170,11 +178,11 @@ port 4343.
    ```
    (Skip this on Termux — the bot and browser are the same device.)
 3. In a browser, **as the bot account**, visit:
-   `http://localhost:4343/oauth?scopes=user:read:chat+user:write:chat+user:bot&force_verify=true`
+   `http://localhost:4343/oauth?scopes=user:read:chat+user:write:chat+user:bot+moderator:manage:chat_messages+moderator:read:followers+moderator:manage:shoutouts&force_verify=true`
    Then, in a **separate** browser session, **as the broadcaster account**:
-   `http://localhost:4343/oauth?scopes=channel:bot&force_verify=true`
-   (Optional if the bot account is already a moderator in your channel,
-   but doing it anyway removes that dependency.)
+   `http://localhost:4343/oauth?scopes=channel:bot+channel:read:subscriptions+bits:read+clips:edit+channel:manage:polls&force_verify=true`
+   (`channel:bot` is optional if the bot account is already a moderator in
+   your channel, but doing it anyway removes that dependency.)
 
 Reusing the same already-logged-in session for both steps is the most
 common way this goes wrong — Twitch just authorizes whichever account is
@@ -188,27 +196,31 @@ no restart needed. Tokens save to `data/twitch_tokens.json` and reload on
 every future start; you won't need to repeat this unless that file is
 deleted or Twitch revokes the token.
 
-**Optional extra scope for the moderation filter's delete action:** the
-link/caps chat filter (off by default; see
-[Viewer engagement & moderation](#viewer-engagement--moderation)) can
-warn-only, or also delete the flagged message. Deleting needs
-`moderator:manage:chat_messages`, which the steps above don't request —
-redo step 3's bot-account URL with it appended
-(`...scopes=user:read:chat+user:write:chat+user:bot+moderator:manage:chat_messages&force_verify=true`)
-if you want to enable `filter_delete_enabled`. Skip this if you're happy
-with warn-only, or haven't turned the filter on at all.
+Both URLs above already request every scope this bot ever asks for, so
+there's nothing to come back and redo later no matter which optional
+features you turn on:
 
-**Optional extended scopes for alerts, `!followage`, `!so`, `!clip`, and
-`!poll`:** none of these are needed for the base bot, and each degrades
-gracefully on its own if its scope is missing (a friendly chat reply, not
-a crash), so it's fine to grant some and not others. See
-[Alerts, shoutouts, clips & polls](#alerts-shoutouts-clips--polls) for
-which command needs which scope. To grant all of them at once:
+| Scope | Account | Unlocks |
+|---|---|---|
+| `user:read:chat` + `user:write:chat` + `user:bot` | bot | reading/sending chat — the base bot |
+| `channel:bot` | broadcaster | same, from the broadcaster's side (skippable if the bot's a mod) |
+| `moderator:manage:chat_messages` | bot | `filter_delete_enabled` actually deleting a flagged message |
+| `moderator:read:followers` | bot | `!followage`, follow alerts |
+| `moderator:manage:shoutouts` | bot | `!so`, auto-shoutout on raid |
+| `channel:read:subscriptions` | broadcaster | sub alerts |
+| `bits:read` | broadcaster | cheer alerts |
+| `clips:edit` | broadcaster | `!clip` |
+| `channel:manage:polls` | broadcaster | `!poll` |
 
-- Bot account — redo step 3 with:
-  `...scopes=user:read:chat+user:write:chat+user:bot+moderator:manage:chat_messages+moderator:read:followers+moderator:manage:shoutouts&force_verify=true`
-- Broadcaster account — redo step 4 with:
-  `...scopes=channel:bot+channel:read:subscriptions+bits:read+clips:edit+channel:manage:polls&force_verify=true`
+Granting a scope doesn't turn its feature on by itself — `alerts_enabled`,
+`filter_delete_enabled`, etc. are still off by default and controlled
+separately via `!toggle` or `/settings` (see
+[Alerts, shoutouts, clips & polls](#alerts-shoutouts-clips--polls)); this
+just means flipping one on later never requires touching OAuth again. If
+you'd rather not grant everything upfront, drop whichever scopes you don't
+want from the two URLs above — every feature that needs one degrades to a
+plain "not set up yet" reply instead of an error when its scope is
+missing, so leaving some out is always safe.
 
 ## Adding the stream to OBS
 
@@ -439,32 +451,37 @@ bragging rights.
 The link/caps chat filter is off by default (`link_filter_enabled` /
 `caps_filter_enabled`), warns in chat when triggered, and exempts
 moderators and the broadcaster. `filter_delete_enabled` (also off by
-default) additionally deletes the flagged message, but needs an extra
-OAuth scope the base setup doesn't request — see
-[One-time Twitch authorization](#one-time-twitch-authorization).
+default) additionally deletes the flagged message — the scope it needs is
+already covered by the default OAuth setup (see
+[One-time Twitch authorization](#one-time-twitch-authorization)), so
+turning the toggle on is all that's needed.
 
 ### Alerts, shoutouts, clips & polls
 
-All off/needs-a-scope by default — none of this is required for the base
-bot. One toggle, `alerts_enabled`, gates chat announcements for follows,
-subs (not gift subs — those fire a separate event this bot doesn't
-listen for, to avoid double-announcing one gift as a self-subscribe),
-cheers, and raids, plus an automatic shoutout for whoever raided. Each
-underlying EventSub subscription is attempted independently at startup
-regardless of the toggle (subscribing is side-effect-free; the toggle
-only gates whether an event that arrives gets announced) — raid alerts
-need no extra scope at all, so they work even with none of the optional
-scopes granted; follow/sub/cheer each need their own (see
-[One-time Twitch authorization](#one-time-twitch-authorization)) and
-simply don't fire if that scope isn't there, with no error either way.
+None of this is required for the base bot, and every command/toggle here
+is off by default even though the default OAuth setup already grants the
+scopes for all of it — see
+[One-time Twitch authorization](#one-time-twitch-authorization) for
+exactly which scope backs which feature (and what still works if you
+trimmed some out of those URLs). One toggle, `alerts_enabled`, gates chat
+announcements for follows, subs (not gift subs — those fire a separate
+event this bot doesn't listen for, to avoid double-announcing one gift as
+a self-subscribe), cheers, and raids, plus an automatic shoutout for
+whoever raided. Each underlying EventSub subscription is attempted
+independently at startup regardless of the toggle (subscribing is
+side-effect-free; the toggle only gates whether an event that arrives
+gets announced) — raid alerts need no extra scope at all, so they work
+even if you trimmed every optional scope out; follow/sub/cheer each need
+their own and simply don't fire if that scope isn't there, with no error
+either way.
 
 `!so`, `!followage`, `!clip`, and `!poll` each need one of those same
-optional scopes too, and each gives a plain "not set up yet" reply
-instead of an error if its scope is missing — check the commands table
-above for which scope each needs. A missing scope is remembered after
-the first failed attempt (not re-logged for every subsequent raid or
-command), so turning a feature's toggle on without doing the matching
-OAuth step is harmless, just inert.
+scopes too, and each gives a plain "not set up yet" reply instead of an
+error if its scope is missing — check the commands table above for which
+scope each needs. A missing scope is remembered after the first failed
+attempt (not re-logged for every subsequent raid or command), so turning
+a feature's toggle on without having granted the matching scope is
+harmless either way — just inert until you have.
 
 ### Systemd hardening: `MemoryDenyWriteExecute` and `SystemCallFilter`
 
