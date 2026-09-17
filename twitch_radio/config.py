@@ -154,6 +154,10 @@ class Settings:
     ytdlp_player_client: tuple[str, ...]
     ytdlp_cache_ttl_seconds: int
     ytdlp_pot_provider_url: str | None
+    # "process" (default) runs extraction in long-lived child processes;
+    # "thread" is the original in-process ThreadPoolExecutor path, kept as
+    # an escape hatch. See extraction.py for the trade-off.
+    ytdlp_worker_mode: str
 
     # Logging
     log_level: str
@@ -204,6 +208,11 @@ def load_settings() -> Settings:
     ytdlp_player_client = tuple(c.strip() for c in player_client_raw.split(",") if c.strip())
     _check_player_clients(ytdlp_player_client, cookies_configured=cookies_path is not None)
 
+    worker_mode = os.getenv("YTDLP_WORKER_MODE", "process").strip().lower() or "process"
+    if worker_mode not in ("process", "thread"):
+        print(f"WARNING: YTDLP_WORKER_MODE={worker_mode!r} is not 'process' or 'thread' — using 'process'.")
+        worker_mode = "process"
+
     nowplaying_host = os.getenv("TWITCH_NOWPLAYING_HOST", "127.0.0.1").strip() or "127.0.0.1"
     settings_password = os.getenv("TWITCH_SETTINGS_PASSWORD", "").strip() or None
     if nowplaying_host not in ("127.0.0.1", "localhost") and settings_password is None:
@@ -243,6 +252,7 @@ def load_settings() -> Settings:
         # Points yt-dlp's PO-token plugin at a bgutil-ytdlp-pot-provider
         # instance, if one's set up (see README). None is a no-op.
         ytdlp_pot_provider_url=os.getenv("YTDLP_POT_PROVIDER_URL", "").strip() or None,
+        ytdlp_worker_mode=worker_mode,
         log_level=_log_level_env("LOG_LEVEL", "INFO"),
         log_to_file=_bool_env("LOG_TO_FILE", True),
         log_dir=LOG_DIR,

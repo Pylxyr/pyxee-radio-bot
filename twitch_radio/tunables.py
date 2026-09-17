@@ -19,6 +19,40 @@ TUNABLE_BOUNDS: dict[str, tuple[int, int]] = {
 }
 
 
+# Label + one-line help for each tunable, shown on the /settings form.
+# Here rather than hand-written into admin_server.py's HTML so that adding a
+# tunable means touching exactly one file: TUNABLE_BOUNDS gets the range,
+# this gets the wording, and the form renders itself from both. The previous
+# arrangement had the inputs typed out in the page template, so a new key
+# silently never appeared on the page.
+TUNABLE_LABELS: dict[str, tuple[str, str]] = {
+    "max_pending_per_chatter": (
+        "Max pending requests per chatter",
+        "How many queued songs one viewer can have waiting at once.",
+    ),
+    "request_cooldown_seconds": (
+        "Request cooldown",
+        "Seconds a viewer must wait between !sr commands. 0 disables the cooldown.",
+    ),
+    "queue_cap": (
+        "Queue cap",
+        "Total requests allowed in the queue before !sr starts turning people away.",
+    ),
+    "max_request_duration_seconds": (
+        "Max track length",
+        "Seconds. Anything longer is refused at request time and skipped if it grows past this later.",
+    ),
+    "vote_skip_threshold": (
+        "Vote-skip threshold",
+        "Unique !voteskip voters needed to skip the current track.",
+    ),
+    "points_per_active_minute": (
+        "Points per active minute",
+        "Awarded to chatters active while live. 0 switches the points economy off.",
+    ),
+}
+
+
 @dataclass(slots=True)
 class TwitchTunables:
     """Request-limit knobs adjustable at runtime from the /settings page or

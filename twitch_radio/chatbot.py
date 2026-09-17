@@ -84,7 +84,7 @@ import re
 import time
 from collections import Counter
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from twitchio import eventsub
 from twitchio.exceptions import HTTPException, TwitchioException

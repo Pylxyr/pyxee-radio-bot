@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import functools
+import json
 import logging
+import os
 import re
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -13,7 +17,7 @@ from urllib.parse import urlsplit
 
 import yt_dlp
 
-from twitch_radio.config import DATA_DIR, Settings
+from twitch_radio.config import BASE_DIR, DATA_DIR, Settings
 from twitch_radio.models import Track
 from twitch_radio.telemetry import counters
 
@@ -104,6 +108,16 @@ _FAST_JS_RUNTIMES: dict[str, dict[str, str]] = {"quickjs": {}}
 _FAST_EXTRACT_TIMEOUT_SECONDS = 15.0
 _RADIO_MIX_TIMEOUT_SECONDS = 15.0
 
+# How long a freshly spawned extraction worker gets to import yt_dlp and
+# announce itself. The import alone is most of a second on a VPS and can be
+# several on a phone, so this is deliberately generous — it only ever costs
+# anything when something is genuinely wrong.
+_WORKER_START_TIMEOUT_SECONDS = 60.0
+# Grace period between SIGTERM and SIGKILL when recycling a worker. A wedged
+# worker is wedged inside yt-dlp or a JS runtime and will not be returning,
+# so this stays short.
+_WORKER_TERM_GRACE_SECONDS = 3.0
+
 
 def _is_allowed_url(url: str) -> bool:
     try:
@@ -123,6 +137,365 @@ class UnsupportedSourceError(DownloadError):
     specific reply instead of a generic "couldn't fetch that"."""
 
 
+class ExtractionBackend:
+    """Where an extraction physically runs.
+
+    Two implementations below, chosen by YTDLP_WORKER_MODE. They present the
+    same surface to Resolver, which is the whole point: the fast/fallback
+    client dance, the caching, the request coalescing and the Track building
+    all live in Resolver and are identical either way, so switching backends
+    on a live deployment changes only the execution model.
+
+    `extract` must raise DownloadError for a timeout or a yt-dlp failure and
+    return a (possibly empty) info dict otherwise.
+    """
+
+    async def extract(self, query: str, options: dict[str, Any], timeout: float) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def warm(self, query: str, options: dict[str, Any], concurrency: int) -> None:
+        raise NotImplementedError
+
+    async def aclose(self) -> None:
+        raise NotImplementedError
+
+
+class ThreadBackend(ExtractionBackend):
+    """The original in-process model: yt-dlp runs on a ThreadPoolExecutor,
+    with a YoutubeDL instance reused per (thread, options) so the solved
+    YouTube signature challenge survives between calls.
+
+    Retained as an escape hatch rather than deleted, because it has no
+    dependency on being able to spawn child processes — which is the sort of
+    thing a hardened container or an unusual Termux setup can take away.
+    Its known limitation is unchanged and is why ProcessBackend exists: a
+    timed-out wait_for() cancels only the *wait*, never the thread, so a
+    wedged extraction occupies a worker for as long as it feels like.
+    """
+
+    def __init__(self, concurrency: int) -> None:
+        self._semaphore = asyncio.Semaphore(concurrency)
+        # A couple of threads wider than the semaphore: see the class
+        # docstring — the extra headroom buys margin before repeated hangs
+        # starve every future request.
+        self._executor = ThreadPoolExecutor(max_workers=concurrency + 2, thread_name_prefix="ytdlp")
+        self._tlocal = threading.local()
+
+    def _extract_sync(self, query: str, options: dict[str, Any]) -> dict[str, Any]:
+        # Keyed by the options themselves rather than a fast/slow flag, so
+        # the radio-mix lookup's third options shape gets its own instance
+        # too instead of thrashing one of the other two.
+        instances: dict[str, Any] | None = getattr(self._tlocal, "instances", None)
+        if instances is None:
+            instances = {}
+            self._tlocal.instances = instances
+        key = json.dumps(options, sort_keys=True)
+        ydl = instances.get(key)
+        if ydl is None:
+            ydl = yt_dlp.YoutubeDL(options)
+            instances[key] = ydl
+        info = ydl.extract_info(query, download=False)
+        return info if isinstance(info, dict) else {}
+
+    async def extract(self, query: str, options: dict[str, Any], timeout: float) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    loop.run_in_executor(self._executor, functools.partial(self._extract_sync, query, options)),
+                    timeout=timeout,
+                )
+            except TimeoutError as exc:
+                raise DownloadError(f"Timed out resolving {query!r}") from exc
+            except yt_dlp.utils.DownloadError as exc:
+                raise DownloadError(str(exc)) from exc
+
+    async def warm(self, query: str, options: dict[str, Any], concurrency: int) -> None:
+        async def _one() -> None:
+            with contextlib.suppress(Exception):
+                await self.extract(query, options, _FAST_EXTRACT_TIMEOUT_SECONDS * 4)
+
+        await asyncio.gather(*(_one() for _ in range(concurrency)))
+
+    async def aclose(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+
+class _WorkerCrashed(Exception):
+    """The worker died, desynchronised, or answered the wrong request id —
+    anything where the right response is to recycle it rather than trust
+    whatever came back."""
+
+
+class _ExtractionWorker:
+    """One `python -m twitch_radio.extractor_worker` child process.
+
+    Handles exactly one request at a time; ProcessBackend's idle pool is
+    what guarantees exclusive access, which is what lets request() read the
+    reply inline instead of demultiplexing by id. The id is still checked —
+    a mismatch means the framing has desynchronised and the process is no
+    longer trustworthy.
+    """
+
+    def __init__(self, index: int) -> None:
+        self._index = index
+        self._proc: asyncio.subprocess.Process | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
+        self._next_id = 0
+
+    @property
+    def pid(self) -> int | None:
+        return self._proc.pid if self._proc is not None else None
+
+    async def start(self) -> None:
+        env = dict(os.environ)
+        # The worker frames its protocol as UTF-8 JSON lines and must not
+        # buffer them; inheriting a C locale or Python's default block
+        # buffering on a pipe would deadlock the very first request.
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUNBUFFERED"] = "1"
+        # Guarantees `-m twitch_radio.extractor_worker` resolves regardless
+        # of what the service's working directory happens to be.
+        existing_path = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = f"{BASE_DIR}{os.pathsep}{existing_path}" if existing_path else str(BASE_DIR)
+        self._proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "twitch_radio.extractor_worker",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(BASE_DIR),
+            env=env,
+            # Default StreamReader limit is 64 KiB per line. Projected
+            # responses are far smaller, but a radio mix of long titles plus
+            # signed CDN URLs is not nothing, and overflowing the limit
+            # would surface as a confusing LimitOverrunError rather than a
+            # clean failure.
+            limit=1024 * 1024,
+        )
+        self._stderr_task = asyncio.create_task(
+            self._drain_stderr(), name=f"ytdlp-worker-{self._index}-stderr"
+        )
+        ready = await asyncio.wait_for(self._read_json(), timeout=_WORKER_START_TIMEOUT_SECONDS)
+        if not ready.get("ready"):
+            raise _WorkerCrashed(f"worker {self._index} sent {ready!r} instead of a ready banner")
+        log.debug("Extraction worker %d ready (pid=%s).", self._index, self.pid)
+
+    async def _drain_stderr(self) -> None:
+        """yt-dlp's warnings, and anything the worker's redirected sys.stdout
+        emits, land here. This has to keep reading whether or not anyone
+        cares about the content: an undrained stderr pipe fills and blocks
+        the worker mid-extraction."""
+        assert self._proc is not None and self._proc.stderr is not None
+        try:
+            while True:
+                line = await self._proc.stderr.readline()
+                if not line:
+                    return
+                text = line.decode("utf-8", "replace").rstrip()
+                if text:
+                    log.debug("[ytdlp-worker-%d] %s", self._index, text)
+        except (asyncio.CancelledError, ValueError):
+            raise
+        except Exception:
+            return
+
+    async def _read_json(self) -> dict[str, Any]:
+        assert self._proc is not None and self._proc.stdout is not None
+        line = await self._proc.stdout.readline()
+        if not line:
+            code = self._proc.returncode
+            raise _WorkerCrashed(f"worker {self._index} closed stdout (exit code {code})")
+        try:
+            payload = json.loads(line.decode("utf-8", "replace"))
+        except ValueError as exc:
+            raise _WorkerCrashed(f"worker {self._index} sent unparseable framing") from exc
+        if not isinstance(payload, dict):
+            raise _WorkerCrashed(f"worker {self._index} sent a non-object response")
+        return payload
+
+    async def request(self, query: str, options: dict[str, Any], timeout: float) -> dict[str, Any]:
+        assert self._proc is not None and self._proc.stdin is not None
+        self._next_id += 1
+        request_id = self._next_id
+        body = json.dumps({"id": request_id, "query": query, "options": options}, ensure_ascii=True)
+        try:
+            self._proc.stdin.write(body.encode("utf-8") + b"\n")
+            await self._proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            raise _WorkerCrashed(f"worker {self._index} stdin closed") from exc
+        response = await asyncio.wait_for(self._read_json(), timeout=timeout)
+        if response.get("id") != request_id:
+            raise _WorkerCrashed(
+                f"worker {self._index} answered id {response.get('id')!r}, expected {request_id}"
+            )
+        if response.get("ok"):
+            info = response.get("info")
+            return info if isinstance(info, dict) else {}
+        error = str(response.get("error") or "unknown extraction error")
+        # Both kinds become DownloadError, matching what the in-process path
+        # raised; the distinction is kept in the message for the log.
+        raise DownloadError(error)
+
+    async def kill(self) -> None:
+        """Terminate, then kill. This is the capability the thread backend
+        structurally cannot offer: a wedged extraction actually stops
+        consuming CPU and memory here instead of occupying a worker slot for
+        the rest of the process's life."""
+        proc = self._proc
+        self._proc = None
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._stderr_task
+            self._stderr_task = None
+        if proc is None:
+            return
+        # Close stdin explicitly. Without this the subprocess transport is
+        # left holding an open pipe, and its __del__ tries to write_eof()
+        # during interpreter teardown — after asyncio.run() has closed the
+        # loop — which surfaces as a "RuntimeError: Event loop is closed"
+        # traceback on every clean shutdown. Closing it here also gives the
+        # worker's `for line in sys.stdin` loop a clean EOF to exit on, so
+        # an idle worker usually never needs the SIGTERM below at all.
+        if proc.stdin is not None:
+            with contextlib.suppress(Exception):
+                proc.stdin.close()
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_WORKER_TERM_GRACE_SECONDS)
+        except TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+
+
+class ProcessBackend(ExtractionBackend):
+    """A pool of long-lived extraction worker processes.
+
+    Three things this buys over ThreadBackend, in rough order of how much
+    they matter on the deployments this bot targets:
+
+    1. The audio path stops sharing an interpreter with yt-dlp. Extraction
+       is overwhelmingly GIL-bound Python — regex over the player response,
+       JSON parsing of a multi-megabyte InnerTube blob, format sorting — and
+       only the JS-runtime subprocess wait releases the GIL. Running that on
+       the same interpreter as RadioPlayer's real-time feed loop is why
+       resolves and stream stutter correlate.
+    2. Timeouts become real. wait_for on a thread cancels the wait; here it
+       kills the process.
+    3. A runaway extraction is charged to its own process, so the systemd
+       unit's MemoryMax bounds it without taking the bot down with it.
+
+    The cost is losing the in-memory signature cache when a worker is
+    recycled — which is acceptable, because the expensive half (the
+    signature cipher) is persisted to disk under `cachedir` and shared
+    across processes anyway, and the "n" challenge was never cacheable to
+    begin with.
+    """
+
+    def __init__(self, size: int) -> None:
+        self._size = size
+        self._idle: asyncio.Queue[_ExtractionWorker] = asyncio.Queue()
+        self._all: list[_ExtractionWorker] = []
+        self._start_lock = asyncio.Lock()
+        self._started = False
+        self._closing = False
+        self._next_index = 0
+
+    async def _spawn(self) -> _ExtractionWorker:
+        self._next_index += 1
+        worker = _ExtractionWorker(self._next_index)
+        await worker.start()
+        self._all.append(worker)
+        return worker
+
+    async def start(self) -> None:
+        """Spawns the pool. Raises if not a single worker comes up, which is
+        Resolver's signal to fall back to ThreadBackend rather than leave
+        song requests permanently broken."""
+        async with self._start_lock:
+            if self._started:
+                return
+            spawned = 0
+            for _ in range(self._size):
+                try:
+                    self._idle.put_nowait(await self._spawn())
+                    spawned += 1
+                except Exception:
+                    log.warning("Extraction worker failed to start.", exc_info=True)
+            if spawned == 0:
+                raise RuntimeError("no extraction workers could be started")
+            if spawned < self._size:
+                log.warning("Only %d of %d extraction workers started.", spawned, self._size)
+            self._started = True
+            log.info("Extraction worker pool ready (%d process(es)).", spawned)
+
+    async def _ensure_started(self) -> None:
+        if not self._started:
+            await self.start()
+
+    async def _recycle(self, worker: _ExtractionWorker) -> None:
+        """Kill a worker and put a fresh one in its place, so the pool never
+        silently shrinks after a hang. If the replacement can't be spawned,
+        the pool runs one narrower rather than failing the request that
+        happened to notice."""
+        with contextlib.suppress(ValueError):
+            self._all.remove(worker)
+        await worker.kill()
+        if self._closing:
+            return
+        try:
+            self._idle.put_nowait(await self._spawn())
+        except Exception:
+            log.warning("Couldn't replace a recycled extraction worker.", exc_info=True)
+
+    async def extract(self, query: str, options: dict[str, Any], timeout: float) -> dict[str, Any]:
+        await self._ensure_started()
+        worker = await self._idle.get()
+        try:
+            info = await worker.request(query, options, timeout)
+        except TimeoutError as exc:
+            log.info("Extraction worker %s timed out on %r — recycling it.", worker.pid, query)
+            await self._recycle(worker)
+            raise DownloadError(f"Timed out resolving {query!r}") from exc
+        except _WorkerCrashed as exc:
+            log.warning("Extraction worker problem (%s) — recycling it.", exc)
+            await self._recycle(worker)
+            raise DownloadError(str(exc)) from exc
+        except asyncio.CancelledError:
+            # The worker is still mid-extraction and its eventual reply would
+            # desynchronise the next caller's read, so it can't go back in
+            # the pool.
+            await self._recycle(worker)
+            raise
+        except DownloadError:
+            # A clean "yt-dlp couldn't do it" — the worker is fine.
+            self._idle.put_nowait(worker)
+            raise
+        else:
+            self._idle.put_nowait(worker)
+            return info
+
+    async def warm(self, query: str, options: dict[str, Any], concurrency: int) -> None:
+        await self._ensure_started()
+
+        async def _one() -> None:
+            with contextlib.suppress(Exception):
+                await self.extract(query, options, _FAST_EXTRACT_TIMEOUT_SECONDS * 4)
+
+        # One per worker: each has its own interpreter and therefore its own
+        # cold in-memory caches.
+        await asyncio.gather(*(_one() for _ in range(max(1, len(self._all)))))
+
+    async def aclose(self) -> None:
+        self._closing = True
+        await asyncio.gather(*(w.kill() for w in list(self._all)), return_exceptions=True)
+        self._all.clear()
+
+
 class Resolver:
     """Turns a !sr query (URL or search text) into a playable Track.
 
@@ -140,16 +513,16 @@ class Resolver:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._semaphore = asyncio.Semaphore(settings.ytdlp_concurrency)
-        # A couple of threads wider than the semaphore: a timed-out wait_for()
-        # only cancels our *wait*, not the underlying thread (ThreadPoolExecutor
-        # can't preempt it), so a hung extraction keeps occupying a worker
-        # indefinitely. The extra headroom buys margin before repeated hangs
-        # starve every future request. A real fix would run extraction
-        # out-of-process so a hung one can actually be killed.
-        self._executor = ThreadPoolExecutor(
-            max_workers=settings.ytdlp_concurrency + 2, thread_name_prefix="ytdlp"
-        )
+        # Where extraction actually runs. "process" is the default and is
+        # the one that makes a timeout able to kill the work it timed out
+        # on; "thread" is the original in-process path, kept selectable via
+        # YTDLP_WORKER_MODE. Everything below this line is identical either
+        # way — see ExtractionBackend.
+        self._backend: ExtractionBackend
+        if settings.ytdlp_worker_mode == "thread":
+            self._backend = ThreadBackend(settings.ytdlp_concurrency)
+        else:
+            self._backend = ProcessBackend(settings.ytdlp_concurrency)
         # A !sr resolves once in chat (to confirm/queue it) and again in the
         # player right before it plays — see resolve()'s docstring. Keyed by
         # both the resolved webpage_url (shared by those two call sites) and,
@@ -202,19 +575,18 @@ class Resolver:
 
         self._ytdl_options: dict[str, Any] | None = None
         self._fast_ytdl_options: dict[str, Any] | None = None
-        # A *reused*, thread-local YoutubeDL instance per worker thread
-        # rather than a fresh one per call — YouTube's per-player-version JS
-        # signature challenge is solved once and cached on the extractor
-        # instance itself. A fresh YoutubeDL() every call throws that away,
-        # so the ~6s Deno JS-challenge solve would rerun from scratch on
-        # every !sr, even for a song played minutes earlier. Fast and
-        # fallback attempts can differ in player_client and/or js_runtimes
-        # (see _get_ytdl_options), so each thread gets up to two instances
-        # (one per attribute below), not one.
-        self._ytdl_tlocal = threading.local()
+        # A *reused* YoutubeDL instance per (worker, options) rather than a
+        # fresh one per call — YouTube's per-player-version JS signature
+        # challenge is solved once and cached on the extractor instance
+        # itself. A fresh YoutubeDL() every call throws that away, so the
+        # ~6s Deno JS-challenge solve would rerun from scratch on every !sr,
+        # even for a song played minutes earlier. Both backends do this;
+        # they differ only in what a "worker" is (a thread vs a process).
 
-    def close(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
+    async def aclose(self) -> None:
+        """Async because ProcessBackend has child processes to reap. Called
+        from bot.py's teardown after the player and HTTP surface are down."""
+        await self._backend.aclose()
 
     async def warm_up(self) -> None:
         """Best-effort: resolves a throwaway video on every worker thread
@@ -227,14 +599,39 @@ class Resolver:
         cost itself, exactly as if this didn't run at all.
         """
         start = time.monotonic()
-
-        async def _one() -> None:
+        # Starting the backend is part of warming up: for ProcessBackend
+        # that means spawning the pool and paying the yt_dlp import cost in
+        # every child now, rather than on the first real !sr. A failure to
+        # start the process pool at all falls back to the in-process path
+        # instead of leaving song requests broken.
+        if isinstance(self._backend, ProcessBackend):
             try:
-                await self._extract_info(self._WARMUP_QUERY)
+                await self._backend.start()
             except Exception:
-                log.debug("Resolver warm-up task failed (non-fatal).", exc_info=True)
+                log.warning(
+                    "Couldn't start the extraction worker pool — falling back to in-process "
+                    "threads for this run (set YTDLP_WORKER_MODE=thread to make that the "
+                    "default and silence this).",
+                    exc_info=True,
+                )
+                with contextlib.suppress(Exception):
+                    await self._backend.aclose()
+                self._backend = ThreadBackend(self._settings.ytdlp_concurrency)
 
-        await asyncio.gather(*(_one() for _ in range(self._settings.ytdlp_concurrency)))
+        try:
+            # fast=False deliberately, even when the fast path is enabled.
+            # The whole point of warming up is to populate the on-disk
+            # signature-challenge cache (see _build_options's `cachedir`
+            # note), and _FAST_PLAYER_CLIENT is yt-dlp's JS-less client —
+            # it skips the challenge entirely, so warming through it would
+            # leave the expensive thing exactly as cold as it started.
+            await self._backend.warm(
+                self._WARMUP_QUERY,
+                self._get_ytdl_options(fast=False),
+                self._settings.ytdlp_concurrency,
+            )
+        except Exception:
+            log.debug("Resolver warm-up failed (non-fatal).", exc_info=True)
         log.info("Resolver warm-up finished in %.1fs.", time.monotonic() - start)
 
     def _build_options(
@@ -307,31 +704,8 @@ class Resolver:
             self._ytdl_options = self._build_options()
         return self._ytdl_options
 
-    def _extract_sync(self, query: str, *, fast: bool) -> dict[str, Any]:
-        # Reused per-thread rather than `with yt_dlp.YoutubeDL(...) as ydl:`
-        # — that context-manager form discards the in-memory signature
-        # cache on every call (see _ytdl_tlocal above).
-        tlocal = self._ytdl_tlocal
-        attr = "fast_instance" if fast else "instance"
-        ydl = getattr(tlocal, attr, None)
-        if ydl is None:
-            ydl = yt_dlp.YoutubeDL(self._get_ytdl_options(fast=fast))
-            setattr(tlocal, attr, ydl)
-        info = ydl.extract_info(query, download=False)
-        return info if isinstance(info, dict) else {}
-
     async def _extract_info_via(self, query: str, *, fast: bool, timeout: float) -> dict[str, Any]:
-        loop = asyncio.get_running_loop()
-        async with self._semaphore:
-            try:
-                info = await asyncio.wait_for(
-                    loop.run_in_executor(self._executor, functools.partial(self._extract_sync, query, fast=fast)),
-                    timeout=timeout,
-                )
-            except TimeoutError as exc:
-                raise DownloadError(f"Timed out resolving {query!r}") from exc
-            except yt_dlp.utils.DownloadError as exc:
-                raise DownloadError(str(exc)) from exc
+        info = await self._backend.extract(query, self._get_ytdl_options(fast=fast), timeout)
         if not info:
             raise DownloadError(f"yt-dlp returned nothing for {query!r}")
         return info
@@ -371,17 +745,6 @@ class Resolver:
         log.debug("Resolve for %r took %.1fs.", query, time.monotonic() - start)
         return info
 
-    def _extract_flat_sync(self, url: str, options: dict[str, Any]) -> dict[str, Any]:
-        # Fresh YoutubeDL, not the reused thread-local instance above — flat
-        # mode does no JS-challenge solving at all (see resolve_radio_mix's
-        # docstring), so there's no per-thread signature cache worth
-        # preserving here, and mixing this options shape into the
-        # fast/fallback thread-local slots would complicate _get_ytdl_options
-        # for no benefit.
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=False)
-        return info if isinstance(info, dict) else {}
-
     async def resolve_radio_mix(self, mix_url: str) -> list[dict[str, Any]]:
         """Flat-extracts a YouTube 'watch?v=X&list=RDX' Mix/Radio playlist —
         YouTube's own auto-generated "more like this" queue, reused here
@@ -392,7 +755,6 @@ class Resolver:
         callers treat that as "no suggestion" and fall back to silence,
         same best-effort philosophy as warm_up()/prefetch.
         """
-        loop = asyncio.get_running_loop()
         # noplaylist=True from _build_options() is correct for a normal
         # !sr resolve (a video URL that happens to sit in some playlist
         # should still resolve to just that one video) — but it's fatal
@@ -408,21 +770,17 @@ class Resolver:
             "playlist_items": "1-15",
             "noplaylist": False,
         }
-        async with self._semaphore:
-            try:
-                info = await asyncio.wait_for(
-                    loop.run_in_executor(self._executor, functools.partial(self._extract_flat_sync, mix_url, options)),
-                    timeout=_RADIO_MIX_TIMEOUT_SECONDS,
-                )
-            except Exception:
-                # Broad on purpose, matching the docstring above ("[] on
-                # any failure") — narrowly catching just TimeoutError/
-                # DownloadError missed real cases (e.g. ExtractorError for
-                # "no mix available"), which would otherwise propagate
-                # out of a background radio-fill task and just look like
-                # autoplay silently doing nothing, with no logged reason.
-                log.debug("Radio mix extraction failed for %s (non-fatal).", mix_url, exc_info=True)
-                return []
+        try:
+            info = await self._backend.extract(mix_url, options, _RADIO_MIX_TIMEOUT_SECONDS)
+        except Exception:
+            # Broad on purpose, matching the docstring above ("[] on
+            # any failure") — narrowly catching just TimeoutError/
+            # DownloadError missed real cases (e.g. ExtractorError for
+            # "no mix available"), which would otherwise propagate
+            # out of a background radio-fill task and just look like
+            # autoplay silently doing nothing, with no logged reason.
+            log.debug("Radio mix extraction failed for %s (non-fatal).", mix_url, exc_info=True)
+            return []
         entries = info.get("entries") if isinstance(info, dict) else None
         return [e for e in (entries or []) if e]
 
