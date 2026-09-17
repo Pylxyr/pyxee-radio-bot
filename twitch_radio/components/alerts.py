@@ -77,15 +77,15 @@ class AlertsComponent(commands.Component):
         docstring); without it this always reports failure."""
         username = username.strip().lstrip("@").lower()
         if not username:
-            await ctx.reply("Usage: !so <username>")
+            await self.bot.safe_reply(ctx, "Usage: !so <username>")
             return
         user_id = await self.bot.resolve_user_id(username)
         if user_id is None:
-            await ctx.reply(f"Couldn't find a Twitch user named {username!r}.")
+            await self.bot.safe_reply(ctx, f"Couldn't find a Twitch user named {username!r}.")
             return
         if await self.bot.try_shoutout(user_id, username):
-            await ctx.reply(f"Shouting out {username}!")
+            await self.bot.safe_reply(ctx, f"Shouting out {username}!")
         else:
-            await ctx.reply(
+            await self.bot.safe_reply(ctx, 
                 "Couldn't send that shoutout — check the bot's log (likely a missing scope or Twitch's cooldown)."
             )
