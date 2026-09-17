@@ -20,19 +20,67 @@ class JsonStore:
     from the chat bot's commands and the /settings HTTP handler, both on the
     same event loop), and writes are write-temp-then-rename so a crash
     mid-write can never leave a corrupt or half-written file behind.
+
+    Reads are served from an in-memory copy, revalidated against the file's
+    (mtime_ns, size) on every call. That matters because the hottest caller
+    is the per-chat-message filter check in chatbot.py: without this, every
+    single chat message cost a lock acquisition, a thread-pool dispatch, an
+    open(), and a json.load() to answer "are the filters on?", which is
+    almost always the same two booleans as the message before it. A stat()
+    is cheap enough to do inline on the event loop and — unlike a plain
+    time-based cache — keeps a hand-edited tunables.json/blocklist.json
+    taking effect immediately, which several other modules' error handling
+    explicitly assumes is possible.
     """
 
     def __init__(self, path: Path) -> None:
         self._path = path
         self._lock = asyncio.Lock()
+        self._cache: dict[str, Any] | None = None
+        self._cache_key: tuple[int, int] | None = None
+
+    def _stat_key(self) -> tuple[int, int] | None:
+        """(mtime_ns, size), or None if the file doesn't exist yet. Both,
+        not just mtime: some filesystems have coarse timestamp granularity,
+        and a same-millisecond rewrite of a different length still changes
+        the size."""
+        try:
+            st = self._path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def invalidate(self) -> None:
+        """Drops the cached copy — next read() goes to disk unconditionally.
+        Not needed for writes through this class (they refresh the cache
+        themselves); here for a caller that knows the file changed underneath
+        it in a way stat() can't see."""
+        self._cache = None
+        self._cache_key = None
 
     async def read(self) -> dict[str, Any]:
         async with self._lock:
-            return await asyncio.to_thread(self._read_sync)
+            key = self._stat_key()
+            if self._cache is not None and key == self._cache_key:
+                # Shallow copy: callers treat the result as read-only and
+                # build new containers for any mutation (see blocklist.py's
+                # add_*/remove_* helpers), but handing out the cached dict
+                # itself would make an accidental in-place edit stick
+                # invisibly until the next file change.
+                return dict(self._cache)
+            data = await asyncio.to_thread(self._read_sync)
+            self._cache = data
+            # Re-stat *after* reading, not before: a write that landed while
+            # the read was in flight would otherwise be cached under the
+            # pre-write key and served stale until the next change.
+            self._cache_key = self._stat_key()
+            return dict(data)
 
     async def write(self, data: dict[str, Any]) -> None:
         async with self._lock:
             await asyncio.to_thread(self._write_sync, data)
+            self._cache = dict(data)
+            self._cache_key = self._stat_key()
 
     async def update(
         self, mutator: Callable[[dict[str, Any]], dict[str, Any] | None]
@@ -42,11 +90,19 @@ class JsonStore:
         silently clobber each other. `mutator` returns the dict to persist,
         or None to leave the file untouched."""
         async with self._lock:
-            current = await asyncio.to_thread(self._read_sync)
+            key = self._stat_key()
+            if self._cache is not None and key == self._cache_key:
+                current = dict(self._cache)
+            else:
+                current = await asyncio.to_thread(self._read_sync)
+                self._cache = dict(current)
+                self._cache_key = self._stat_key()
             updated = mutator(current)
             if updated is None:
                 return current
             await asyncio.to_thread(self._write_sync, updated)
+            self._cache = dict(updated)
+            self._cache_key = self._stat_key()
             return updated
 
     def _read_sync(self) -> dict[str, Any]:
