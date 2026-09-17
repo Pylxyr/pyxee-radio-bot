@@ -24,9 +24,9 @@ where). Full walkthrough in README.md; short version:
   2. On a remote host, tunnel the adapter's port first:
      `ssh -L 4343:localhost:4343 <user>@<host>`
   3. In a browser, logged in as the BOT's own account:
-     http://localhost:4343/oauth?scopes=user:read:chat+user:write:chat+user:bot&force_verify=true
+     http://localhost:4343/oauth?scopes=user:read:chat+user:write:chat+user:bot+moderator:manage:chat_messages+moderator:read:followers+moderator:manage:shoutouts&force_verify=true
   4. In a SEPARATE browser session, logged in as the BROADCASTER's account:
-     http://localhost:4343/oauth?scopes=channel:bot&force_verify=true
+     http://localhost:4343/oauth?scopes=channel:bot+channel:read:subscriptions+bits:read+clips:edit+channel:manage:polls&force_verify=true
 
   Reusing the same already-logged-in session for both steps 3 and 4 is the
   most common way this goes wrong — Twitch just authorizes whichever
@@ -45,44 +45,25 @@ class filters the bot's own messages by `chatter.id == self.bot_id`, not
 by any `.echo`-style attribute (ChatMessage has no such attribute), so
 this file's own filtering uses the same check.
 
-filter_delete_enabled (off by default, toggle via !toggle or /settings)
-additionally deletes a message the link/caps filter flags, via
-PartialUser.delete_chat_messages() — verified to exist, but it requires
-the bot's token to carry the `moderator:manage:chat_messages` scope,
-which the OAuth steps above do NOT request (deleting/timing out chat is a
-meaningfully bigger grant than reading/sending it, so this stays opt-in
-rather than bundled into the default setup). Turning the toggle on
-without that scope granted doesn't break anything — the first delete
-attempt logs the permission failure once and the filter quietly stays
-warn-only from then on (see _run_filter_delete below) — but the delete
-obviously won't happen until the scope's actually there. To grant it,
-redo step 3 above with `+moderator:manage:chat_messages` appended to the
-scopes list.
+Every feature below this point is gated by its own toggle (default off —
+see toggles.py) even though steps 3 and 4 above already request every
+scope any of them need; granting the scope up front just means turning a
+toggle on later never requires touching OAuth again. Each one also
+degrades independently and gracefully if its scope turns out to be
+missing anyway (someone trimmed a scope out of those URLs, a token was
+re-authorized with a narrower set, etc.): a sticky flag logs the
+permission failure once and stops retrying that specific action for the
+rest of the run, rather than erroring every time or spamming the log.
 
-Optional extended scopes — none of these are needed for the base bot
-(song requests, radio autoplay, moderation, engagement); each feature
-below degrades independently and gracefully if its scope is missing (a
-sticky flag logs the permission failure once and stops retrying that
-specific action for the rest of the run), so it's safe to grant some but
-not others, or none at all:
-
-  Bot account (redo step 3 with these appended to the scopes list):
-    +moderator:manage:chat_messages  -> filter_delete_enabled (above)
-    +moderator:read:followers        -> !followage, follow alerts
-    +moderator:manage:shoutouts      -> !so, auto-shoutout on raid
-
-  Combined: .../oauth?scopes=user:read:chat+user:write:chat+user:bot+
-  moderator:manage:chat_messages+moderator:read:followers+
-  moderator:manage:shoutouts&force_verify=true
-
-  Broadcaster account (redo step 4 with these appended):
-    +channel:read:subscriptions -> sub alerts
-    +bits:read                  -> cheer alerts
-    +clips:edit                 -> !clip
-    +channel:manage:polls       -> !poll
-
-  Combined: .../oauth?scopes=channel:bot+channel:read:subscriptions+
-  bits:read+clips:edit+channel:manage:polls&force_verify=true
+  moderator:manage:chat_messages (bot)   -> filter_delete_enabled actually
+                                             deleting a flagged message
+                                             (see _run_filter_delete below)
+  moderator:read:followers (bot)         -> !followage, follow alerts
+  moderator:manage:shoutouts (bot)       -> !so, auto-shoutout on raid
+  channel:read:subscriptions (broadcaster) -> sub alerts
+  bits:read (broadcaster)                -> cheer alerts
+  clips:edit (broadcaster)               -> !clip
+  channel:manage:polls (broadcaster)     -> !poll
 
 Follow/subscription/cheer/raid alerts and auto-shoutout-on-raid are all
 gated by one toggle, alerts_enabled (off by default) — see
