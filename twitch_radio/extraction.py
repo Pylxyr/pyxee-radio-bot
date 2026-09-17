@@ -485,21 +485,57 @@ class Resolver:
                 if now - cached_at < ttl:
                     return dataclasses.replace(track, requester_id=requester_id)
 
+        # asyncio.shield, not a bare await, on BOTH paths below. Awaiting a
+        # Task directly propagates the *awaiter's* cancellation into the Task
+        # itself — so one caller going away would cancel the shared
+        # extraction out from under every other caller waiting on it. That is
+        # not hypothetical here: RadioPlayer._play_one cancels its prefetch
+        # task at the end of every single track (see its finally block), and
+        # that prefetch routinely shares a dedup_key with a chatter's live
+        # !sr for the same URL. Without shield, the chatter's resolve dies
+        # with CancelledError — which _resolve_and_queue's `except Exception`
+        # deliberately doesn't catch — so the request vanishes with no queue
+        # entry and no error reply at all. shield cancels only this waiter
+        # and leaves the shared work running, which is what we want anyway:
+        # its result still lands in _cache for whoever is left.
         existing = self._inflight.get(dedup_key)
         if existing is not None:
-            track = await existing
+            track = await asyncio.shield(existing)
             return dataclasses.replace(track, requester_id=requester_id) if track is not None else None
 
         task = asyncio.ensure_future(self._do_resolve(query, dedup_key, now))
         self._inflight[dedup_key] = task
+
+        def _evict(finished: "asyncio.Task[Track | None]", key: str = dedup_key) -> None:
+            # Backstop for the shielded case above: if every waiter walked
+            # away before the shared task finished, nothing else is left to
+            # remove it from _inflight, and a stale done-task entry would
+            # make later callers await an already-completed (possibly
+            # failed) result forever after.
+            if self._inflight.get(key) is finished:
+                del self._inflight[key]
+            # Retrieve any exception so asyncio doesn't log "Task exception
+            # was never retrieved" for a shared resolve whose only waiter
+            # was cancelled before it failed. Every live waiter still sees
+            # the real exception through its own await.
+            if not finished.cancelled() and finished.exception() is not None:
+                log.debug("Shared resolve for %r failed with no waiter left.", key)
+
+        task.add_done_callback(_evict)
         try:
-            track = await task
+            track = await asyncio.shield(task)
         finally:
-            # Only clear our own entry — a concurrent resolve() call for a
-            # *different* query could have already claimed dedup_key again
-            # by the time we get here in a pathological ordering, and we
-            # must not evict someone else's still-running task.
-            if self._inflight.get(dedup_key) is task:
+            # Only clear our own entry, and only once it's actually
+            # finished — a concurrent resolve() call for a *different* query
+            # could have already claimed dedup_key again by the time we get
+            # here in a pathological ordering, and we must not evict someone
+            # else's still-running task. The done() check is what the shield
+            # above makes necessary: this finally can now run while `task` is
+            # still in flight (this waiter was cancelled, the shared work
+            # wasn't), and evicting it there would send the very next caller
+            # off to start a duplicate extraction of something already
+            # running. It cleans itself up via the callback below instead.
+            if self._inflight.get(dedup_key) is task and task.done():
                 del self._inflight[dedup_key]
         return dataclasses.replace(track, requester_id=requester_id) if track is not None else None
 
