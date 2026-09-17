@@ -298,7 +298,7 @@ mobile carriers block inbound connections outright.
 | `!commands` / `!help` | anyone | Lists the commands above |
 | `!setlimit <key> <value>` | moderators | Adjusts one request-limit tunable live — same keys/ranges as `/settings` |
 | `!toggle <key> [on/off]` | moderators | Flips a feature toggle (radio autoplay, chat filters, alerts) — same keys as `/settings` |
-| `!block <url or uploader>` | moderators | Blocks a track (by link) or every track from an uploader (by name); a track block also pulls any already-queued copy out |
+| `!block <url or uploader>` | moderators | Blocks a track (by link) or every track from an uploader (by name); either way, any already-queued requests it now matches are pulled out of the queue too |
 | `!unblock <url or uploader>` | moderators | Reverses `!block` |
 | `!blocklist` | moderators | Shows how many tracks/uploaders are currently blocked |
 | `!clearqueue` | moderators | Empties the queue (not the currently-playing track — use `!skip` for that) |
@@ -443,6 +443,12 @@ Points and watch-time are earned passively for chat *activity* — sending
 messages while the stream's live — not true viewer presence (that would
 need viewer-list data this bot doesn't fetch); a chatter who watches
 silently earns nothing, and this is a known simplification, not a bug.
+The "while the stream's live" part is enforced: the award loop checks the
+channel's live status (cached, one Helix call every couple of minutes at
+most) and skips the tick when it's offline, so chatter activity in an
+offline channel doesn't quietly inflate `!leaderboard`. If that check
+can't be completed, the tick awards anyway rather than silently zeroing
+everyone out over one failed API call.
 The rate (`points_per_active_minute`, default 1, adjustable like any
 other tunable) applies per minute of continued activity within a 5-minute
 window; there's no economy yet for spending them beyond `!leaderboard`
