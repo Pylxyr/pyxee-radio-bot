@@ -40,6 +40,20 @@ _THUMB_FETCH_TIMEOUT = aiohttp.ClientTimeout(total=5)
 _THUMB_MAX_BYTES = 3 * 1024 * 1024  # real thumbnails run tens-to-low-hundreds of KB; generous ceiling, not a target
 
 
+# Hidden field present only in the /settings form this server renders. See
+# handle_settings_post's toggle handling for why it has to exist.
+_FORM_MARKER = "_settings_form"
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _is_truthy(value: str) -> bool:
+    """For a toggle named explicitly in a partial (non-browser) POST. A bare
+    HTML checkbox submits the literal string "on", so that has to count as
+    true, but an explicit `alerts_enabled=false` from a script should mean
+    what it says rather than "present, therefore on"."""
+    return value.strip().lower() in _TRUTHY
+
+
 def _is_allowed_thumb_host(host: str) -> bool:
     host = host.lower()
     return any(host == suffix or host.endswith("." + suffix) for suffix in _THUMB_HOST_SUFFIXES)
@@ -708,26 +722,49 @@ class AdminServer:
             )
             return web.Response(status=403, text="Origin check failed — refusing to save.")
         form = await request.post()
-        errors: list[str] = []
-        preview: dict[str, Any] = {}
 
-        def _mutate(current: dict[str, Any]) -> dict[str, Any] | None:
-            updated = dict(TwitchTunables.from_dict(current).to_dict())
-            for field, attr, lo, hi in _FIELDS:
-                raw = form.get(field)
-                if raw is None:
-                    continue
-                try:
-                    value = int(str(raw))
-                except ValueError:
-                    errors.append(f"{field}: not a number")
-                    continue
-                if value < lo or value > hi:
-                    errors.append(f"{field}: must be between {lo} and {hi}")
-                    continue
-                updated[attr] = value
-            preview.update(updated)
-            return None if errors else updated
+        # Validate every tunable BEFORE writing anything anywhere. The
+        # previous order wrote specs and toggles unconditionally and only
+        # then reported "Tunables not saved", so one out-of-range number
+        # left the three files disagreeing about what the operator had just
+        # submitted — and returned 400 for a request that had, in fact,
+        # changed things.
+        errors: list[str] = []
+        submitted: dict[str, int] = {}
+        for field, attr, lo, hi in _FIELDS:
+            raw = form.get(field)
+            if raw is None:
+                continue
+            try:
+                value = int(str(raw))
+            except ValueError:
+                errors.append(f"{field}: not a number")
+                continue
+            if value < lo or value > hi:
+                errors.append(f"{field}: must be between {lo} and {hi}")
+                continue
+            submitted[attr] = value
+
+        if errors:
+            current_tunables = TwitchTunables.from_dict(await self._tunables_store.read())
+            preview = TwitchTunables.from_dict({**current_tunables.to_dict(), **submitted})
+            specs_data = await self._specs_store.read()
+            community = await self._community_snapshot()
+            return web.Response(
+                text=self._render_page(
+                    preview,
+                    PCSpecs.from_dict(specs_data),
+                    Peripherals.from_dict(specs_data),
+                    FeatureToggles.from_dict(await self._toggles_store.read()),
+                    community,
+                    message="Nothing was saved — " + "; ".join(errors),
+                ),
+                content_type="text/html",
+                status=400,
+            )
+
+        def _mutate(current: dict[str, Any]) -> dict[str, Any]:
+            return {**TwitchTunables.from_dict(current).to_dict(), **submitted}
 
         result = await self._tunables_store.update(_mutate)
 
@@ -739,38 +776,38 @@ class AdminServer:
                     updated[field] = str(raw)
             # Routed through from_dict()/to_dict() so the strip+length-clamp
             # lives in one place (specs.py). Free-text fields have no
-            # failure mode the way tunable bounds do, so unlike _mutate
-            # above, nothing here ever adds to `errors`.
+            # failure mode the way tunable bounds do, so unlike the
+            # validation above, nothing here can fail.
             return {**PCSpecs.from_dict(updated).to_dict(), **Peripherals.from_dict(updated).to_dict()}
 
         specs_result = await self._specs_store.update(_mutate_specs)
         pc_specs = PCSpecs.from_dict(specs_result)
         peripherals = Peripherals.from_dict(specs_result)
 
+        # Absent-means-unchecked is correct for a browser submitting this
+        # page's own form, and catastrophic for anything else: _check_origin
+        # deliberately lets non-browser callers (curl, a Stream Deck script)
+        # through, and one of those POSTing just `queue_cap=100` would
+        # silently switch off radio autoplay and every filter, because none
+        # of those checkboxes were in its body. _FORM_MARKER is a hidden
+        # field only this page's form carries, so checkbox semantics apply
+        # exactly where they're meant to, and a partial POST updates only
+        # the toggles it actually names.
+        full_form = form.get(_FORM_MARKER) is not None
+
         def _mutate_toggles(current: dict[str, Any]) -> dict[str, Any]:
             toggles = FeatureToggles.from_dict(current)
-            # Absent from the form == unchecked — standard HTML checkbox
-            # behavior, safe here specifically because every toggle always
-            # renders as a checkbox on this form (see _render_page), so
-            # "missing" never means "this field wasn't offered".
             for key in TOGGLE_KEYS:
-                setattr(toggles, key, form.get(key) is not None)
+                present = form.get(key) is not None
+                if full_form:
+                    setattr(toggles, key, present)
+                elif present:
+                    setattr(toggles, key, _is_truthy(str(form.get(key))))
             return toggles.to_dict()
 
         toggles_result = await self._toggles_store.update(_mutate_toggles)
         toggles = FeatureToggles.from_dict(toggles_result)
         community = await self._community_snapshot()
-
-        if errors:
-            tunables = TwitchTunables.from_dict(preview or result)
-            return web.Response(
-                text=self._render_page(
-                    tunables, pc_specs, peripherals, toggles, community,
-                    message="Tunables not saved — " + "; ".join(errors),
-                ),
-                content_type="text/html",
-                status=400,
-            )
 
         log.info(
             "Settings updated via /settings from %s: tunables=%s specs=%s toggles=%s",
@@ -832,6 +869,7 @@ h2 {{ margin-top: 2rem; border-top: 1px solid #ddd; padding-top: 1rem; }}
 <h1>Twitch Radio Settings</h1>
 {message_html}
 <form method="post">
+<input type="hidden" name="{_FORM_MARKER}" value="1">
 <label>Max pending requests per chatter
 <input type="number" name="max_pending_per_chatter" value="{tunables.max_pending_per_chatter}"></label>
 <label>Request cooldown (seconds)
