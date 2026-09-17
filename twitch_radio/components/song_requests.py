@@ -190,6 +190,7 @@ class SongRequestComponent(commands.Component):
                     requester_id=requester_id,
                     requester_name=requester_name,
                     title=track.title,
+                    uploader=track.uploader,
                     on_start=_on_start,
                 )
             )
@@ -200,8 +201,7 @@ class SongRequestComponent(commands.Component):
             # pending-count reservation forever, or fail with no reply at
             # all — create_task() has no caller left to propagate to.
             log.exception("Unhandled error resolving/queuing song request: %s", query)
-            with contextlib.suppress(Exception):
-                await ctx.reply("Something went wrong queuing that — try again.")
+            await self.bot.safe_reply(ctx, "Something went wrong queuing that — try again.")
         finally:
             if reserved:
                 remaining_pending = self.bot.pending_by_chatter.get(chatter_key, 1) - 1
@@ -229,19 +229,19 @@ class SongRequestComponent(commands.Component):
             # take 15-20s+, and now_playing stays None the whole time.
             active_id = self.bot.player.active_requester_id
             if active_id is None:
-                await ctx.reply("Nothing's playing right now.")
+                await self.bot.safe_reply(ctx, "Nothing's playing right now.")
                 return
             try:
                 requester_id = int(ctx.chatter.id)
             except (TypeError, ValueError):
                 requester_id = -1
             if requester_id != active_id:
-                await ctx.reply("You can only skip your own song — mods can skip anything.")
+                await self.bot.safe_reply(ctx, "You can only skip your own song — mods can skip anything.")
                 return
         if self.bot.player.skip_current():
-            await ctx.reply("Skipped.")
+            await self.bot.safe_reply(ctx, "Skipped.")
         else:
-            await ctx.reply("Nothing's playing right now.")
+            await self.bot.safe_reply(ctx, "Nothing's playing right now.")
 
     @commands.command(name="voteskip", aliases=["vs"])
     async def vote_skip(self, ctx: commands.Context) -> None:
@@ -250,26 +250,26 @@ class SongRequestComponent(commands.Component):
         adjustable via /settings or !setlimit), it's skipped automatically.
         Votes are per-track and don't carry over to the next one."""
         if self.bot.player.active_requester_id is None:
-            await ctx.reply("Nothing's playing right now.")
+            await self.bot.safe_reply(ctx, "Nothing's playing right now.")
             return
         try:
             voter_id = int(ctx.chatter.id)
         except (TypeError, ValueError):
-            await ctx.reply("Couldn't identify you — try again.")
+            await self.bot.safe_reply(ctx, "Couldn't identify you — try again.")
             return
         tunables = TwitchTunables.from_dict(await self.bot.tunables_store.read())
         result = self.bot.player.register_skip_vote(voter_id, tunables.vote_skip_threshold)
         if result is None:
-            await ctx.reply("Nothing's playing right now.")
+            await self.bot.safe_reply(ctx, "Nothing's playing right now.")
             return
         skipped, count, is_new = result
         if skipped:
-            await ctx.reply("Vote-skipped!")
+            await self.bot.safe_reply(ctx, "Vote-skipped!")
         elif not is_new:
-            await ctx.reply(f"You've already voted to skip this one ({count}/{tunables.vote_skip_threshold}).")
+            await self.bot.safe_reply(ctx, f"You've already voted to skip this one ({count}/{tunables.vote_skip_threshold}).")
         else:
             needed = tunables.vote_skip_threshold - count
-            await ctx.reply(f"Skip vote registered ({count}/{tunables.vote_skip_threshold}) — {needed} more needed.")
+            await self.bot.safe_reply(ctx, f"Skip vote registered ({count}/{tunables.vote_skip_threshold}) — {needed} more needed.")
 
     @commands.command(name="remove", aliases=["cancel", "unqueue"])
     async def remove(self, ctx: commands.Context) -> None:
@@ -279,14 +279,14 @@ class SongRequestComponent(commands.Component):
         try:
             requester_id = int(ctx.chatter.id)
         except (TypeError, ValueError):
-            await ctx.reply("Couldn't identify you — try again.")
+            await self.bot.safe_reply(ctx, "Couldn't identify you — try again.")
             return
         removed = self.bot.player.cancel_pending_for(requester_id)
         if removed is None:
-            await ctx.reply("You don't have anything waiting in the queue.")
+            await self.bot.safe_reply(ctx, "You don't have anything waiting in the queue.")
             return
         title = removed.title or "your request"
-        await ctx.reply(f"Removed: {title}")
+        await self.bot.safe_reply(ctx, f"Removed: {title}")
 
     @commands.command(name="position", aliases=["pos"])
     async def position(self, ctx: commands.Context) -> None:
@@ -294,39 +294,39 @@ class SongRequestComponent(commands.Component):
         try:
             requester_id = int(ctx.chatter.id)
         except (TypeError, ValueError):
-            await ctx.reply("Couldn't identify you — try again.")
+            await self.bot.safe_reply(ctx, "Couldn't identify you — try again.")
             return
         positions = self.bot.player.positions_for(requester_id)
         if not positions:
             if self.bot.player.active_requester_id == requester_id:
-                await ctx.reply("Your song is up now!")
+                await self.bot.safe_reply(ctx, "Your song is up now!")
             else:
-                await ctx.reply("You don't have anything queued.")
+                await self.bot.safe_reply(ctx, "You don't have anything queued.")
             return
         if len(positions) == 1:
-            await ctx.reply(f"You're #{positions[0]} in the queue.")
+            await self.bot.safe_reply(ctx, f"You're #{positions[0]} in the queue.")
         else:
             spots = ", ".join(f"#{p}" for p in positions)
-            await ctx.reply(f"You're at {spots} in the queue.")
+            await self.bot.safe_reply(ctx, f"You're at {spots} in the queue.")
 
     @commands.command(name="queue")
     async def queue_cmd(self, ctx: commands.Context) -> None:
         items = self.bot.player.queued_items()
         if not items:
-            await ctx.reply("Queue is empty.")
+            await self.bot.safe_reply(ctx, "Queue is empty.")
             return
         upcoming = ", ".join(item.title or "an unnamed track" for item in items[:3])
         more = f" (+{len(items) - 3} more)" if len(items) > 3 else ""
-        await ctx.reply(f"{len(items)} queued: {upcoming}{more}")
+        await self.bot.safe_reply(ctx, f"{len(items)} queued: {upcoming}{more}")
 
     @commands.command(name="nowplaying", aliases=["np"])
     async def now_playing(self, ctx: commands.Context) -> None:
         np = self.bot.player.now_playing
         if np is None:
-            await ctx.reply("Nothing's playing right now.")
+            await self.bot.safe_reply(ctx, "Nothing's playing right now.")
             return
         elapsed = max(0, int(time.monotonic() - np.started_at))
-        await ctx.reply(f"Now playing: {np.title} — requested by {np.requester_name} ({elapsed}s in)")
+        await self.bot.safe_reply(ctx, f"Now playing: {np.title} — requested by {np.requester_name} ({elapsed}s in)")
 
     @commands.command(name="radio")
     async def radio_toggle(self, ctx: commands.Context, *, arg: str = "") -> None:
@@ -337,14 +337,14 @@ class SongRequestComponent(commands.Component):
         if not arg:
             toggles = FeatureToggles.from_dict(await self.bot.toggles_store.read())
             state = "on" if toggles.radio_autoplay_enabled else "off"
-            await ctx.reply(f"Radio autoplay is {state}.")
+            await self.bot.safe_reply(ctx, f"Radio autoplay is {state}.")
             return
         chatter = ctx.chatter
         if not (isinstance(chatter, Chatter) and chatter.moderator):
-            await ctx.reply("Only mods can change that — try !radio with no argument to check status.")
+            await self.bot.safe_reply(ctx, "Only mods can change that — try !radio with no argument to check status.")
             return
         if arg not in ("on", "off"):
-            await ctx.reply("Usage: !radio [on|off]")
+            await self.bot.safe_reply(ctx, "Usage: !radio [on|off]")
             return
 
         def _mutate(current: dict[str, object]) -> dict[str, object]:
@@ -353,4 +353,4 @@ class SongRequestComponent(commands.Component):
             return toggles.to_dict()
 
         await self.bot.toggles_store.update(_mutate)
-        await ctx.reply(f"Radio autoplay is now {arg}.")
+        await self.bot.safe_reply(ctx, f"Radio autoplay is now {arg}.")
