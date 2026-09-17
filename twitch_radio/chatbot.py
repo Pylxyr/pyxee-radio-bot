@@ -146,6 +146,20 @@ _LAST_SEEN_PRUNE_SECONDS = 3600.0
 _LINK_RE = re.compile(r"(https?://|www\.)\S+", re.IGNORECASE)
 _CUSTOM_COMMAND_COOLDOWN_SECONDS = 3.0
 
+# Twitch's hard limit on a single chat message. PartialUser.send_message
+# raises a plain ValueError above it (twitchio/user.py, verified against the
+# installed twitchio==3.3.2) — and ValueError is NOT a TwitchioException, so
+# it sails straight past the delivery-failure handling in safe_reply below
+# unless it's caught explicitly. Reachable without trying: three long
+# YouTube titles in !queue, five long display names in !leaderboard, or a
+# custom command whose response !addcom never length-checked.
+_MAX_CHAT_MESSAGE_LENGTH = 500
+
+# How often the passive-points loop re-checks whether the channel is
+# actually live. Cheap (one Helix call per tick at most) and the answer
+# doesn't change on a shorter timescale than this anyway.
+_LIVE_CHECK_TTL_SECONDS = 120.0
+
 
 def _is_excessive_caps(text: str) -> bool:
     letters = [c for c in text if c.isalpha()]
@@ -224,6 +238,9 @@ class TwitchChatBot(commands.Bot):
         self.last_seen: dict[str, float] = {}
         self.last_seen_name: dict[str, str] = {}
         self._points_task: asyncio.Task[None] | None = None
+        # Cached "is the channel live" answer for the points loop — see
+        # _channel_is_live(). (value, checked_at_monotonic).
+        self._live_cache: tuple[bool, float] | None = None
         self.custom_command_cooldowns = CooldownTracker()
         # Sticky "give up" flag for filter_delete_enabled — set on the first
         # permission failure so a missing scope doesn't mean retrying (and
@@ -451,7 +468,16 @@ class TwitchChatBot(commands.Bot):
         assert self._owner_id is not None
         assert self._bot_id is not None
         channel = self.create_partialuser(user_id=self._owner_id)
-        await channel.send_message(sender=self._bot_id, message=message)
+        text = self._decorate(message)
+        try:
+            await channel.send_message(sender=self._bot_id, message=text)
+        except (TwitchioException, ValueError) as e:
+            # Same rationale as safe_reply: a delivery failure here is
+            # Twitch declining to show a message, not a bug in the caller,
+            # and every caller (the player's track-failure notifier, the
+            # chat filter, the alerts component) treats announcing as
+            # best-effort already.
+            log.info("Announcement not delivered (%s): %r", type(e).__name__, text)
 
     async def safe_reply(self, ctx: commands.Context, message: str) -> None:
         """ctx.reply() that swallows Twitch's own message-delivery failures
@@ -474,13 +500,30 @@ class TwitchChatBot(commands.Bot):
         outlasts a single "previous message" comparison, and survives
         this bot restarting).
         """
-        suffix = _DEDUP_SUFFIXES[self._reply_counter % len(_DEDUP_SUFFIXES)]
-        self._reply_counter += 1
-        text = f"{message}{suffix}"
+        text = self._decorate(message)
         try:
             await ctx.reply(text)
-        except TwitchioException:
-            log.info("Chat reply dropped by Twitch (rate limit or duplicate message): %r", text)
+        except (TwitchioException, ValueError) as e:
+            log.info("Chat reply not delivered (%s): %r", type(e).__name__, text)
+
+    def _decorate(self, message: str) -> str:
+        """Adds the rotating anti-dedup suffix and enforces Twitch's
+        500-character limit. Shared by safe_reply() and announce() so both
+        outbound paths get identical treatment — the filter warnings sent
+        through announce() are if anything *more* exposed to the dedup rule
+        than command replies, since a repeat offender triggers a
+        byte-identical warning every time.
+
+        Truncation is preferable to the alternative: over the limit,
+        send_message raises and the message simply never appears, which
+        looks to chat exactly like the bot ignoring the command.
+        """
+        suffix = _DEDUP_SUFFIXES[self._reply_counter % len(_DEDUP_SUFFIXES)]
+        self._reply_counter += 1
+        budget = _MAX_CHAT_MESSAGE_LENGTH - len(suffix)
+        if len(message) > budget:
+            message = message[: budget - 1] + "\u2026"
+        return f"{message}{suffix}"
 
     async def event_message(self, message: ChatMessage) -> None:
         # super() call happens first and unconditionally. Verified directly
@@ -566,8 +609,11 @@ class TwitchChatBot(commands.Bot):
         self.custom_command_cooldowns.mark(name)
         display_name = ctx.chatter.display_name or ctx.chatter.name or "there"
         text = response.replace("{user}", display_name)
-        with contextlib.suppress(Exception):
-            await ctx.reply(text)
+        # safe_reply, not ctx.reply: !addcom never length-checked the
+        # response, so a long one would raise ValueError out of
+        # send_message; and a custom command fired twice in a row is a
+        # byte-identical message, i.e. precisely Twitch's dedup case.
+        await self.safe_reply(ctx, text)
         return True
 
     async def _points_award_loop(self) -> None:
@@ -577,6 +623,24 @@ class TwitchChatBot(commands.Bot):
                 await self._run_points_award_tick()
             except Exception:
                 log.debug("Points award tick failed (non-fatal).", exc_info=True)
+
+    async def _channel_is_live(self) -> bool:
+        """Best-effort, cached for _LIVE_CHECK_TTL_SECONDS. On a lookup
+        failure this reports True — the points loop is a nice-to-have, and
+        silently zeroing out everyone's earnings because one Helix call
+        timed out is a worse failure than over-awarding for one tick."""
+        now = time.monotonic()
+        if self._live_cache is not None and now - self._live_cache[1] < _LIVE_CHECK_TTL_SECONDS:
+            return self._live_cache[0]
+        assert self._owner_id is not None
+        try:
+            stream = await self.create_partialuser(user_id=self._owner_id).fetch_stream()
+            live = stream is not None
+        except Exception:
+            log.debug("Live check failed (non-fatal) — assuming live.", exc_info=True)
+            live = True
+        self._live_cache = (live, now)
+        return live
 
     async def _run_points_award_tick(self) -> None:
         now = time.monotonic()
@@ -590,6 +654,12 @@ class TwitchChatBot(commands.Bot):
             return
         active = [uid for uid, ts in self.last_seen.items() if now - ts <= _ACTIVE_WINDOW_SECONDS]
         if not active:
+            return
+        # README has always described these as earned "while the stream's
+        # live"; nothing actually enforced that, so points and watch-time
+        # accrued from any chat activity at any hour, which makes
+        # !leaderboard a measure of who idles in an offline channel.
+        if not await self._channel_is_live():
             return
         entries = [
             (uid, self.last_seen_name.get(uid, uid), tunables.points_per_active_minute, int(_AWARD_TICK_SECONDS))
@@ -615,24 +685,27 @@ class TwitchChatBot(commands.Bot):
                             return
             return
         if isinstance(exc, commands.GuardFailure):
-            with contextlib.suppress(Exception):
-                await ctx.reply("You don't have permission to use that command.")
+            await self.safe_reply(ctx, "You don't have permission to use that command.")
             return
         if isinstance(exc, commands.MissingRequiredArgument):
             # ctx.command.name is the canonical name even via an alias (e.g.
             # !songrequest resolves to "sr").
             name = ctx.command.name if ctx.command is not None else "sr"
             usage = _USAGE.get(name, _USAGE["sr"])
-            with contextlib.suppress(Exception):
-                await ctx.reply(usage)
+            await self.safe_reply(ctx, usage)
             return
         log.error("Command error in %r: %r", getattr(ctx, "content", "<unknown>"), exc, exc_info=exc)
 
     async def close(self) -> None:
+        """Deliberately does NOT close self.db. The admin server outlives
+        this object during shutdown (bot.py tears it down in the enclosing
+        finally), and a /settings request landing in that window used to hit
+        RuntimeError("Database.connect() was never called") from the
+        already-closed connection. The database is created in bot.py and is
+        closed there too, after the HTTP surface is actually down."""
         if self._points_task is not None:
             self._points_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._points_task
             self._points_task = None
-        await self.db.close()
         await super().close()
