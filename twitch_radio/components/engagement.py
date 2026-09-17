@@ -48,22 +48,22 @@ class EngagementComponent(commands.Component):
         stats = await self.bot.db.get_stats(str(ctx.chatter.id))
         points = stats["points"] if stats else 0
         watch = _format_duration(stats["watch_seconds"] if stats else 0)
-        await ctx.reply(f"{ctx.chatter.display_name}: {points} points, {watch} watched.")
+        await self.bot.safe_reply(ctx, f"{ctx.chatter.display_name}: {points} points, {watch} watched.")
 
     @commands.command(name="watchtime")
     async def watchtime_cmd(self, ctx: commands.Context) -> None:
         stats = await self.bot.db.get_stats(str(ctx.chatter.id))
         watch = _format_duration(stats["watch_seconds"] if stats else 0)
-        await ctx.reply(f"{ctx.chatter.display_name} has {watch} of chat activity tracked.")
+        await self.bot.safe_reply(ctx, f"{ctx.chatter.display_name} has {watch} of chat activity tracked.")
 
     @commands.command(name="leaderboard", aliases=["top"])
     async def leaderboard_cmd(self, ctx: commands.Context) -> None:
         top = await self.bot.db.top_points(limit=5)
         if not top:
-            await ctx.reply("No points earned yet.")
+            await self.bot.safe_reply(ctx, "No points earned yet.")
             return
         ranked = ", ".join(f"{i}. {name} ({pts})" for i, (name, pts) in enumerate(top, start=1))
-        await ctx.reply(f"Top points: {ranked}")
+        await self.bot.safe_reply(ctx, f"Top points: {ranked}")
 
     # -- custom commands --------------------------------------------------
 
@@ -76,22 +76,22 @@ class EngagementComponent(commands.Component):
         chatter's display name."""
         parts = args.strip().split(maxsplit=1)
         if len(parts) != 2:
-            await ctx.reply("Usage: !addcom <name> <response text>")
+            await self.bot.safe_reply(ctx, "Usage: !addcom <name> <response text>")
             return
         name, response = parts[0].strip().lstrip("!").lower(), parts[1].strip()
         if name in _RESERVED_NAMES:
-            await ctx.reply(f"!{name} is a built-in command — pick a different name.")
+            await self.bot.safe_reply(ctx, f"!{name} is a built-in command — pick a different name.")
             return
         await self.bot.db.set_command(name, response, str(ctx.chatter.id))
         log.info("Custom command !%s set by %s (%s)", name, ctx.chatter.display_name, ctx.chatter.id)
-        await ctx.reply(f"Saved !{name}.")
+        await self.bot.safe_reply(ctx, f"Saved !{name}.")
 
     @commands.is_moderator()
     @commands.command(name="delcom")
     async def del_command_cmd(self, ctx: commands.Context, *, name: str) -> None:
         name = name.strip().lstrip("!").lower()
         removed = await self.bot.db.delete_command(name)
-        await ctx.reply(f"Removed !{name}." if removed else f"No custom command !{name}.")
+        await self.bot.safe_reply(ctx, f"Removed !{name}." if removed else f"No custom command !{name}.")
 
     # -- quotes -------------------------------------------------------------
 
@@ -104,24 +104,24 @@ class EngagementComponent(commands.Component):
             try:
                 quote_id = int(arg)
             except ValueError:
-                await ctx.reply("Usage: !quote [id]")
+                await self.bot.safe_reply(ctx, "Usage: !quote [id]")
                 return
         row = await self.bot.db.get_quote(quote_id)
         if row is None:
-            await ctx.reply("No quotes saved yet." if quote_id is None else f"No quote #{arg}.")
+            await self.bot.safe_reply(ctx, "No quotes saved yet." if quote_id is None else f"No quote #{arg}.")
             return
         qid, text = row
-        await ctx.reply(f"#{qid}: {text}")
+        await self.bot.safe_reply(ctx, f"#{qid}: {text}")
 
     @commands.is_moderator()
     @commands.command(name="addquote")
     async def add_quote_cmd(self, ctx: commands.Context, *, text: str) -> None:
         text = text.strip()
         if not text:
-            await ctx.reply("Usage: !addquote <text>")
+            await self.bot.safe_reply(ctx, "Usage: !addquote <text>")
             return
         quote_id = await self.bot.db.add_quote(text, str(ctx.chatter.id))
-        await ctx.reply(f"Saved as #{quote_id}.")
+        await self.bot.safe_reply(ctx, f"Saved as #{quote_id}.")
 
     @commands.is_moderator()
     @commands.command(name="delquote")
@@ -129,7 +129,7 @@ class EngagementComponent(commands.Component):
         try:
             quote_id = int(arg.strip())
         except ValueError:
-            await ctx.reply("Usage: !delquote <id>")
+            await self.bot.safe_reply(ctx, "Usage: !delquote <id>")
             return
         removed = await self.bot.db.delete_quote(quote_id)
-        await ctx.reply(f"Removed #{quote_id}." if removed else f"No quote #{quote_id}.")
+        await self.bot.safe_reply(ctx, f"Removed #{quote_id}." if removed else f"No quote #{quote_id}.")
