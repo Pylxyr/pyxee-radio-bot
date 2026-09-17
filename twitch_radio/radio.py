@@ -60,5 +60,9 @@ class RadioSuggester:
                 requester_id=0,  # never a real Twitch user ID — see models.Track's same convention
                 requester_name=_REQUESTER_LABEL,
                 title=entry.get("title") or "Unknown title",
+                # Flat extraction gives us this for free, and it means a
+                # !block <uploader> purges autoplay picks from that uploader
+                # out of the queue like any other request.
+                uploader=uploader,
             )
         return None
