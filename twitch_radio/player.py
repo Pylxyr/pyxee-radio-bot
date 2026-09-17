@@ -64,6 +64,13 @@ class QueuedRequest:
     requester_id: int
     requester_name: str
     title: str = ""
+    # Whatever the resolve that produced this request reported as the
+    # uploader/channel. Carried on the request purely so !block <uploader>
+    # can purge already-queued entries the same way !block <url> already
+    # does — the queue holds URLs, and re-resolving every pending request
+    # just to answer "who uploaded this" would be absurdly expensive.
+    # Empty string when unknown (nothing depends on it being accurate).
+    uploader: str = ""
     cancelled: bool = False
     on_start: Callable[[], None] | None = field(default=None, repr=False)
 
@@ -156,6 +163,11 @@ class RadioPlayer:
         self._radio_fill_task: asyncio.Task[None] | None = None
         self._radio_fill_failed_at: float = 0.0
 
+        # Wall-clock deadline for the next silence chunk — see
+        # _write_paced_silence(). Zero means "not pacing yet"; the first
+        # call snaps it to now.
+        self._silence_deadline: float = 0.0
+
     # -- public interface used by the chat bot / admin server ------------
 
     @property
@@ -183,7 +195,18 @@ class RadioPlayer:
         return None
 
     def queue_size(self) -> int:
-        return self._queue.qsize()
+        """Requests still waiting to play. Deliberately len(self._pending)
+        and not self._queue.qsize(): purge_pending()/cancel_pending_for()
+        only mark an entry cancelled and drop it from _pending — the
+        asyncio.Queue keeps the tombstone until _feed_loop next dequeues
+        and discards it. Normally that's milliseconds, but with
+        PAUSE_QUEUE_WHEN_NO_LISTENERS=true and nobody connected, _feed_loop
+        never reaches get_nowait() at all, so qsize() stayed at its
+        pre-!clearqueue value indefinitely and !sr answered "Queue's full
+        right now" over a visibly empty queue. _pending is the authoritative
+        not-yet-played list and is also what !queue and the overlay already
+        render, so this makes all three agree."""
+        return len(self._pending)
 
     def queued_items(self) -> list[QueuedRequest]:
         return list(self._pending)
@@ -442,8 +465,7 @@ class RadioPlayer:
                     # Track-boundary pause only (not mid-track) — checked
                     # fresh every loop tick, so playback resumes on its own
                     # the instant a subscriber (re)connects.
-                    await self._write_silence_chunk(encoder_stdin)
-                    await asyncio.sleep(_CHUNK_DURATION)
+                    await self._write_paced_silence(encoder_stdin)
                     continue
                 request = self._queue.get_nowait()
             except asyncio.QueueEmpty:
@@ -452,8 +474,7 @@ class RadioPlayer:
                 # timer ever fired. Guarded/deduped inside the method
                 # itself, so calling it every idle tick is cheap.
                 self._maybe_start_radio_fill()
-                await self._write_silence_chunk(encoder_stdin)
-                await asyncio.sleep(_CHUNK_DURATION)
+                await self._write_paced_silence(encoder_stdin)
                 continue
             with contextlib.suppress(ValueError):
                 self._pending.remove(request)
@@ -468,11 +489,36 @@ class RadioPlayer:
         encoder_stdin.write(_SILENCE_CHUNK)
         await encoder_stdin.drain()
 
+    async def _write_paced_silence(self, encoder_stdin: asyncio.StreamWriter) -> None:
+        """Writes one silence chunk and sleeps until the *deadline* for the
+        next one, rather than sleeping a flat _CHUNK_DURATION.
+
+        The flat-sleep version fed 0.1s of audio per (0.1s + write time +
+        event-loop latency) of wall clock, so the encoder ran permanently
+        slower than real time whenever the stream was silent. Measured at
+        ~0.3% on an idle box — roughly 11 seconds of listener-buffer drain
+        per hour of silence — and much worse under load, since every
+        oversleep is kept rather than amortised: yt-dlp's extraction work is
+        GIL-bound and runs on this same interpreter, so a resolve in flight
+        is exactly when these sleeps overshoot. OBS's Media Source pays for
+        it as a progressive underrun.
+
+        Accumulating against a monotonic deadline makes a late tick borrow
+        from the next one instead of adding to a permanent debt. The max()
+        clamps the deadline forward after a long gap (a track just played,
+        the loop was paused) so it never tries to "catch up" by dumping a
+        burst of silence into the encoder.
+        """
+        await self._write_silence_chunk(encoder_stdin)
+        self._silence_deadline = max(self._silence_deadline + _CHUNK_DURATION, time.monotonic())
+        delay = self._silence_deadline - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
     async def _trickle_silence_until_cancelled(self, encoder_stdin: asyncio.StreamWriter) -> None:
         try:
             while True:
-                await self._write_silence_chunk(encoder_stdin)
-                await asyncio.sleep(_CHUNK_DURATION)
+                await self._write_paced_silence(encoder_stdin)
         except asyncio.CancelledError:
             raise
 
@@ -547,6 +593,16 @@ class RadioPlayer:
             if self._radio_enabled_getter is not None:
                 with contextlib.suppress(Exception):
                     if not await self._radio_enabled_getter():
+                        # Arm the same backoff a failed suggestion uses.
+                        # Without this, "radio autoplay is off" — the single
+                        # most common state, since the queue being empty is
+                        # exactly when this runs — meant _feed_loop's idle
+                        # branch spawned a fresh task every ~100ms forever,
+                        # each one taking the toggles-store lock and reading
+                        # the toggle only to return. Ten pointless tasks a
+                        # second is invisible on a VPS and very much not on
+                        # a phone running this under Termux.
+                        self._radio_fill_failed_at = time.monotonic()
                         return
             seed = self._last_played_webpage_url
             if seed is None or self._radio_suggest is None:
