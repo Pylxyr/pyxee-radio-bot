@@ -154,7 +154,10 @@ async def _async_run(settings: Settings) -> None:
             with contextlib.suppress(asyncio.CancelledError):
                 await warmup_task
         await player.stop()
-        resolver.close()
+        # Async now: with YTDLP_WORKER_MODE=process this reaps the extraction
+        # child processes, and leaving those orphaned would keep a wedged
+        # yt-dlp/Deno alive past the service stopping.
+        await resolver.aclose()
         await db.close()
 
 
@@ -209,7 +212,8 @@ def _check_config() -> int:
     print(f"  Token file: {settings.token_path} ({token_status})")
     print(f"  Community DB: {settings.db_path}")
     print(
-        f"  yt-dlp: concurrency={settings.ytdlp_concurrency} "
+        f"  yt-dlp: mode={settings.ytdlp_worker_mode} "
+        f"concurrency={settings.ytdlp_concurrency} "
         f"timeout={settings.ytdlp_extract_timeout_seconds}s "
         f"cookies={'configured' if settings.ytdlp_cookies_file else 'none'}"
     )

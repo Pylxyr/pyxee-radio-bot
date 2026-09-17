@@ -14,19 +14,39 @@ from aiohttp import web
 
 from twitch_radio.blocklist import clean_list
 from twitch_radio.blocklist import counts as blocklist_counts
+from twitch_radio.config import BASE_DIR
 from twitch_radio.db import Database
 from twitch_radio.player import RadioPlayer
 from twitch_radio.specs import MAX_FIELD_LENGTH, PC_SPEC_FIELDS, PERIPHERAL_FIELDS, PCSpecs, Peripherals
 from twitch_radio.store import JsonStore
 from twitch_radio.telemetry import counters
 from twitch_radio.toggles import TOGGLE_KEYS, FeatureToggles
-from twitch_radio.tunables import TUNABLE_BOUNDS, TwitchTunables
+from twitch_radio.tunables import TUNABLE_BOUNDS, TUNABLE_LABELS, TwitchTunables
 
 log = logging.getLogger(__name__)
 
 # Derived from tunables.py's TUNABLE_BOUNDS (not re-hardcoded here) so this
 # and the chat !setlimit command can never drift apart on allowed ranges.
 _FIELDS = [(name, name, lo, hi) for name, (lo, hi) in TUNABLE_BOUNDS.items()]
+
+# Twitch brand purple, used as the single accent across the settings page.
+_ACCENT = "#9146FF"
+
+# Served at /logo.png (96px) and /logo.png?s=32 (favicon). Read from disk
+# once at startup rather than base64'd into this module: it keeps a 10KB
+# blob out of the source, and swapping in a different logo becomes a matter
+# of replacing a file. Missing assets degrade to no logo, never an error —
+# this is decoration, and a fresh clone that skipped the assets directory
+# should still get a working settings page.
+_LOGO_DIR = BASE_DIR / "assets"
+
+
+def _read_logo(name: str) -> bytes | None:
+    try:
+        return (_LOGO_DIR / name).read_bytes()
+    except OSError:
+        log.debug("Logo asset %s not available — settings page will render without it.", name)
+        return None
 
 # Hostnames /thumb-proxy will actually fetch from — see handle_thumb_proxy()
 # for why this exists at all (it's not optional). Covers YouTube's thumbnail
@@ -389,6 +409,161 @@ tick();
 </body></html>"""
 
 
+# Plain string, not an f-string: the page template below is an f-string and
+# escaping every CSS brace in it would make this unreadable.
+_SETTINGS_CSS = """
+:root {
+  --accent: #9146FF;
+  --accent-soft: rgba(145, 70, 255, 0.14);
+  --bg: #0E0E10;          /* Twitch's own dark chrome */
+  --panel: #18181B;
+  --panel-2: #1F1F23;
+  --line: #2A2A31;
+  --text: #EFEFF1;
+  --muted: #ADADB8;
+  --ok: #00B371;
+  --err: #FF6B6B;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: "Sora", -apple-system, "Segoe UI", system-ui, sans-serif;
+  font-size: 15px; line-height: 1.5;
+}
+/* A soft purple wash behind the masthead so the page doesn't read as a
+   flat slab of near-black. */
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto 0; height: 320px; z-index: -1;
+  background: radial-gradient(80% 140% at 12% 0%, var(--accent-soft), transparent 70%);
+}
+.masthead {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  max-width: 900px; margin: 0 auto; padding: 32px 20px 8px;
+}
+.masthead .mark { width: 52px; height: auto; flex-shrink: 0; }
+.titles { margin-right: auto; }
+h1 { margin: 0; font-size: 26px; font-weight: 700; letter-spacing: -0.02em; }
+.sub { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  font-size: 12px; padding: 4px 10px; border-radius: 999px;
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
+}
+.chip.state-playing { color: var(--ok); border-color: rgba(0, 179, 113, 0.4); }
+.chip.state-resolving { color: var(--accent); border-color: rgba(145, 70, 255, 0.45); }
+.chip-np { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+main { max-width: 900px; margin: 0 auto; padding: 12px 20px 96px; }
+.banner {
+  padding: 12px 14px; border-radius: 10px; margin: 12px 0 20px;
+  font-size: 14px; border: 1px solid;
+}
+.banner-ok { background: rgba(0, 179, 113, 0.1); border-color: rgba(0, 179, 113, 0.45); color: #7BE8BE; }
+.banner-error { background: rgba(255, 107, 107, 0.1); border-color: rgba(255, 107, 107, 0.45); color: #FFB4B4; }
+.card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+  padding: 20px 22px 24px; margin-bottom: 18px;
+}
+.card h2 {
+  margin: 0; font-size: 13px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.09em; color: var(--accent);
+}
+.card h3 { margin: 22px 0 10px; font-size: 13px; font-weight: 600; color: var(--muted); }
+.section-help { margin: 6px 0 18px; color: var(--muted); font-size: 13px; }
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em;
+  background: var(--panel-2); border: 1px solid var(--line);
+  padding: 1px 5px; border-radius: 5px; color: #D9C7FF;
+}
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 16px 20px; }
+.field label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+.field input {
+  width: 100%; padding: 9px 11px; font: inherit; font-size: 14px; color: var(--text);
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.field input:focus {
+  outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.field input::placeholder { color: #55555F; }
+.help { margin: 6px 0 0; font-size: 12px; color: var(--muted); line-height: 1.45; }
+.range {
+  display: inline-block; margin-left: 2px; padding: 0 6px; border-radius: 999px;
+  background: var(--panel-2); border: 1px solid var(--line); font-size: 11px;
+}
+.switches { display: flex; flex-direction: column; gap: 4px; }
+.switch-row {
+  display: flex; align-items: flex-start; gap: 12px; padding: 12px 10px;
+  border-radius: 10px; cursor: pointer; transition: background 0.15s;
+}
+.switch-row:hover { background: var(--panel-2); }
+/* The real checkbox stays in the DOM (so the form posts normally and
+   keyboard/screen-reader behaviour is unchanged) but is visually replaced
+   by the pill below. */
+.switch-row input { position: absolute; opacity: 0; width: 0; height: 0; }
+.switch {
+  flex-shrink: 0; margin-top: 2px; width: 38px; height: 22px; border-radius: 999px;
+  background: var(--panel-2); border: 1px solid var(--line); position: relative;
+  transition: background 0.18s, border-color 0.18s;
+}
+.switch::after {
+  content: ""; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px;
+  border-radius: 50%; background: var(--muted); transition: transform 0.18s, background 0.18s;
+}
+.switch-row input:checked + .switch { background: var(--accent); border-color: var(--accent); }
+.switch-row input:checked + .switch::after { transform: translateX(16px); background: #fff; }
+.switch-row input:focus-visible + .switch { box-shadow: 0 0 0 3px var(--accent-soft); }
+.switch-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.switch-text .help { margin: 0; }
+.actionbar {
+  position: sticky; bottom: 0; display: flex; justify-content: flex-end;
+  padding: 14px 0; background: linear-gradient(to top, var(--bg) 62%, transparent);
+}
+button {
+  font: inherit; font-weight: 600; font-size: 14px; color: #fff; cursor: pointer;
+  background: var(--accent); border: 0; border-radius: 10px; padding: 11px 26px;
+  transition: filter 0.15s, transform 0.05s;
+}
+button:hover { filter: brightness(1.12); }
+button:active { transform: translateY(1px); }
+button:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+.stats { display: flex; gap: 12px; flex-wrap: wrap; }
+.stat {
+  flex: 1 1 140px; background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; gap: 2px;
+}
+.stat .n { font-size: 24px; font-weight: 700; letter-spacing: -0.02em; }
+.stat .l { font-size: 12px; color: var(--muted); }
+.leaderboard { list-style: none; margin: 0; padding: 0; }
+.leaderboard li {
+  display: flex; align-items: center; gap: 12px;
+  padding: 9px 4px; border-bottom: 1px solid var(--line);
+}
+.leaderboard li:last-child { border-bottom: 0; }
+.rank {
+  flex-shrink: 0; width: 22px; height: 22px; border-radius: 50%; font-size: 11px;
+  font-weight: 700; display: grid; place-items: center;
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
+}
+.leaderboard li:first-child .rank { background: var(--accent); border-color: var(--accent); color: #fff; }
+.who { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pts { font-weight: 600; font-variant-numeric: tabular-nums; }
+.empty { color: var(--muted); font-size: 14px; margin: 0; }
+table.info { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.info td { padding: 8px 4px; border-bottom: 1px solid var(--line); }
+table.info tr:last-child td { border-bottom: 0; }
+table.info td:first-child { color: var(--muted); width: 45%; }
+@media (max-width: 560px) {
+  .masthead { padding-top: 22px; }
+  .chips { width: 100%; }
+  .card { padding: 18px 16px 20px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+}
+"""
+
+
 class _AuthRateLimiter:
     """Sliding-window lockout for /settings — HTTP Basic Auth has no
     built-in rate limiting, so without this it's brute-forceable at
@@ -461,6 +636,10 @@ class AdminServer:
         # across every /thumb-proxy request rather than opening a fresh
         # connection per fetch.
         self._thumb_session = thumb_session
+        # Read once at construction; see _read_logo(). None simply means the
+        # page renders without a mark.
+        self._logo = _read_logo("logo-96.png")
+        self._logo_small = _read_logo("logo-32.png")
 
     def _check_auth(self, request: web.Request) -> bool:
         if self._settings_password is None:
@@ -612,6 +791,21 @@ class AdminServer:
     async def handle_overlay(self, request: web.Request) -> web.Response:
         return web.Response(text=_OVERLAY_HTML, content_type="text/html")
 
+    async def handle_logo(self, request: web.Request) -> web.Response:
+        """The bot mark, for the settings page and its favicon. Public like
+        the rest of the overlay surface — it's a static image with nothing
+        deployment-specific in it — and served from memory, so this costs no
+        disk I/O per request."""
+        small = request.query.get("s") == "32"
+        body = self._logo_small if small else self._logo
+        if body is None:
+            return web.Response(status=404, text="No logo asset installed")
+        return web.Response(
+            body=body,
+            content_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
     async def handle_thumb_proxy(self, request: web.Request) -> web.Response:
         """Same-origin relay for a track's thumbnail image, fetched only so
         the overlay's canvas-based color extraction (applyPalette() in
@@ -758,6 +952,7 @@ class AdminServer:
                     FeatureToggles.from_dict(await self._toggles_store.read()),
                     community,
                     message="Nothing was saved — " + "; ".join(errors),
+                    error=True,
                 ),
                 content_type="text/html",
                 status=400,
@@ -819,13 +1014,72 @@ class AdminServer:
             content_type="text/html",
         )
 
+    # -- /settings rendering ---------------------------------------------
+    #
+    # The page is assembled from the same metadata the rest of the service
+    # uses — TUNABLE_BOUNDS/TUNABLE_LABELS, TOGGLE_KEYS, PC_SPEC_FIELDS,
+    # PERIPHERAL_FIELDS — rather than hand-written inputs. Adding a tunable
+    # or a toggle now shows up here automatically; previously the inputs
+    # were typed out in the template and a new key silently never appeared.
+
+    def _tunable_rows(self, tunables: TwitchTunables) -> str:
+        rows = []
+        for name, (lo, hi) in TUNABLE_BOUNDS.items():
+            label, help_text = TUNABLE_LABELS.get(name, (name, ""))
+            value = getattr(tunables, name)
+            rows.append(
+                f'<div class="field">'
+                f'<label for="f-{escape(name)}">{escape(label)}</label>'
+                f'<input id="f-{escape(name)}" type="number" name="{escape(name)}" '
+                f'value="{value}" min="{lo}" max="{hi}" step="1" inputmode="numeric">'
+                f'<p class="help">{escape(help_text)} <span class="range">{lo}\u2013{hi}</span></p>'
+                f'</div>'
+            )
+        return "".join(rows)
+
+    def _toggle_rows(self, toggles: FeatureToggles) -> str:
+        rows = []
+        for key, desc in TOGGLE_KEYS.items():
+            on = "checked" if getattr(toggles, key) else ""
+            # The description strings in toggles.py are long and mention
+            # required OAuth scopes; the key is the short handle mods use
+            # with !toggle, so lead with that and keep the prose as help.
+            rows.append(
+                f'<label class="switch-row">'
+                f'<input type="checkbox" name="{escape(key)}" {on}>'
+                f'<span class="switch" aria-hidden="true"></span>'
+                f'<span class="switch-text"><code>{escape(key)}</code>'
+                f'<span class="help">{escape(desc)}</span></span>'
+                f'</label>'
+            )
+        return "".join(rows)
+
     def _text_field_rows(self, fields: list[tuple[str, str]], values: dict[str, str]) -> str:
         return "".join(
-            f"<label>{escape(label)}\n"
-            f'<input type="text" name="{escape(name)}" value="{escape(values.get(name, ""))}" '
-            f'maxlength="{MAX_FIELD_LENGTH}"></label>\n'
+            f'<div class="field">'
+            f'<label for="f-{escape(name)}">{escape(label)}</label>'
+            f'<input id="f-{escape(name)}" type="text" name="{escape(name)}" '
+            f'value="{escape(values.get(name, ""))}" maxlength="{MAX_FIELD_LENGTH}" '
+            f'placeholder="\u2014" autocomplete="off">'
+            f'</div>'
             for name, label in fields
         )
+
+    def _status_chips(self) -> str:
+        state = self._player.state.value
+        np = self._player.now_playing
+        uptime = int(time.monotonic() - self._started_at)
+        hours, rem = divmod(uptime, 3600)
+        uptime_text = f"{hours}h {rem // 60}m" if hours else f"{rem // 60}m"
+        chips = [
+            (f"state-{state}", state),
+            ("", f"{self._player.queue_size()} queued"),
+            ("", f"up {uptime_text}"),
+        ]
+        out = "".join(f'<span class="chip {cls}">{escape(text)}</span>' for cls, text in chips)
+        if np is not None:
+            out += f'<span class="chip chip-np" title="{escape(np.title)}">\u25b6 {escape(np.title)}</span>'
+        return out
 
     def _render_page(
         self,
@@ -836,70 +1090,101 @@ class AdminServer:
         community: dict[str, Any],
         *,
         message: str | None,
+        error: bool = False,
     ) -> str:
         info_rows = "".join(
-            f"<tr><td>{escape(k)}</td><td>{escape(v)}</td></tr>" for k, v in self._broadcast_info.items()
+            f"<tr><td>{escape(k)}</td><td><code>{escape(v)}</code></td></tr>"
+            for k, v in self._broadcast_info.items()
         )
-        message_html = f'<p class="msg">{escape(message)}</p>' if message else ""
-        pc_spec_rows = self._text_field_rows(PC_SPEC_FIELDS, pc_specs.to_dict())
-        peripheral_rows = self._text_field_rows(PERIPHERAL_FIELDS, peripherals.to_dict())
-        toggle_rows = "".join(
-            f'<label class="toggle"><input type="checkbox" name="{escape(key)}" '
-            f'{"checked" if getattr(toggles, key) else ""}> {escape(desc)}</label>\n'
-            for key, desc in TOGGLE_KEYS.items()
-        )
-        leaderboard_rows = "".join(
-            f"<tr><td>{i}</td><td>{escape(name)}</td><td>{pts}</td></tr>"
-            for i, (name, pts) in enumerate(community["top_points"], start=1)
-        ) or '<tr><td colspan="3">No points earned yet.</td></tr>'
+        banner = ""
+        if message:
+            kind = "banner-error" if error else "banner-ok"
+            banner = f'<div class="banner {kind}" role="status">{escape(message)}</div>'
+        top = community["top_points"]
+        if top:
+            leaderboard = "".join(
+                f'<li><span class="rank">{i}</span>'
+                f'<span class="who">{escape(name)}</span>'
+                f'<span class="pts">{pts:,}</span></li>'
+                for i, (name, pts) in enumerate(top, start=1)
+            )
+            leaderboard = f'<ol class="leaderboard">{leaderboard}</ol>'
+        else:
+            leaderboard = '<p class="empty">No points earned yet.</p>'
+        logo = '<img class="mark" src="/logo.png" alt="" onerror="this.remove()">' if self._logo else ""
         return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Twitch Radio Settings</title>
-<style>
-body {{ font-family: sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }}
-label {{ display: block; margin-top: 1rem; }}
-label.toggle {{ display: flex; align-items: center; gap: 0.5rem; font-weight: normal; }}
-label.toggle input {{ width: auto; }}
-input {{ width: 100%; padding: 0.4rem; box-sizing: border-box; }}
-table {{ margin-top: 1.5rem; border-collapse: collapse; }}
-td {{ padding: 0.2rem 0.6rem; border-bottom: 1px solid #ddd; }}
-.msg {{ color: #a33; font-weight: bold; }}
-button {{ margin-top: 1rem; padding: 0.5rem 1rem; }}
-h2 {{ margin-top: 2rem; border-top: 1px solid #ddd; padding-top: 1rem; }}
-</style></head><body>
-<h1>Twitch Radio Settings</h1>
-{message_html}
-<form method="post">
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Twitch Radio \u00b7 Settings</title>
+<link rel="icon" type="image/png" href="/logo.png?s=32">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&display=swap" rel="stylesheet">
+<style>{_SETTINGS_CSS}</style>
+</head><body>
+<header class="masthead">
+  {logo}
+  <div class="titles">
+    <h1>Twitch Radio</h1>
+    <p class="sub">settings &amp; community</p>
+  </div>
+  <div class="chips">{self._status_chips()}</div>
+</header>
+
+<main>
+{banner}
+<form method="post" autocomplete="off">
 <input type="hidden" name="{_FORM_MARKER}" value="1">
-<label>Max pending requests per chatter
-<input type="number" name="max_pending_per_chatter" value="{tunables.max_pending_per_chatter}"></label>
-<label>Request cooldown (seconds)
-<input type="number" name="request_cooldown_seconds" value="{tunables.request_cooldown_seconds}"></label>
-<label>Queue cap
-<input type="number" name="queue_cap" value="{tunables.queue_cap}"></label>
-<label>Max request duration (seconds)
-<input type="number" name="max_request_duration_seconds" value="{tunables.max_request_duration_seconds}"></label>
-<label>Vote-skip threshold (unique !voteskip votes needed)
-<input type="number" name="vote_skip_threshold" value="{tunables.vote_skip_threshold}"></label>
-<label>Points per active minute (0 disables the points economy)
-<input type="number" name="points_per_active_minute" value="{tunables.points_per_active_minute}"></label>
 
-<h2>Features</h2>
-{toggle_rows}
+  <section class="card">
+    <h2>Request limits</h2>
+    <p class="section-help">Live \u2014 no restart needed. Mods can change the same values from chat with
+      <code>!setlimit &lt;key&gt; &lt;value&gt;</code>.</p>
+    <div class="grid">{self._tunable_rows(tunables)}</div>
+  </section>
 
-<h2>PC specs (shown to viewers via !specs)</h2>
-{pc_spec_rows}
+  <section class="card">
+    <h2>Features</h2>
+    <p class="section-help">Same keys as <code>!toggle &lt;key&gt; on|off</code> in chat.</p>
+    <div class="switches">{self._toggle_rows(toggles)}</div>
+  </section>
 
-<h2>Peripherals (shown to viewers via !peripherals)</h2>
-{peripheral_rows}
+  <section class="card">
+    <h2>PC specs</h2>
+    <p class="section-help">Shown to viewers by <code>!specs</code>. Blank fields are left out of the reply.</p>
+    <div class="grid">{self._text_field_rows(PC_SPEC_FIELDS, pc_specs.to_dict())}</div>
+  </section>
 
-<button type="submit">Save</button>
+  <section class="card">
+    <h2>Peripherals</h2>
+    <p class="section-help">Shown to viewers by <code>!peripherals</code>.</p>
+    <div class="grid">{self._text_field_rows(PERIPHERAL_FIELDS, peripherals.to_dict())}</div>
+  </section>
+
+  <div class="actionbar">
+    <button type="submit">Save changes</button>
+  </div>
 </form>
 
-<h2>Community (read-only — managed via chat commands)</h2>
-<p>{community["commands_count"]} custom command(s), {community["quotes_count"]} quote(s) saved.</p>
-<table><tr><th>#</th><th>Viewer</th><th>Points</th></tr>{leaderboard_rows}</table>
+<section class="card">
+  <h2>Community</h2>
+  <p class="section-help">Read-only \u2014 managed from chat with <code>!addcom</code>, <code>!addquote</code>
+    and friends.</p>
+  <div class="stats">
+    <div class="stat"><span class="n">{community["commands_count"]}</span><span class="l">custom commands</span></div>
+    <div class="stat"><span class="n">{community["quotes_count"]}</span><span class="l">quotes</span></div>
+  </div>
+  <h3>Top points</h3>
+  {leaderboard}
+</section>
 
-<table>{info_rows}</table>
+<section class="card">
+  <h2>Endpoints</h2>
+  <table class="info">{info_rows}</table>
+</section>
+</main>
 </body></html>"""
 
 
@@ -929,6 +1214,7 @@ async def run_admin_server(
     app.router.add_get("/ws/nowplaying", server.handle_ws_nowplaying)
     app.router.add_get("/blocklist.json", server.handle_blocklist)
     app.router.add_get("/overlay", server.handle_overlay)
+    app.router.add_get("/logo.png", server.handle_logo)
     app.router.add_get("/thumb-proxy", server.handle_thumb_proxy)
     app.router.add_get("/stream.mp3", server.handle_stream)
     app.router.add_get("/settings", server.handle_settings_get)
@@ -947,7 +1233,7 @@ async def run_admin_server(
     await site.start()
     log.info(
         "Admin server listening on http://%s:%d (/stream.mp3, /overlay, /nowplaying.json, "
-        "/ws/nowplaying, /blocklist.json, /healthz, /settings)",
+        "/ws/nowplaying, /blocklist.json, /healthz, /logo.png, /settings)",
         host, port,
     )
     return runner

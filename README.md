@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Twitch Radio Bot" width="140">
+</p>
+
 ## <p align="center">Twitch Radio Bot</p>
 
 <p align="center">
@@ -153,6 +157,7 @@ required; everything else has a default.
 | `YTDLP_POT_PROVIDER_URL` | unset | URL of a local PO-token provider, if configured |
 | `YTDLP_JS_RUNTIME_PATH` / `YTDLP_JS_RUNTIME_NAME` | unset / `deno` | Pin a specific JS runtime binary |
 | `YTDLP_PLAYER_CLIENT` | auto | Comma-separated override for yt-dlp's YouTube client list |
+| `YTDLP_WORKER_MODE` | `process` | `process` runs yt-dlp in child processes; `thread` uses the old in-process pool — see [below](#out-of-process-extraction) |
 | `YTDLP_CACHE_TTL_SECONDS` | `300` | 0–3600; `0` disables the resolve cache |
 | `YTDLP_CONCURRENCY` | `2` | 1–4 concurrent extractions |
 | `YTDLP_EXTRACT_TIMEOUT_SECONDS` | `45` | 10–120 |
@@ -329,6 +334,7 @@ Binds to `127.0.0.1` by default (`TWITCH_NOWPLAYING_HOST`).
 | `GET /nowplaying.json` | public | Same data as JSON, for a custom overlay |
 | `GET /ws/nowplaying` | public | WebSocket version, pushed on every change |
 | `GET /healthz` | public | Player state, queue size, rolling resolve success/failure counts |
+| `GET /logo.png` | public | The bot mark (add `?s=32` for the favicon size) |
 | `GET /blocklist.json` | password-gated | Full blocklist contents |
 | `GET`/`POST /settings` | password-gated | Request-limit and specs/peripherals editor |
 
@@ -370,6 +376,8 @@ twitch-radio-bot/
 ├── bot.py                     # entry point
 ├── requirements.txt
 ├── pyproject.toml             # ruff/mypy config
+├── assets/
+│   └── logo.png                # also served at /logo.png
 ├── deploy/
 │   ├── .env.example
 │   ├── setup.sh                # installer (Ubuntu/Debian VPS)
@@ -380,6 +388,7 @@ twitch-radio-bot/
     ├── config.py               # Settings dataclass, env var loading
     ├── models.py                # Track dataclass
     ├── extraction.py            # yt-dlp resolver + short-lived cache (YouTube/SoundCloud only)
+    ├── extractor_worker.py       # the child process `extraction.py` drives (YTDLP_WORKER_MODE=process)
     ├── radio.py                  # RadioSuggester: radio-autoplay picks via YouTube's own Mix playlist
     ├── store.py                 # atomic JSON persistence
     ├── db.py                     # SQLite persistence for per-viewer data (points, custom commands, quotes)
@@ -542,6 +551,38 @@ startup rather than failing silently on every `!sr`. Without cookies, the
 resolver also tries a single fast, JS-less client first (falling back
 automatically to the normal default if that comes back empty) — see the
 next section.
+
+### Out-of-process extraction
+
+By default (`YTDLP_WORKER_MODE=process`) yt-dlp runs in a small pool of
+long-lived child processes — `YTDLP_CONCURRENCY` of them — rather than on a
+thread pool inside the bot. Each worker imports yt-dlp once at startup and
+keeps its `YoutubeDL` instances alive, so the per-request cost is the same
+as before; what changes is the blast radius:
+
+- **The audio path stops sharing an interpreter with the extractor.**
+  Extraction is overwhelmingly GIL-bound Python — regex over the player
+  response, parsing a multi-megabyte InnerTube blob, sorting formats — and
+  only the JS-runtime subprocess wait releases the GIL. On the same
+  interpreter, that competes with the player's real-time feed loop, which
+  is why a resolve and a stream hiccup tend to coincide.
+- **A timeout can actually kill the work.** `YTDLP_EXTRACT_TIMEOUT_SECONDS`
+  previously cancelled the *wait*, never the thread; a wedged extraction
+  held a worker slot until the process restarted. A wedged worker process
+  gets terminated and replaced, and the pool keeps its full width.
+- **A runaway extraction is charged to its own process**, so the systemd
+  unit's `MemoryMax` bounds it instead of counting against the bot.
+
+Workers talk newline-delimited JSON over stdin/stdout and send back only
+the handful of fields the resolver reads, so a full format listing never
+crosses the pipe. Nothing else changes: caching, request coalescing, the
+fast/fallback client dance and the resulting `Track` are identical either
+way.
+
+`YTDLP_WORKER_MODE=thread` restores the old in-process behaviour if you
+need it — and if the pool can't be spawned at all (an unusual container, a
+locked-down Termux install), the bot logs a warning and falls back to
+threads by itself rather than leaving `!sr` broken.
 
 ### Every resolve needs one JS-runtime call, by design
 
