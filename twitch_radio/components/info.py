@@ -21,9 +21,9 @@ class InfoComponent(commands.Component):
         specs = PCSpecs.from_dict(await self.bot.specs_store.read())
         lines = specs.display_lines()
         if not lines:
-            await ctx.reply("Specs haven't been set up yet.")
+            await self.bot.safe_reply(ctx, "Specs haven't been set up yet.")
             return
-        await ctx.reply(" | ".join(lines))
+        await self.bot.safe_reply(ctx, " | ".join(lines))
 
     @commands.command(name="peripherals", aliases=["periphs"])
     async def peripherals_cmd(self, ctx: commands.Context) -> None:
@@ -31,14 +31,14 @@ class InfoComponent(commands.Component):
         peripherals = Peripherals.from_dict(await self.bot.specs_store.read())
         lines = peripherals.display_lines()
         if not lines:
-            await ctx.reply("Peripherals haven't been set up yet.")
+            await self.bot.safe_reply(ctx, "Peripherals haven't been set up yet.")
             return
-        await ctx.reply(" | ".join(lines))
+        await self.bot.safe_reply(ctx, " | ".join(lines))
 
     @commands.command(name="commands", aliases=["help"])
     async def commands_list(self, ctx: commands.Context) -> None:
         p = self.bot.prefix
-        await ctx.reply(
+        await self.bot.safe_reply(ctx, 
             f"{p}sr <song/URL>  |  {p}skip/{p}voteskip  |  {p}remove  |  {p}position  |  {p}queue  |  "
             f"{p}nowplaying  |  {p}radio  |  {p}points  |  {p}leaderboard  |  {p}watchtime  |  {p}quote  |  "
             f"{p}specs  |  {p}peripherals  |  mods: {p}setlimit, {p}toggle, {p}block/{p}unblock, "
