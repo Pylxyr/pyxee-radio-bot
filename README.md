@@ -37,6 +37,12 @@ any Discord bot.
 - **Viewer engagement** — passive points and watch-time for active
   chatters (`!points`, `!leaderboard`, `!watchtime`), mod-managed custom
   commands (`!addcom`/`!delcom`) and quotes (`!addquote`/`!quote`).
+- **Alerts, shoutouts, clips & polls** — optional (off by default) chat
+  announcements for follows/subs/cheers/raids with auto-shoutout on raid,
+  plus `!uptime`/`!title`/`!game`/`!followage`/`!clip`/`!so`/`!poll`; each
+  needs its own small OAuth scope beyond the base setup and degrades
+  gracefully without it — see
+  [Alerts, shoutouts, clips & polls](#alerts-shoutouts-clips--polls).
 - **`/settings` web page** — adjust request limits, feature toggles, and
   the streamer's PC specs/peripherals (shown to viewers via
   `!specs`/`!peripherals`) without touching a config file, optionally
@@ -192,6 +198,18 @@ redo step 3's bot-account URL with it appended
 if you want to enable `filter_delete_enabled`. Skip this if you're happy
 with warn-only, or haven't turned the filter on at all.
 
+**Optional extended scopes for alerts, `!followage`, `!so`, `!clip`, and
+`!poll`:** none of these are needed for the base bot, and each degrades
+gracefully on its own if its scope is missing (a friendly chat reply, not
+a crash), so it's fine to grant some and not others. See
+[Alerts, shoutouts, clips & polls](#alerts-shoutouts-clips--polls) for
+which command needs which scope. To grant all of them at once:
+
+- Bot account — redo step 3 with:
+  `...scopes=user:read:chat+user:write:chat+user:bot+moderator:manage:chat_messages+moderator:read:followers+moderator:manage:shoutouts&force_verify=true`
+- Broadcaster account — redo step 4 with:
+  `...scopes=channel:bot+channel:read:subscriptions+bits:read+clips:edit+channel:manage:polls&force_verify=true`
+
 ## Adding the stream to OBS
 
 Two sources, both pointed at the HTTP surface below:
@@ -267,7 +285,7 @@ mobile carriers block inbound connections outright.
 | `!peripherals` / `!periphs` | anyone | Shows the streamer's peripherals (set from `/settings`) |
 | `!commands` / `!help` | anyone | Lists the commands above |
 | `!setlimit <key> <value>` | moderators | Adjusts one request-limit tunable live — same keys/ranges as `/settings` |
-| `!toggle <key> [on/off]` | moderators | Flips a feature toggle (radio autoplay, chat filters) — same keys as `/settings` |
+| `!toggle <key> [on/off]` | moderators | Flips a feature toggle (radio autoplay, chat filters, alerts) — same keys as `/settings` |
 | `!block <url or uploader>` | moderators | Blocks a track (by link) or every track from an uploader (by name); a track block also pulls any already-queued copy out |
 | `!unblock <url or uploader>` | moderators | Reverses `!block` |
 | `!blocklist` | moderators | Shows how many tracks/uploaders are currently blocked |
@@ -276,6 +294,13 @@ mobile carriers block inbound connections outright.
 | `!delcom <name>` | moderators | Removes a custom command |
 | `!addquote <text>` | moderators | Saves a new quote |
 | `!delquote <id>` | moderators | Removes a quote by ID |
+| `!uptime` | anyone | Shows how long the stream's been live (or that it's offline) |
+| `!title` | anyone | Shows the current stream title |
+| `!game` | anyone | Shows the current category/game |
+| `!followage` | anyone | Shows how long you've followed the channel — needs `moderator:read:followers` |
+| `!clip` | anyone | Creates a clip of the last ~30s and posts the link — needs `clips:edit` on the broadcaster's token |
+| `!so <username>` / `!shoutout` | moderators | Sends a native Twitch shoutout — needs `moderator:manage:shoutouts` |
+| `!poll <seconds> <question> ; <choice> ; <choice> [...]` | moderators | Starts a native Twitch poll (2-5 choices, 15-1800s) — needs `channel:manage:polls` on the broadcaster's token |
 
 Request limits (`max_pending_per_chatter`, `request_cooldown_seconds`,
 `queue_cap`, `max_request_duration_seconds`, `vote_skip_threshold`) are
@@ -358,7 +383,9 @@ twitch-radio-bot/
     │   ├── song_requests.py       #   !sr, !skip, !voteskip, !remove, !position, !queue, !nowplaying, !radio
     │   ├── moderation.py          #   !setlimit, !toggle, !block/!unblock, !blocklist, !clearqueue
     │   ├── info.py                #   !specs, !peripherals, !commands
-    │   └── engagement.py          #   !points, !leaderboard, !watchtime, !addcom/!delcom, !quote/!addquote/!delquote
+    │   ├── engagement.py          #   !points, !leaderboard, !watchtime, !addcom/!delcom, !quote/!addquote/!delquote
+    │   ├── alerts.py              #   follow/sub/cheer/raid announcements, auto-shoutout, !so
+    │   └── stream_info.py         #   !uptime, !title, !game, !followage, !clip, !poll
     ├── admin_server.py            # aiohttp: /stream.mp3, /overlay, /nowplaying.json, /ws/nowplaying, /healthz, /settings
     └── bot.py                     # wires everything together, owns shutdown, --check-config
 ```
@@ -387,6 +414,17 @@ so it's normally cache-warm by the time it's needed; a skip that empties
 the queue early falls back to the same lookup on the spot instead, with
 the same brief silence-while-resolving as a normal cold `!sr`.
 
+If this looks like it's doing nothing (queue stays empty, no "Radio
+autoplay queued" log line ever appears): the mix lookup shares its base
+yt-dlp options with a normal `!sr` resolve, one of which
+(`noplaylist: True`) is correct for a single-track request but silently
+breaks the mix lookup specifically — it makes yt-dlp ignore the
+`&list=RD<id>` part of the URL entirely and resolve just the seed video,
+so there's never anything to queue. Fixed by explicitly overriding it
+back to `False` for this one call only (`Resolver.resolve_radio_mix` in
+`extraction.py`); if you're running a version from before this fix,
+that's the whole story.
+
 ### Viewer engagement & moderation
 
 Points and watch-time are earned passively for chat *activity* — sending
@@ -404,6 +442,29 @@ moderators and the broadcaster. `filter_delete_enabled` (also off by
 default) additionally deletes the flagged message, but needs an extra
 OAuth scope the base setup doesn't request — see
 [One-time Twitch authorization](#one-time-twitch-authorization).
+
+### Alerts, shoutouts, clips & polls
+
+All off/needs-a-scope by default — none of this is required for the base
+bot. One toggle, `alerts_enabled`, gates chat announcements for follows,
+subs (not gift subs — those fire a separate event this bot doesn't
+listen for, to avoid double-announcing one gift as a self-subscribe),
+cheers, and raids, plus an automatic shoutout for whoever raided. Each
+underlying EventSub subscription is attempted independently at startup
+regardless of the toggle (subscribing is side-effect-free; the toggle
+only gates whether an event that arrives gets announced) — raid alerts
+need no extra scope at all, so they work even with none of the optional
+scopes granted; follow/sub/cheer each need their own (see
+[One-time Twitch authorization](#one-time-twitch-authorization)) and
+simply don't fire if that scope isn't there, with no error either way.
+
+`!so`, `!followage`, `!clip`, and `!poll` each need one of those same
+optional scopes too, and each gives a plain "not set up yet" reply
+instead of an error if its scope is missing — check the commands table
+above for which scope each needs. A missing scope is remembered after
+the first failed attempt (not re-logged for every subsequent raid or
+command), so turning a feature's toggle on without doing the matching
+OAuth step is harmless, just inert.
 
 ### Systemd hardening: `MemoryDenyWriteExecute` and `SystemCallFilter`
 

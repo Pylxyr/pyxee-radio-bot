@@ -393,14 +393,35 @@ class Resolver:
         same best-effort philosophy as warm_up()/prefetch.
         """
         loop = asyncio.get_running_loop()
-        options = {**self._build_options(), "extract_flat": "in_playlist", "playlist_items": "1-15"}
+        # noplaylist=True from _build_options() is correct for a normal
+        # !sr resolve (a video URL that happens to sit in some playlist
+        # should still resolve to just that one video) — but it's fatal
+        # here: it makes yt-dlp ignore the &list=RD<id> part of mix_url
+        # entirely and resolve only the single seed video, so "entries"
+        # never comes back and this silently always returned [] before
+        # this override existed. That was the actual bug behind "radio
+        # autoplay doesn't do anything" — not a network/auth issue, a
+        # single inherited flag.
+        options = {
+            **self._build_options(),
+            "extract_flat": "in_playlist",
+            "playlist_items": "1-15",
+            "noplaylist": False,
+        }
         async with self._semaphore:
             try:
                 info = await asyncio.wait_for(
                     loop.run_in_executor(self._executor, functools.partial(self._extract_flat_sync, mix_url, options)),
                     timeout=_RADIO_MIX_TIMEOUT_SECONDS,
                 )
-            except (TimeoutError, yt_dlp.utils.DownloadError):
+            except Exception:
+                # Broad on purpose, matching the docstring above ("[] on
+                # any failure") — narrowly catching just TimeoutError/
+                # DownloadError missed real cases (e.g. ExtractorError for
+                # "no mix available"), which would otherwise propagate
+                # out of a background radio-fill task and just look like
+                # autoplay silently doing nothing, with no logged reason.
+                log.debug("Radio mix extraction failed for %s (non-fatal).", mix_url, exc_info=True)
                 return []
         entries = info.get("entries") if isinstance(info, dict) else None
         return [e for e in (entries or []) if e]

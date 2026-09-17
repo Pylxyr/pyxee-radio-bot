@@ -58,6 +58,39 @@ warn-only from then on (see _run_filter_delete below) — but the delete
 obviously won't happen until the scope's actually there. To grant it,
 redo step 3 above with `+moderator:manage:chat_messages` appended to the
 scopes list.
+
+Optional extended scopes — none of these are needed for the base bot
+(song requests, radio autoplay, moderation, engagement); each feature
+below degrades independently and gracefully if its scope is missing (a
+sticky flag logs the permission failure once and stops retrying that
+specific action for the rest of the run), so it's safe to grant some but
+not others, or none at all:
+
+  Bot account (redo step 3 with these appended to the scopes list):
+    +moderator:manage:chat_messages  -> filter_delete_enabled (above)
+    +moderator:read:followers        -> !followage, follow alerts
+    +moderator:manage:shoutouts      -> !so, auto-shoutout on raid
+
+  Combined: .../oauth?scopes=user:read:chat+user:write:chat+user:bot+
+  moderator:manage:chat_messages+moderator:read:followers+
+  moderator:manage:shoutouts&force_verify=true
+
+  Broadcaster account (redo step 4 with these appended):
+    +channel:read:subscriptions -> sub alerts
+    +bits:read                  -> cheer alerts
+    +clips:edit                 -> !clip
+    +channel:manage:polls       -> !poll
+
+  Combined: .../oauth?scopes=channel:bot+channel:read:subscriptions+
+  bits:read+clips:edit+channel:manage:polls&force_verify=true
+
+Follow/subscription/cheer/raid alerts and auto-shoutout-on-raid are all
+gated by one toggle, alerts_enabled (off by default) — see
+components/alerts.py. Raid alerts and detection need no extra scope at
+all (channel.raid is public data); shoutout still needs
+moderator:manage:shoutouts even when the raid itself was detected for
+free, so a raid announcement can appear without the follow-up shoutout if
+only that one scope is missing.
 """
 
 from __future__ import annotations
@@ -76,12 +109,14 @@ from twitchio import eventsub
 from twitchio.exceptions import HTTPException, TwitchioException
 from twitchio.ext import commands
 
+from twitch_radio.components.alerts import AlertsComponent
 from twitch_radio.components.engagement import EngagementComponent
 from twitch_radio.components.info import InfoComponent
 from twitch_radio.components.moderation import ModerationComponent
 from twitch_radio.components.moderation import USAGE as _MODERATION_USAGE
 from twitch_radio.components.song_requests import SongRequestComponent
 from twitch_radio.components.song_requests import USAGE as _SONG_REQUEST_USAGE
+from twitch_radio.components.stream_info import StreamInfoComponent
 from twitch_radio.cooldown import CooldownTracker
 from twitch_radio.db import Database
 from twitch_radio.player import RadioPlayer
@@ -213,6 +248,13 @@ class TwitchChatBot(commands.Bot):
         # permission failure so a missing scope doesn't mean retrying (and
         # logging) a failed delete on every single flagged message forever.
         self._delete_scope_missing = False
+        # Same idea for shoutouts (moderator:manage:shoutouts) — shared by
+        # the auto-raid-shoutout and the manual !so command.
+        self._shoutout_scope_missing = False
+        # Tracks which alert EventSub subscriptions have already succeeded,
+        # so _try_subscribe_alerts (called again from save_tokens, for a
+        # scope granted after startup) only retries the ones that haven't.
+        self._alert_subscriptions_done: dict[str, bool] = {}
 
     async def load_tokens(self, path: str | None = None, /) -> None:
         # Redirects TwitchIO's default token file into DATA_DIR instead.
@@ -239,6 +281,7 @@ class TwitchChatBot(commands.Bot):
         with contextlib.suppress(OSError):
             Path(target).chmod(0o600)
         await self._try_subscribe_chat()
+        await self._try_subscribe_alerts()
 
     async def add_token(self, token: str, refresh: str) -> ValidateTokenPayload:
         """twitchio calls this automatically the instant an OAuth
@@ -298,12 +341,89 @@ class TwitchChatBot(commands.Bot):
                     e,
                 )
 
+    async def _try_subscribe_alerts(self) -> None:
+        """Follow/sub/cheer/raid EventSub subscriptions — independent of
+        each other and of alerts_enabled (subscribing is side-effect-free;
+        the toggle only gates whether an event that arrives gets announced
+        — see AlertsComponent), and independent of each other's success:
+        raid needs no extra scope at all, so it should keep working even
+        if follow/sub/cheer fail for lack of one. Re-run from save_tokens()
+        so a scope granted after the bot's already running (redoing the
+        broadcaster OAuth step, say) is picked up without a restart."""
+        attempts = (
+            (
+                "follow",
+                eventsub.ChannelFollowSubscription(broadcaster_user_id=self._owner_id, moderator_user_id=self._bot_id),
+            ),
+            ("subscription", eventsub.ChannelSubscribeSubscription(broadcaster_user_id=self._owner_id)),
+            ("cheer", eventsub.ChannelCheerSubscription(broadcaster_user_id=self._owner_id)),
+            ("raid", eventsub.ChannelRaidSubscription(to_broadcaster_user_id=self._owner_id)),
+        )
+        for name, subscription in attempts:
+            if self._alert_subscriptions_done.get(name):
+                continue
+            try:
+                await self.subscribe_websocket(payload=subscription)
+                self._alert_subscriptions_done[name] = True
+                log.info("Subscribed to %s alerts.", name)
+            except Exception as e:
+                # Routine (not warning/error) when the relevant extra OAuth
+                # scope hasn't been granted — see the module docstring —
+                # since most streamers running this bot never touch alerts
+                # at all, and startup noise for a scope nobody asked for
+                # would just be confusing.
+                log.info("Skipping %s alerts for now (%s) — see module docstring for the optional scope.", name, e)
+
+    async def try_shoutout(self, to_user_id: str, to_display_name: str) -> bool:
+        """Best-effort — shared by AlertsComponent's auto-raid-shoutout and
+        its manual !so command. Needs moderator:manage:shoutouts on the
+        bot's token (see module docstring); a permission failure is logged
+        once and remembered so a train of raids doesn't re-log the same
+        missing-scope warning for every single raider."""
+        if self._shoutout_scope_missing:
+            return False
+        try:
+            broadcaster = self.create_partialuser(user_id=self._owner_id)
+            await broadcaster.send_shoutout(to_broadcaster=to_user_id, moderator=self._bot_id)
+            return True
+        except HTTPException as e:
+            if e.status in (401, 403):
+                self._shoutout_scope_missing = True
+                log.warning(
+                    "Shoutout failed with HTTP %s — the bot's token is probably missing "
+                    "moderator:manage:shoutouts. Staying off for the rest of this run; see "
+                    "chatbot.py's module docstring for the OAuth step to add it. (%s)",
+                    e.status, e,
+                )
+            else:
+                # Most likely Twitch's own shoutout cooldown (once/2min
+                # channel-wide, once/60min per target) — routine, not a
+                # scope problem, so no sticky flag; the next raid tries again.
+                log.info("Shoutout to %s not sent (%s) — likely Twitch's own cooldown.", to_display_name, e)
+            return False
+        except Exception:
+            log.debug("Shoutout to %s failed (non-fatal).", to_display_name, exc_info=True)
+            return False
+
+    async def resolve_user_id(self, login: str) -> str | None:
+        """Login name -> user ID, for !so <username> (send_shoutout needs an
+        ID, not a login name). Public endpoint, no extra scope needed."""
+        try:
+            users = await self.fetch_users(logins=[login])
+        except Exception:
+            log.debug("Failed to resolve Twitch login %r to a user ID.", login, exc_info=True)
+            return None
+        return users[0].id if users else None
+
     async def setup_hook(self) -> None:
         await self.add_component(SongRequestComponent(self))
         await self.add_component(ModerationComponent(self))
         await self.add_component(InfoComponent(self))
         await self.add_component(EngagementComponent(self))
+        await self.add_component(AlertsComponent(self))
+        await self.add_component(StreamInfoComponent(self))
         await self._try_subscribe_chat()
+        await self._try_subscribe_alerts()
         self._points_task = asyncio.create_task(self._points_award_loop(), name="points-award-loop")
 
     def _log_token_diagnostics(self) -> None:

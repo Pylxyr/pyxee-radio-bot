@@ -13,19 +13,26 @@ TOGGLE_KEYS: dict[str, str] = {
         "Also delete the offending message (needs moderator:manage:chat_messages "
         "on the bot's token — see README; silently stays warn-only without it)"
     ),
+    "alerts_enabled": (
+        "Post chat announcements for follows/subs/cheers/raids, and auto-shoutout "
+        "a raider (needs extra OAuth scopes for some of these — see README; each "
+        "degrades independently, so this is safe to turn on regardless of which "
+        "scopes are actually granted)"
+    ),
 }
 
 
 @dataclass(slots=True)
 class FeatureToggles:
     # Defaults to on: this is the specific gap ("radio silence") this
-    # feature exists to close. Moderation filters default off — a false
-    # positive is a chat-visible annoyance (or, for filter_delete_enabled,
-    # a removed message), so all of them are opt-in.
+    # feature exists to close. Everything else defaults off — new
+    # chat-visible behavior (a filter warning, a follow announcement) is
+    # something the streamer should opt into, not discover.
     radio_autoplay_enabled: bool = True
     link_filter_enabled: bool = False
     caps_filter_enabled: bool = False
     filter_delete_enabled: bool = False
+    alerts_enabled: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "FeatureToggles":
@@ -42,6 +49,7 @@ class FeatureToggles:
             link_filter_enabled=_field("link_filter_enabled", defaults.link_filter_enabled),
             caps_filter_enabled=_field("caps_filter_enabled", defaults.caps_filter_enabled),
             filter_delete_enabled=_field("filter_delete_enabled", defaults.filter_delete_enabled),
+            alerts_enabled=_field("alerts_enabled", defaults.alerts_enabled),
         )
 
     def to_dict(self) -> dict[str, bool]:
@@ -50,4 +58,5 @@ class FeatureToggles:
             "link_filter_enabled": self.link_filter_enabled,
             "caps_filter_enabled": self.caps_filter_enabled,
             "filter_delete_enabled": self.filter_delete_enabled,
+            "alerts_enabled": self.alerts_enabled,
         }
