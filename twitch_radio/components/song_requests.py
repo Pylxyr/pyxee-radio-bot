@@ -242,6 +242,28 @@ class SongRequestComponent(commands.Component):
         else:
             await self.bot.safe_reply(ctx, "Nothing's playing right now.")
 
+    @commands.command(name="pause")
+    @commands.is_moderator()
+    async def pause(self, ctx: commands.Context) -> None:
+        """Stops whatever's playing (or still resolving) right now and
+        holds the queue at silence — for an ad break, an announcement,
+        anything where the mod wants the music gone immediately rather
+        than waiting for the current track to end. The interrupted track
+        replays from the top on !resume; there's no seek support anywhere
+        in this pipeline, so "resume" can't mean "from where it left off"."""
+        if self.bot.player.pause():
+            await self.bot.safe_reply(ctx, "Paused. !resume to pick it back up.")
+        else:
+            await self.bot.safe_reply(ctx, "Already paused.")
+
+    @commands.command(name="resume", aliases=["unpause"])
+    @commands.is_moderator()
+    async def resume(self, ctx: commands.Context) -> None:
+        if self.bot.player.resume():
+            await self.bot.safe_reply(ctx, "Resumed.")
+        else:
+            await self.bot.safe_reply(ctx, "Not paused right now.")
+
     @commands.command(name="voteskip", aliases=["vs"])
     async def vote_skip(self, ctx: commands.Context) -> None:
         """Anyone can vote to skip whatever's currently playing (or still

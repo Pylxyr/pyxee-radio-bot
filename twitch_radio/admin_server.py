@@ -14,6 +14,7 @@ from aiohttp import web
 
 from twitch_radio.blocklist import clean_list
 from twitch_radio.blocklist import counts as blocklist_counts
+from twitch_radio.commands_reference import COMMANDS
 from twitch_radio.config import BASE_DIR
 from twitch_radio.db import Database
 from twitch_radio.player import RadioPlayer
@@ -452,6 +453,7 @@ h1 { margin: 0; font-size: 26px; font-weight: 700; letter-spacing: -0.02em; }
 }
 .chip.state-playing { color: var(--ok); border-color: rgba(0, 179, 113, 0.4); }
 .chip.state-resolving { color: var(--accent); border-color: rgba(145, 70, 255, 0.45); }
+.chip.state-paused { color: var(--err); border-color: rgba(255, 107, 107, 0.4); }
 .chip-np { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
 main { max-width: 900px; margin: 0 auto; padding: 12px 20px 96px; }
 .banner {
@@ -553,6 +555,34 @@ table.info { width: 100%; border-collapse: collapse; font-size: 13px; }
 table.info td { padding: 8px 4px; border-bottom: 1px solid var(--line); }
 table.info tr:last-child td { border-bottom: 0; }
 table.info td:first-child { color: var(--muted); width: 45%; }
+
+/* -- Now Playing / Queue (realtime, see _SETTINGS_JS) -------------------- */
+.np-track { margin-bottom: 4px; }
+.np-title { font-size: 17px; font-weight: 600; letter-spacing: -0.01em; }
+.np-meta { margin: 3px 0 12px; font-size: 13px; color: var(--muted); }
+.np-bar {
+  height: 6px; border-radius: 999px; background: var(--panel-2);
+  border: 1px solid var(--line); overflow: hidden;
+}
+.np-fill {
+  height: 100%; background: var(--accent); border-radius: 999px;
+  transition: width 0.25s linear;
+}
+.np-time {
+  display: flex; justify-content: space-between; margin-top: 6px;
+  font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums;
+}
+#np-body .leaderboard { margin-top: 4px; }
+#np-body .leaderboard .pts { font-weight: 400; font-size: 12px; color: var(--muted); }
+
+/* -- Commands reference --------------------------------------------------- */
+.cmd-list { display: flex; flex-direction: column; gap: 2px; }
+.cmd-row { padding: 10px 4px; border-bottom: 1px solid var(--line); }
+.cmd-row:last-child { border-bottom: 0; }
+.cmd-row code { font-size: 0.92em; }
+.cmd-alias { margin-left: 8px; font-size: 12px; color: var(--muted); }
+.cmd-row .help { margin-top: 4px; }
+.cmd-row .who { display: block; margin-top: 3px; font-size: 11.5px; color: #A98CFF; }
 @media (max-width: 560px) {
   .masthead { padding-top: 22px; }
   .chips { width: 100%; }
@@ -561,6 +591,142 @@ table.info td:first-child { color: var(--muted); width: 45%; }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
 }
+"""
+
+# Plain string, not an f-string — same reasoning as _SETTINGS_CSS above:
+# this has far more literal `{`/`}` (every JS block, every template
+# literal) than it's worth escaping inside the page's outer f-string.
+#
+# Reuses the exact same /ws/nowplaying feed the OBS overlay already
+# subscribes to — no new endpoint, no new payload shape (just one added
+# "state" field; see _nowplaying_payload). The overlay needs 60fps-smooth
+# animation and does its own requestAnimationFrame + palette-extraction
+# work for that; this page only needs to stop looking stale within a
+# quarter-second of something changing, so it settles for a plain
+# setInterval tick instead — simpler to read, and plenty fast for a text
+# progress bar and a couple of status chips.
+_SETTINGS_JS = """
+(function () {
+  function escapeHtml(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  function fmtTime(s) {
+    s = Math.max(0, Math.floor(s || 0));
+    var m = Math.floor(s / 60), sec = s % 60;
+    return m + ":" + (sec < 10 ? "0" : "") + sec;
+  }
+  function renderQueue(queue) {
+    if (!queue || !queue.length) return '<p class="empty">Queue is empty.</p>';
+    var shown = queue.slice(0, 8).map(function (q, i) {
+      return '<li><span class="rank">' + (i + 1) + '</span>' +
+             '<span class="who">' + escapeHtml(q.title || "Unknown title") + '</span>' +
+             '<span class="pts">' + escapeHtml(q.requester_name || "") + '</span></li>';
+    }).join("");
+    var more = queue.length > 8 ? '<p class="help">+' + (queue.length - 8) + ' more</p>' : "";
+    return '<ol class="leaderboard">' + shown + '</ol>' + more;
+  }
+
+  var lastPayload = null, lastAt = 0;
+
+  function paint(data, elapsed) {
+    var body = document.getElementById("np-body");
+    if (body) {
+      if (!data.playing) {
+        body.innerHTML = '<p class="empty">Nothing playing right now.</p>' + renderQueue(data.queue);
+      } else {
+        var dur = data.duration_seconds || 0;
+        var pct = dur > 0 ? Math.min(100, (elapsed / dur) * 100) : 0;
+        body.innerHTML =
+          '<div class="np-track">' +
+            '<div class="np-title">' + escapeHtml(data.title) + '</div>' +
+            '<div class="np-meta">requested by ' + escapeHtml(data.requester_name) + '</div>' +
+            '<div class="np-bar"><div class="np-fill" style="width:' + pct + '%"></div></div>' +
+            '<div class="np-time"><span>' + fmtTime(elapsed) + '</span><span>' + fmtTime(dur) + '</span></div>' +
+          '</div>' +
+          '<h3>Up next (' + (data.queue_size || 0) + ')</h3>' + renderQueue(data.queue);
+      }
+    }
+
+    var chipState = document.getElementById("chip-state");
+    if (chipState && data.state) {
+      chipState.textContent = data.state;
+      chipState.className = "chip state-" + data.state;
+    }
+    var chipQueue = document.getElementById("chip-queue");
+    if (chipQueue) chipQueue.textContent = (data.queue_size || 0) + " queued";
+    var chipNp = document.getElementById("chip-np");
+    if (chipNp) {
+      if (data.playing) {
+        chipNp.style.display = "";
+        chipNp.title = data.title || "";
+        chipNp.textContent = "\u25b6 " + (data.title || "");
+      } else {
+        chipNp.style.display = "none";
+      }
+    }
+  }
+
+  function onPayload(data) {
+    lastPayload = data;
+    lastAt = performance.now();
+    paint(data, data.playing ? (data.elapsed_seconds || 0) : 0);
+  }
+
+  // Ticks between server pushes so the progress bar and elapsed time move
+  // smoothly instead of only jumping once a second when the overlay's own
+  // push happens to land. Drift-corrected against the wall clock each
+  // tick rather than just incrementing a counter, so a delayed tick (a
+  // slow tab, a backgrounded browser) catches back up instead of running
+  // permanently behind.
+  setInterval(function () {
+    if (lastPayload && lastPayload.playing) {
+      var drift = (performance.now() - lastAt) / 1000;
+      paint(lastPayload, (lastPayload.elapsed_seconds || 0) + drift);
+    }
+  }, 250);
+
+  var ws = null;
+  function connectWs() {
+    var proto = location.protocol === "https:" ? "wss:" : "ws:";
+    try {
+      ws = new WebSocket(proto + "//" + location.host + "/ws/nowplaying");
+    } catch (e) {
+      return;
+    }
+    ws.onmessage = function (ev) {
+      try { onPayload(JSON.parse(ev.data)); } catch (e) {}
+    };
+    ws.onclose = function () { setTimeout(connectWs, 2000); };
+    ws.onerror = function () { try { ws.close(); } catch (e) {} };
+  }
+
+  // Fallback for a proxy/browser that blocks websockets outright — polls
+  // only while the socket isn't actually open, so this never fights the
+  // websocket for which value wins once it connects.
+  function pollFallback() {
+    if (ws && ws.readyState === WebSocket.OPEN) return;
+    fetch("/nowplaying.json").then(function (r) { return r.json(); }).then(onPayload).catch(function () {});
+  }
+
+  connectWs();
+  pollFallback();
+  setInterval(pollFallback, 3000);
+
+  // Local uptime ticker — the "up Xh Ym" chip only needs to look alive,
+  // not be pushed from the server every second for that.
+  var uptimeEl = document.getElementById("chip-uptime");
+  if (uptimeEl) {
+    var base = parseInt(uptimeEl.dataset.uptimeBase || "0", 10);
+    var start = performance.now();
+    setInterval(function () {
+      var total = base + Math.floor((performance.now() - start) / 1000);
+      var h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60);
+      uptimeEl.textContent = h ? ("up " + h + "h " + m + "m") : ("up " + m + "m");
+    }, 1000);
+  }
+})();
 """
 
 
@@ -709,10 +875,16 @@ class AdminServer:
             {"title": item.title or "Unknown title", "requester_name": item.requester_name}
             for item in self._player.queued_items()
         ]
+        # "state" added for the /settings page's realtime chips (idle /
+        # resolving / playing / paused) — the overlay ignores fields it
+        # doesn't recognize, so this is a safe addition to an existing,
+        # already-consumed payload rather than a new endpoint.
+        state = self._player.state.value
         if np is None:
-            return {"playing": False, "queue_size": len(queue), "queue": queue}
+            return {"playing": False, "state": state, "queue_size": len(queue), "queue": queue}
         return {
             "playing": True,
+            "state": state,
             "title": np.title,
             "uploader": np.uploader,
             "thumbnail_url": np.thumbnail_url,
@@ -896,12 +1068,16 @@ class AdminServer:
 
     async def _community_snapshot(self) -> dict[str, Any]:
         """Read-only dashboard data for /settings — management itself stays
-        in chat (!addcom, !addquote, etc.); this is just visibility so a mod
-        doesn't need a second tool to see what's accumulated."""
+        in chat (!addcom, etc.); this is just visibility so a mod doesn't
+        need a second tool to see what's accumulated.
+
+        No quotes_count here any more — !quote/!addquote/!delquote were
+        removed from chat, so a frozen historical count with no way to act
+        on it from here was just clutter. db.py's quote table and methods
+        are untouched; this only stops calling them from the dashboard."""
         top = await self._db.top_points(limit=5)
-        commands_count = len(await self._db.list_commands())
-        quotes_count = await self._db.count_quotes()
-        return {"top_points": top, "commands_count": commands_count, "quotes_count": quotes_count}
+        custom_commands = sorted(await self._db.list_commands())
+        return {"top_points": top, "custom_commands": custom_commands}
 
     async def handle_settings_post(self, request: web.Request) -> web.Response:
         denied = self._authorize(request)
@@ -1065,21 +1241,69 @@ class AdminServer:
             for name, label in fields
         )
 
+    def _command_row(self, cmd: Any, prefix: str) -> str:
+        alias_text = ""
+        if cmd.aliases:
+            alias_text = '<span class="cmd-alias">also ' + ", ".join(f"{prefix}{a}" for a in cmd.aliases) + "</span>"
+        usage = f"{prefix}{cmd.name}" + (f" {cmd.usage}" if cmd.usage else "")
+        return (
+            '<div class="cmd-row">'
+            f'<code>{escape(usage)}</code>{alias_text}'
+            f'<p class="help">{escape(cmd.description)}</p>'
+            f'<span class="who">{escape(cmd.who)}</span>'
+            '</div>'
+        )
+
+    def _commands_table(self, prefix: str) -> str:
+        """Everything commands_reference.py knows, laid out in three
+        groups. The third group (hidden) is exactly the commands that
+        chat's own !commands deliberately leaves out — see
+        components/info.py — so a mod who only ever reads /settings still
+        finds !block/!unblock/!blocklist documented here in full."""
+        anyone = [c for c in COMMANDS if c.public and c.group == "anyone"]
+        mods = [c for c in COMMANDS if c.public and c.group == "moderators"]
+        hidden = [c for c in COMMANDS if not c.public]
+
+        def rows(cmds: list[Any]) -> str:
+            return "".join(self._command_row(c, prefix) for c in cmds)
+
+        hidden_section = ""
+        if hidden:
+            hidden_section = f"""
+  <h3>Moderators \u2014 not shown in !commands</h3>
+  <div class="cmd-list">{rows(hidden)}</div>"""
+        return f"""<h3>Everyone</h3>
+  <div class="cmd-list">{rows(anyone)}</div>
+  <h3>Moderators</h3>
+  <div class="cmd-list">{rows(mods)}</div>{hidden_section}"""
+
     def _status_chips(self) -> str:
+        """Server-rendered for the very first paint; from then on
+        chip-state/chip-queue/chip-np/chip-uptime are updated in place by
+        the realtime script below over the same /ws/nowplaying feed the
+        overlay already uses (see _SETTINGS_JS) — a mod watching this page
+        sees the queue and now-playing status change live, the thing this
+        section exists to fix, without a page reload.
+
+        chip-np always renders (possibly empty/hidden) rather than being
+        conditionally included, so the live script only ever has to update
+        an existing element's text/visibility — inserting or removing a
+        whole chip node from JS on every state change would be needless
+        DOM churn for something this small."""
         state = self._player.state.value
         np = self._player.now_playing
         uptime = int(time.monotonic() - self._started_at)
         hours, rem = divmod(uptime, 3600)
         uptime_text = f"{hours}h {rem // 60}m" if hours else f"{rem // 60}m"
-        chips = [
-            (f"state-{state}", state),
-            ("", f"{self._player.queue_size()} queued"),
-            ("", f"up {uptime_text}"),
-        ]
-        out = "".join(f'<span class="chip {cls}">{escape(text)}</span>' for cls, text in chips)
-        if np is not None:
-            out += f'<span class="chip chip-np" title="{escape(np.title)}">\u25b6 {escape(np.title)}</span>'
-        return out
+        np_style = "" if np is not None else "display:none"
+        np_text = f"\u25b6 {escape(np.title)}" if np is not None else ""
+        np_title_attr = escape(np.title) if np is not None else ""
+        return (
+            f'<span class="chip state-{state}" id="chip-state">{escape(state)}</span>'
+            f'<span class="chip" id="chip-queue">{self._player.queue_size()} queued</span>'
+            f'<span class="chip" id="chip-uptime" data-uptime-base="{uptime}">up {uptime_text}</span>'
+            f'<span class="chip chip-np" id="chip-np" style="{np_style}" title="{np_title_attr}">{np_text}</span>'
+        )
 
     def _render_page(
         self,
@@ -1111,6 +1335,15 @@ class AdminServer:
             leaderboard = f'<ol class="leaderboard">{leaderboard}</ol>'
         else:
             leaderboard = '<p class="empty">No points earned yet.</p>'
+        custom_commands = community["custom_commands"]
+        custom_commands_html = (
+            '<p class="help">' + ", ".join(f"<code>!{escape(n)}</code>" for n in custom_commands) + "</p>"
+            if custom_commands else ""
+        )
+        # Same value already threaded through to the endpoints table below
+        # as "Chat command prefix" — reused here so the commands reference
+        # shows real, copy-pasteable command text instead of a hardcoded "!".
+        prefix = self._broadcast_info.get("Chat command prefix", "!")
         logo = '<img class="mark" src="/logo.png" alt="" onerror="this.remove()">' if self._logo else ""
         return f"""<!doctype html>
 <html lang="en"><head>
@@ -1135,6 +1368,12 @@ class AdminServer:
 
 <main>
 {banner}
+
+<section class="card live-card" id="live-card">
+  <h2>Now Playing</h2>
+  <div id="np-body"><p class="empty">Loading\u2026</p></div>
+</section>
+
 <form method="post" autocomplete="off">
 <input type="hidden" name="{_FORM_MARKER}" value="1">
 
@@ -1170,14 +1409,20 @@ class AdminServer:
 
 <section class="card">
   <h2>Community</h2>
-  <p class="section-help">Read-only \u2014 managed from chat with <code>!addcom</code>, <code>!addquote</code>
-    and friends.</p>
+  <p class="section-help">Read-only \u2014 managed from chat with <code>!addcom</code>/<code>!editcom</code>/<code>!delcom</code>.</p>
   <div class="stats">
-    <div class="stat"><span class="n">{community["commands_count"]}</span><span class="l">custom commands</span></div>
-    <div class="stat"><span class="n">{community["quotes_count"]}</span><span class="l">quotes</span></div>
+    <div class="stat"><span class="n">{len(community["custom_commands"])}</span><span class="l">custom commands</span></div>
   </div>
+  {custom_commands_html}
   <h3>Top points</h3>
   {leaderboard}
+</section>
+
+<section class="card">
+  <h2>Commands</h2>
+  <p class="section-help">Full reference for every chat command, including a couple of mod tools kept out of
+    <code>!commands</code> in chat to keep that listing short.</p>
+  {self._commands_table(prefix)}
 </section>
 
 <section class="card">
@@ -1185,6 +1430,7 @@ class AdminServer:
   <table class="info">{info_rows}</table>
 </section>
 </main>
+<script>{_SETTINGS_JS}</script>
 </body></html>"""
 
 

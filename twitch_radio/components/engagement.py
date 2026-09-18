@@ -17,10 +17,10 @@ log = logging.getLogger(__name__)
 _RESERVED_NAMES = frozenset(
     {
         "sr", "songrequest", "skip", "voteskip", "vs", "remove", "cancel", "unqueue",
-        "position", "pos", "queue", "nowplaying", "np", "radio", "specs", "peripherals",
-        "commands", "help", "setlimit", "toggle", "block", "unblock", "blocklist", "clearqueue",
-        "points", "balance", "leaderboard", "top", "watchtime", "addcom", "editcom", "delcom",
-        "quote", "addquote", "delquote",
+        "position", "pos", "queue", "nowplaying", "np", "radio", "pause", "resume", "unpause",
+        "specs", "peripherals", "commands", "help", "setlimit", "toggle", "block", "unblock",
+        "blocklist", "clearqueue", "points", "balance", "leaderboard", "top", "watchtime",
+        "addcom", "editcom", "delcom",
     }
 )
 
@@ -93,43 +93,10 @@ class EngagementComponent(commands.Component):
         removed = await self.bot.db.delete_command(name)
         await self.bot.safe_reply(ctx, f"Removed !{name}." if removed else f"No custom command !{name}.")
 
-    # -- quotes -------------------------------------------------------------
-
-    @commands.command(name="quote")
-    async def quote_cmd(self, ctx: commands.Context, *, arg: str = "") -> None:
-        """!quote — random saved quote. !quote <id> — a specific one."""
-        arg = arg.strip()
-        quote_id: int | None = None
-        if arg:
-            try:
-                quote_id = int(arg)
-            except ValueError:
-                await self.bot.safe_reply(ctx, "Usage: !quote [id]")
-                return
-        row = await self.bot.db.get_quote(quote_id)
-        if row is None:
-            await self.bot.safe_reply(ctx, "No quotes saved yet." if quote_id is None else f"No quote #{arg}.")
-            return
-        qid, text = row
-        await self.bot.safe_reply(ctx, f"#{qid}: {text}")
-
-    @commands.is_moderator()
-    @commands.command(name="addquote")
-    async def add_quote_cmd(self, ctx: commands.Context, *, text: str) -> None:
-        text = text.strip()
-        if not text:
-            await self.bot.safe_reply(ctx, "Usage: !addquote <text>")
-            return
-        quote_id = await self.bot.db.add_quote(text, str(ctx.chatter.id))
-        await self.bot.safe_reply(ctx, f"Saved as #{quote_id}.")
-
-    @commands.is_moderator()
-    @commands.command(name="delquote")
-    async def del_quote_cmd(self, ctx: commands.Context, *, arg: str) -> None:
-        try:
-            quote_id = int(arg.strip())
-        except ValueError:
-            await self.bot.safe_reply(ctx, "Usage: !delquote <id>")
-            return
-        removed = await self.bot.db.delete_quote(quote_id)
-        await self.bot.safe_reply(ctx, f"Removed #{quote_id}." if removed else f"No quote #{quote_id}.")
+    # !quote/!addquote/!delquote lived here and were removed on request.
+    # Database.add_quote/get_quote/delete_quote/count_quotes and the
+    # `quotes` table are left completely untouched in db.py — any quotes
+    # already saved in production stay in place, and the feature is a
+    # small re-add away if it's ever wanted back. "quote"/"addquote"/
+    # "delquote" were also dropped from _RESERVED_NAMES above, so a mod
+    # can freely use those as custom command names now.

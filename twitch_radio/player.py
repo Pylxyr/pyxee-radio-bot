@@ -86,6 +86,7 @@ class PlayerState(str, Enum):
     IDLE = "idle"
     RESOLVING = "resolving"
     PLAYING = "playing"
+    PAUSED = "paused"
 
 
 @dataclass(slots=True)
@@ -168,6 +169,19 @@ class RadioPlayer:
         # call snaps it to now.
         self._silence_deadline: float = 0.0
 
+        # Manual mod pause (!pause/!resume) — deliberately separate from
+        # _pause_when_no_listeners above, which is automatic and driven by
+        # subscriber count. This one is only ever set by an explicit chat
+        # command and never cleared by anything else. See pause()/resume().
+        self._paused = False
+        # Holds the track that was interrupted mid-play by pause(), so
+        # resume() plays it again first rather than skipping straight to
+        # whatever's next in _pending. There's no seek support anywhere in
+        # this pipeline (ffmpeg runs with -re and no -ss), so "resume"
+        # always means "play the same track again from 0:00", not from the
+        # interrupted position — see pause()'s docstring.
+        self._priority_request: QueuedRequest | None = None
+
     # -- public interface used by the chat bot / admin server ------------
 
     @property
@@ -236,11 +250,24 @@ class RadioPlayer:
 
     @property
     def state(self) -> PlayerState:
+        # Checked first, ahead of now_playing/resolving: killing the
+        # decoder in pause() is asynchronous (see skip_current()), so
+        # there's a brief window where _now_playing hasn't been cleared
+        # yet even though a mod already asked to pause. Reporting "paused"
+        # through that window is the answer that actually matches what a
+        # mod just did, not an internal implementation detail of how fast
+        # ffmpeg happens to exit.
+        if self._paused:
+            return PlayerState.PAUSED
         if self._now_playing is not None:
             return PlayerState.PLAYING
         if self._resolving or self._active_request is not None:
             return PlayerState.RESOLVING
         return PlayerState.IDLE
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
 
     def subscribe(self) -> asyncio.Queue[bytes]:
         q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=_SUBSCRIBER_QUEUE_SIZE)
@@ -311,6 +338,44 @@ class RadioPlayer:
             self._skip_pending = True
             return True
         return False
+
+    def pause(self) -> bool:
+        """Mod-only manual pause. Returns False if already paused (nothing
+        changed), True otherwise.
+
+        Interrupts whatever's currently playing or resolving immediately —
+        this deliberately does NOT wait for a track boundary the way
+        _pause_when_no_listeners does, because the whole point of a mod
+        reaching for !pause is usually "stop it right now" (an ad break, an
+        announcement), not "stop it in four minutes when this song ends".
+        The interrupted request (if any) is preserved and replayed from the
+        top on resume() — see _priority_request's docstring for why "from
+        the top" rather than from where it was cut off."""
+        if self._paused:
+            return False
+        self._paused = True
+        active = self._active_request
+        if active is not None and not active.cancelled:
+            resumed = QueuedRequest(
+                webpage_url=self._now_playing.webpage_url if self._now_playing else active.webpage_url,
+                requester_id=active.requester_id,
+                requester_name=active.requester_name,
+                title=self._now_playing.title if self._now_playing else active.title,
+                uploader=self._now_playing.uploader if self._now_playing else active.uploader,
+            )
+            self._priority_request = resumed
+            self._pending.insert(0, resumed)
+        self.skip_current()
+        self._notify_state_changed()
+        return True
+
+    def resume(self) -> bool:
+        """Returns False if not currently paused (nothing changed)."""
+        if not self._paused:
+            return False
+        self._paused = False
+        self._notify_state_changed()
+        return True
 
     def register_skip_vote(self, voter_id: int, threshold: int) -> tuple[bool, int, bool] | None:
         """Registers one vote to skip whatever's currently active. Returns
@@ -460,14 +525,30 @@ class RadioPlayer:
             if not self._backoff_reset_done and time.monotonic() - self._encoder_spawned_at >= _STABLE_UPTIME_SECONDS:
                 self._backoff = _MIN_BACKOFF
                 self._backoff_reset_done = True
+            if self._paused:
+                # Checked before anything else in the loop, every tick —
+                # unlike _pause_when_no_listeners below, this never falls
+                # through to a dequeue, and _maybe_start_radio_fill() is
+                # never reached from here either, so autoplay can't sneak a
+                # new track in while a mod has explicitly paused things.
+                await self._write_paced_silence(encoder_stdin)
+                continue
             try:
-                if self._pause_when_no_listeners and not self._subscribers:
+                if self._priority_request is not None:
+                    # Set by pause() when it interrupted something — takes
+                    # priority over the normal queue exactly once, so
+                    # resume() picks up the same track again rather than
+                    # whatever else is now at the front of _pending.
+                    request = self._priority_request
+                    self._priority_request = None
+                elif self._pause_when_no_listeners and not self._subscribers:
                     # Track-boundary pause only (not mid-track) — checked
                     # fresh every loop tick, so playback resumes on its own
                     # the instant a subscriber (re)connects.
                     await self._write_paced_silence(encoder_stdin)
                     continue
-                request = self._queue.get_nowait()
+                else:
+                    request = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 # Catches the case the prefetch-timer hook above doesn't:
                 # a skip or early end that empties the queue before that
@@ -579,8 +660,13 @@ class RadioPlayer:
         prefetch timer above (pre-warms the common "track ends naturally"
         case) and _feed_loop's idle branch below (catches a skip/early-end,
         where the prefetch timer never got to fire). Both funnel through
-        this one guarded entry point so they can't double-queue a pick."""
-        if self._radio_fill_task is not None or self._pending:
+        this one guarded entry point so they can't double-queue a pick.
+
+        The _feed_loop caller path can never reach this while paused (the
+        pause check above returns before getting here), but the prefetch-
+        timer caller is a background task scheduled minutes earlier — it
+        could still fire mid-pause, so the guard is repeated here too."""
+        if self._paused or self._radio_fill_task is not None or self._pending:
             return
         if self._radio_suggest is None or self._last_played_webpage_url is None:
             return
