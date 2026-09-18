@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from twitchio.ext import commands
 
+from twitch_radio.commands_reference import COMMANDS
 from twitch_radio.specs import PCSpecs, Peripherals
 
 if TYPE_CHECKING:
@@ -37,10 +38,23 @@ class InfoComponent(commands.Component):
 
     @commands.command(name="commands", aliases=["help"])
     async def commands_list(self, ctx: commands.Context) -> None:
+        """Built from commands_reference.COMMANDS rather than hand-typed —
+        a command that isn't meant to show up here at all (public=False,
+        e.g. !block/!unblock/!blocklist) just needs that one flag set in
+        one place, instead of also needing someone to remember to leave it
+        out of this string by hand. Full docs for everything, hidden
+        commands included, live on /settings."""
         p = self.bot.prefix
-        await self.bot.safe_reply(ctx, 
-            f"{p}sr <song/URL>  |  {p}skip/{p}voteskip  |  {p}remove  |  {p}position  |  {p}queue  |  "
-            f"{p}nowplaying  |  {p}radio  |  {p}points  |  {p}leaderboard  |  {p}watchtime  |  {p}quote  |  "
-            f"{p}specs  |  {p}peripherals  |  mods: {p}setlimit, {p}toggle, {p}block/{p}unblock, "
-            f"{p}blocklist, {p}clearqueue, {p}addcom/{p}editcom/{p}delcom, {p}addquote/{p}delquote"
+        anyone = [c for c in COMMANDS if c.public and c.group == "anyone"]
+        mods = [c for c in COMMANDS if c.public and c.group == "moderators"]
+        # !sr is the one command worth a visible argument hint here — it's
+        # the single most-used command and the one people are most likely
+        # to type bare and wonder what goes after it.
+        main = " | ".join(
+            f"{p}{c.name} <song/URL>" if c.name == "sr" else f"{p}{c.name}" for c in anyone
+        )
+        mod_list = ", ".join(f"{p}{c.name}" for c in mods)
+        await self.bot.safe_reply(
+            ctx, f"{main}  |  mods: {mod_list}  |  full reference (incl. a couple of mod-only "
+                 f"extras not shown here): /settings"
         )

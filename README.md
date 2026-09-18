@@ -42,13 +42,14 @@ any Discord bot.
 - **Browser Source overlay** (`/overlay`) showing the current track,
   elapsed/duration progress bar, and the next two songs, driven by a
   WebSocket with polling fallback.
-- **Moderation tools** — `!skip`, `!voteskip`, `!block`/`!unblock` by track
-  or uploader, `!clearqueue`, a live blocklist, and an optional link/caps
-  chat filter (warn-only by default; see
+- **Moderation tools** — `!skip`, `!pause`/`!resume`, `!voteskip`,
+  `!block`/`!unblock` by track or uploader, `!clearqueue`, a live
+  blocklist, and an optional link/caps chat filter (warn-only by
+  default; see
   [Viewer engagement & moderation](#viewer-engagement--moderation)).
 - **Viewer engagement** — passive points and watch-time for active
-  chatters (`!points`, `!leaderboard`, `!watchtime`), mod-managed custom
-  commands (`!addcom`/`!delcom`) and quotes (`!addquote`/`!quote`).
+  chatters (`!points`, `!leaderboard`, `!watchtime`) and mod-managed
+  custom commands (`!addcom`/`!delcom`).
 - **Alerts, shoutouts, clips & polls** — optional (off by default) chat
   announcements for follows/subs/cheers/raids with auto-shoutout on raid,
   plus `!uptime`/`!title`/`!game`/`!followage`/`!clip`/`!so`/`!poll`; each
@@ -58,8 +59,11 @@ any Discord bot.
 - **`/settings` web page** — adjust request limits, feature toggles, and
   the streamer's PC specs/peripherals (shown to viewers via
   `!specs`/`!peripherals`) without touching a config file, optionally
-  password-protected. Includes a read-only community dashboard (points
-  leaderboard, custom command/quote counts).
+  password-protected. A "Now Playing" section updates live over the same
+  WebSocket the overlay uses — no page refresh needed to see what's
+  queued or playing — alongside a full command reference (every command,
+  including a couple kept out of `!commands` in chat) and a read-only
+  community dashboard (points leaderboard, custom commands).
 - **Runtime-adjustable request limits** — cooldown, per-chatter pending
   cap, queue cap, max track duration, points-per-active-minute, and
   vote-skip threshold, settable from `/settings` or via `!setlimit` in
@@ -284,6 +288,12 @@ mobile carriers block inbound connections outright.
 
 ## Commands (in Twitch chat)
 
+Full descriptions, usage, and access level for every command below — including
+`!block`/`!unblock`/`!blocklist`, which are kept out of `!commands` in chat to
+keep that listing short but stay fully documented and fully working — are also
+on the `/settings` page, generated from the same source
+(`twitch_radio/commands_reference.py`) so the two can't drift apart.
+
 | Command | Who | Does |
 |---|---|---|
 | `!sr <query>` / `!songrequest <query>` | anyone | Resolves a YouTube/SoundCloud search or link and queues it |
@@ -294,23 +304,22 @@ mobile carriers block inbound connections outright.
 | `!queue` | anyone | Shows how many requests are queued |
 | `!nowplaying` / `!np` | anyone | Shows the current track and who requested it |
 | `!radio [on/off]` | status: anyone; toggling: moderators | Shows or changes whether the queue auto-fills with related tracks when empty |
+| `!pause` | moderators | Stops the current track immediately and holds the queue at silence — for an ad break or an announcement, not waiting out the current song. The interrupted track (if any) replays from the start on `!resume`; nothing in this pipeline can seek, so there's no resuming from the interrupted position |
+| `!resume` / `!unpause` | moderators | Resumes playback after `!pause` |
 | `!points` / `!balance` | anyone | Shows your points and tracked watch-time |
 | `!watchtime` | anyone | Shows your tracked chat-activity time |
 | `!leaderboard` / `!top` | anyone | Shows the top 5 point earners |
-| `!quote [id]` | anyone | Shows a random saved quote, or a specific one by ID |
 | `!specs` | anyone | Shows the streamer's PC specs (set from `/settings`) |
 | `!peripherals` / `!periphs` | anyone | Shows the streamer's peripherals (set from `/settings`) |
-| `!commands` / `!help` | anyone | Lists the commands above |
+| `!commands` / `!help` | anyone | Lists the commands above (a couple of mod tools are deliberately left off — see `/settings` for the full list) |
 | `!setlimit <key> <value>` | moderators | Adjusts one request-limit tunable live — same keys/ranges as `/settings` |
 | `!toggle <key> [on/off]` | moderators | Flips a feature toggle (radio autoplay, chat filters, alerts) — same keys as `/settings` |
-| `!block <url or uploader>` | moderators | Blocks a track (by link) or every track from an uploader (by name); either way, any already-queued requests it now matches are pulled out of the queue too |
-| `!unblock <url or uploader>` | moderators | Reverses `!block` |
-| `!blocklist` | moderators | Shows how many tracks/uploaders are currently blocked |
-| `!clearqueue` | moderators | Empties the queue (not the currently-playing track — use `!skip` for that) |
+| `!block <url or uploader>` *(not in `!commands`)* | moderators | Blocks a track (by link) or every track from an uploader (by name); either way, any already-queued requests it now matches are pulled out of the queue too |
+| `!unblock <url or uploader>` *(not in `!commands`)* | moderators | Reverses `!block` |
+| `!blocklist` *(not in `!commands`)* | moderators | Shows how many tracks/uploaders are currently blocked |
+| `!clearqueue` | moderators | Empties the queue (not the currently-playing track — use `!skip` for that; also clears a track currently held by `!pause`) |
 | `!addcom <name> <response>` / `!editcom` | moderators | Adds or edits a custom command (`{user}` is replaced with the caller's name) |
 | `!delcom <name>` | moderators | Removes a custom command |
-| `!addquote <text>` | moderators | Saves a new quote |
-| `!delquote <id>` | moderators | Removes a quote by ID |
 | `!uptime` | anyone | Shows how long the stream's been live (or that it's offline) |
 | `!title` | anyone | Shows the current stream title |
 | `!game` | anyone | Shows the current category/game |
@@ -391,23 +400,24 @@ twitch-radio-bot/
     ├── extractor_worker.py       # the child process `extraction.py` drives (YTDLP_WORKER_MODE=process)
     ├── radio.py                  # RadioSuggester: radio-autoplay picks via YouTube's own Mix playlist
     ├── store.py                 # atomic JSON persistence
-    ├── db.py                     # SQLite persistence for per-viewer data (points, custom commands, quotes)
+    ├── db.py                     # SQLite persistence for per-viewer data (points, custom commands)
     ├── tunables.py               # TwitchTunables dataclass (request limits + points rate)
     ├── toggles.py                 # FeatureToggles dataclass (radio autoplay, chat filters)
+    ├── commands_reference.py     # single source of truth for !commands + /settings' command table
     ├── telemetry.py               # rolling event counters, exposed via /healthz
     ├── cooldown.py                # reusable per-chatter cooldown tracker
     ├── specs.py                  # PCSpecs/Peripherals dataclasses (!specs, !peripherals)
     ├── blocklist.py               # moderation blocklist normalization/lookup
-    ├── player.py                  # RadioPlayer: MP3 encoder + subscriber fan-out, gapless queue, radio-autoplay hooks
+    ├── player.py                  # RadioPlayer: MP3 encoder + subscriber fan-out, gapless queue, !pause/!resume, radio-autoplay hooks
     ├── chatbot.py                 # TwitchChatBot: OAuth/token lifecycle, component wiring, engagement tracking
     ├── components/                # chat commands, split by concern
-    │   ├── song_requests.py       #   !sr, !skip, !voteskip, !remove, !position, !queue, !nowplaying, !radio
+    │   ├── song_requests.py       #   !sr, !skip, !pause/!resume, !voteskip, !remove, !position, !queue, !nowplaying, !radio
     │   ├── moderation.py          #   !setlimit, !toggle, !block/!unblock, !blocklist, !clearqueue
     │   ├── info.py                #   !specs, !peripherals, !commands
-    │   ├── engagement.py          #   !points, !leaderboard, !watchtime, !addcom/!delcom, !quote/!addquote/!delquote
+    │   ├── engagement.py          #   !points, !leaderboard, !watchtime, !addcom/!editcom/!delcom
     │   ├── alerts.py              #   follow/sub/cheer/raid announcements, auto-shoutout, !so
     │   └── stream_info.py         #   !uptime, !title, !game, !followage, !clip, !poll
-    ├── admin_server.py            # aiohttp: /stream.mp3, /overlay, /nowplaying.json, /ws/nowplaying, /healthz, /settings
+    ├── admin_server.py            # aiohttp: /stream.mp3, /overlay, /nowplaying.json, /ws/nowplaying, /healthz, /settings (live now-playing + full command reference)
     └── bot.py                     # wires everything together, owns shutdown, --check-config
 ```
 
@@ -470,6 +480,14 @@ default) additionally deletes the flagged message — the scope it needs is
 already covered by the default OAuth setup (see
 [One-time Twitch authorization](#one-time-twitch-authorization)), so
 turning the toggle on is all that's needed.
+
+`!pause`/`!resume` stop and restart playback on demand — useful for an ad
+break or an announcement without waiting for the current song to end.
+Pausing kills the current track immediately rather than at a boundary;
+resuming re-resolves and replays the same track from 0:00, since nothing
+in the audio pipeline can seek to a mid-track position. `!clearqueue`
+(or `!block`ing the interrupted track/uploader) drops it instead of
+replaying it on resume, same as it would for anything else in the queue.
 
 ### Alerts, shoutouts, clips & polls
 
