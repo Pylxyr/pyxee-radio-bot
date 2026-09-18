@@ -135,6 +135,14 @@ class Settings:
     nowplaying_host: str
     nowplaying_port: int
     settings_password: str | None
+    # Externally-reachable base URL for the public /commands page (no
+    # trailing slash), e.g. "https://radio.example.com" or
+    # "http://203.0.113.5:8098". None if unset — nowplaying_host is almost
+    # always 127.0.0.1 or 0.0.0.0, neither of which means anything typed
+    # into a browser on someone else's machine, so it can't be derived
+    # automatically the way the other local endpoints are. Unset, !commands
+    # falls back to the old terse in-chat listing instead of a broken link.
+    public_base_url: str | None
 
     # Persistence — all under DATA_DIR so one ReadWritePaths entry in the
     # systemd unit covers everything this process writes.
@@ -222,6 +230,14 @@ def load_settings() -> Settings:
             f"queue/cooldown settings via /settings. Set TWITCH_SETTINGS_PASSWORD."
         )
 
+    public_base_url = os.getenv("TWITCH_PUBLIC_BASE_URL", "").strip().rstrip("/") or None
+    if public_base_url is not None and not public_base_url.startswith(("http://", "https://")):
+        print(
+            f"WARNING: TWITCH_PUBLIC_BASE_URL={public_base_url!r} has no http(s):// scheme — "
+            f"ignoring it. !commands will use the terse in-chat listing instead of a link."
+        )
+        public_base_url = None
+
     return Settings(
         client_id=client_id,
         client_secret=client_secret,
@@ -233,6 +249,7 @@ def load_settings() -> Settings:
         nowplaying_host=nowplaying_host,
         nowplaying_port=_clamped_int_env("TWITCH_NOWPLAYING_PORT", 8098, 1024, 65535),
         settings_password=settings_password,
+        public_base_url=public_base_url,
         token_path=DATA_DIR / os.getenv("TWITCH_TOKEN_FILE", "twitch_tokens.json").strip(),
         tunables_path=DATA_DIR / os.getenv("TWITCH_TUNABLES_FILE", "tunables.json").strip(),
         blocklist_path=DATA_DIR / os.getenv("TWITCH_BLOCKLIST_FILE", "blocklist.json").strip(),

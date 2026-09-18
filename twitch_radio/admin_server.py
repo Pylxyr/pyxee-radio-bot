@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hmac
+import json
 import logging
 import time
 from html import escape
@@ -14,7 +15,7 @@ from aiohttp import web
 
 from twitch_radio.blocklist import clean_list
 from twitch_radio.blocklist import counts as blocklist_counts
-from twitch_radio.commands_reference import COMMANDS
+from twitch_radio.commands_reference import CATEGORIES, COMMANDS
 from twitch_radio.config import BASE_DIR
 from twitch_radio.db import Database
 from twitch_radio.player import RadioPlayer
@@ -101,8 +102,19 @@ _OVERLAY_HTML = """<!doctype html>
     --accent-primary: #E8A33D;
     --accent-secondary: #E85D75;
     transition: background 0.5s ease;
+    overflow: hidden;
   }
   .now { display: flex; gap: 12px; align-items: center; }
+  /* Track-change choreography: the finishing track exits left, the
+     incoming one enters by sliding up from below (see render()'s
+     trackKey-changed branch, which adds/removes these classes around a
+     single panel.innerHTML swap). Both transform and opacity animate so
+     the motion reads as a genuine transition rather than a hard cut. */
+  .now, .next { transition: transform 0.32s cubic-bezier(.22,.61,.36,1), opacity 0.28s ease; }
+  .now.now-exit { transform: translateX(-42px); opacity: 0; }
+  .now.now-enter { transform: translateY(30px); opacity: 0; }
+  .now.now-enter-active { transform: translateY(0); opacity: 1; }
+  .next.next-exit { transform: translateY(-14px); opacity: 0; }
   .thumb {
     width: 56px; height: 56px; border-radius: 10px; flex-shrink: 0;
     background: rgba(255,255,255,0.08) center/cover no-repeat;
@@ -130,6 +142,16 @@ _OVERLAY_HTML = """<!doctype html>
   .next-item {
     font-size: 12px; color: #C7C9D6; white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis; line-height: 1.6;
+    transition: transform 0.3s cubic-bezier(.22,.61,.36,1), opacity 0.3s ease;
+  }
+  /* Applied only to an item that wasn't visible a moment ago — a newly
+     !sr'd track landing in the queue, or one promoted into view because
+     something ahead of it just left. Already-visible items are left
+     alone so they don't replay an entrance they already played. */
+  .next-item.item-enter { transform: translateY(18px); opacity: 0; }
+  .next-item.item-enter-active { transform: translateY(0); opacity: 1; }
+  @media (prefers-reduced-motion: reduce) {
+    .now, .next, .next-item { transition: none !important; }
   }
 </style></head>
 <body><div class="panel" id="panel"></div>
@@ -279,6 +301,27 @@ function nextHtml(queue) {
     + items.map(q => `<div class="next-item">${escapeHtml(q.title)}</div>`).join('');
 }
 
+// Marks the incoming queue items that weren't on screen a moment ago with
+// item-enter, then flips to item-enter-active next frame so the
+// slide-up-from-bottom transition actually has a starting point to
+// animate from. oldTitles is the previous render's up-next titles (in
+// order) — an item already showing, just shifted up a slot because
+// something ahead of it left, is deliberately NOT re-animated.
+function animateNewQueueItems(wrap, newTitles, oldTitles) {
+  const items = wrap.querySelectorAll('.next-item');
+  items.forEach((el, i) => {
+    if (newTitles[i] !== undefined && !oldTitles.includes(newTitles[i])) {
+      el.classList.add('item-enter');
+    }
+  });
+  requestAnimationFrame(() => {
+    wrap.querySelectorAll('.next-item.item-enter').forEach((el) => {
+      el.classList.remove('item-enter');
+      el.classList.add('item-enter-active');
+    });
+  });
+}
+
 function render(data, elapsed) {
   if (!data.playing) {
     if (lastTrackKey !== null) {
@@ -291,9 +334,12 @@ function render(data, elapsed) {
   }
 
   const trackKey = data.webpage_url || data.title;
-  const nextKey = JSON.stringify((data.queue || []).slice(0, 2).map(q => q.title));
+  const newTitles = (data.queue || []).slice(0, 2).map(q => q.title);
+  const nextKey = JSON.stringify(newTitles);
 
   if (trackKey !== lastTrackKey) {
+    const oldTitles = JSON.parse(lastNextKey || '[]');
+    const oldNow = document.getElementById('now-block');
     lastTrackKey = trackKey;
     lastNextKey = nextKey;
     if (data.thumbnail_url !== lastThumb) {
@@ -306,27 +352,64 @@ function render(data, elapsed) {
     // URLs from chat, so thumbnail_url isn't trustworthy input.
     const thumb = data.thumbnail_url ? `style="background-image:url('${escapeHtml(data.thumbnail_url)}')"` : '';
     const hasNext = (data.queue || []).length > 0;
-    panel.innerHTML = `
-      <div class="now">
-        <div class="thumb" ${thumb}></div>
-        <div class="info">
-          <div class="title" id="t-title" style="opacity:0">${escapeHtml(data.title)}</div>
-          <div class="meta">requested by ${escapeHtml(data.requester_name)}</div>
-          <div class="bar-row">
-            <span class="time" id="t-elapsed">0:00</span>
-            <div class="bar"><div class="fill" id="t-fill"></div></div>
-            <span class="time right">${fmt(data.duration_seconds)}</span>
+    const buildNewPanel = () => {
+      panel.innerHTML = `
+        <div class="now now-enter" id="now-block">
+          <div class="thumb" ${thumb}></div>
+          <div class="info">
+            <div class="title" id="t-title" style="opacity:0">${escapeHtml(data.title)}</div>
+            <div class="meta">requested by ${escapeHtml(data.requester_name)}</div>
+            <div class="bar-row">
+              <span class="time" id="t-elapsed">0:00</span>
+              <div class="bar"><div class="fill" id="t-fill"></div></div>
+              <span class="time right">${fmt(data.duration_seconds)}</span>
+            </div>
           </div>
         </div>
-      </div>
-      <div class="next" id="next-wrap" style="${hasNext ? '' : 'display:none'}">${nextHtml(data.queue)}</div>
-    `;
-    // Rebuilt fresh above with opacity 0 — bump to 1 next frame so the
-    // fade-in transition actually has something to animate from.
-    requestAnimationFrame(() => {
-      const t = document.getElementById('t-title');
-      if (t) t.style.opacity = '1';
-    });
+        <div class="next" id="next-wrap" style="${hasNext ? '' : 'display:none'}">${nextHtml(data.queue)}</div>
+      `;
+      const now = document.getElementById('now-block');
+      const wrap = document.getElementById('next-wrap');
+      // Rebuilt fresh above with the *-enter classes (translateY + opacity:0)
+      // — flip to the active state next frame so there's a starting point
+      // for the transition to animate from, same trick the title's own
+      // opacity fade already used.
+      requestAnimationFrame(() => {
+        const t = document.getElementById('t-title');
+        if (t) t.style.opacity = '1';
+        if (now) {
+          now.classList.remove('now-enter');
+          now.classList.add('now-enter-active');
+        }
+      });
+      // Every item in a freshly-rebuilt queue slides up together as part
+      // of the same transition — "oldTitles" here is deliberately the
+      // pre-track-change queue, so nothing in the new list is treated as
+      // "already visible", and the whole up-next block reads as moving up
+      // in lockstep with the promoted track above it.
+      if (wrap) animateNewQueueItems(wrap, newTitles, oldTitles);
+    };
+
+    if (oldNow) {
+      // A track was already showing — animate it out (left) before
+      // swapping in the new one, rather than a hard cut. The old
+      // next-wrap exits upward in the same beat, so the whole panel
+      // reads as one coordinated shift rather than two unrelated pieces
+      // changing independently.
+      let swapped = false;
+      const swap = () => { if (!swapped) { swapped = true; buildNewPanel(); } };
+      oldNow.classList.add('now-exit');
+      const oldWrap = document.getElementById('next-wrap');
+      if (oldWrap) oldWrap.classList.add('next-exit');
+      oldNow.addEventListener('transitionend', swap, { once: true });
+      // Safety net: prefers-reduced-motion (or any environment where the
+      // transition genuinely never fires) would otherwise wait forever.
+      setTimeout(swap, 400);
+    } else {
+      // First render, or coming back from silence — nothing on screen to
+      // animate away from, so just build directly.
+      buildNewPanel();
+    }
   } else if (nextKey !== lastNextKey) {
     // Same track still playing, but the queue itself changed (a new !sr
     // landed, or a mod cleared/blocked something) — update just the "Up
@@ -336,17 +419,21 @@ function render(data, elapsed) {
     // the now-playing track changing, not the queue — so "Up next" only
     // ever caught up whenever a new song happened to start next, which
     // looked like it needed an OBS browser-source refresh to show up.
+    const oldTitles = JSON.parse(lastNextKey || '[]');
     lastNextKey = nextKey;
     const wrap = document.getElementById('next-wrap');
     if (wrap) {
       const hasNext = (data.queue || []).length > 0;
       wrap.style.display = hasNext ? '' : 'none';
       wrap.innerHTML = nextHtml(data.queue);
+      // Only a genuinely new arrival slides up from the bottom — a track
+      // that was already visible and just moved up a slot is left as-is.
+      animateNewQueueItems(wrap, newTitles, oldTitles);
     }
   }
 
   // Runs every frame via tick() — only touches the two per-frame-changing
-  // nodes, not a full innerHTML rebuild (which would undo the fade-in above).
+  // nodes, not a full innerHTML rebuild (which would undo the animations above).
   const pct = data.duration_seconds > 0 ? Math.min(100, (elapsed / data.duration_seconds) * 100) : 0;
   const fillEl = document.getElementById('t-fill');
   const elapsedEl = document.getElementById('t-elapsed');
@@ -729,6 +816,215 @@ _SETTINGS_JS = """
 })();
 """
 
+# -- Public /commands page -----------------------------------------------
+#
+# A deliberately different look from /settings: this is a small public
+# microsite, not a settings form, so it gets its own sidebar-nav layout,
+# larger type, and its own accent treatment rather than reusing
+# _SETTINGS_CSS wholesale. Built once from static data (commands_reference
+# .COMMANDS plus the configured prefix, both fixed for the process's
+# lifetime) and cached — see AdminServer.__init__ — rather than re-rendered
+# per request, which also means there is categorically no per-request
+# user input anywhere in this page's HTML to worry about escaping.
+_COMMANDS_PAGE_CSS = """
+:root {
+  --accent: #9146FF;
+  --accent-soft: rgba(145, 70, 255, 0.14);
+  --accent-2: #E85D75;
+  --bg: #0E0E10;
+  --panel: #18181B;
+  --panel-2: #1F1F23;
+  --line: #2A2A31;
+  --text: #EFEFF1;
+  --muted: #ADADB8;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: "Sora", -apple-system, "Segoe UI", system-ui, sans-serif;
+  font-size: 15px; line-height: 1.55;
+}
+body::before {
+  content: ""; position: fixed; inset: 0 0 auto 0; height: 420px; z-index: -1;
+  background: radial-gradient(70% 120% at 18% 0%, var(--accent-soft), transparent 70%);
+}
+a { color: inherit; }
+.layout { display: grid; grid-template-columns: 272px 1fr; min-height: 100vh; }
+.side {
+  border-right: 1px solid var(--line); padding: 28px 20px; position: sticky; top: 0;
+  height: 100vh; overflow-y: auto; display: flex; flex-direction: column; gap: 22px;
+}
+.brand { display: flex; align-items: center; gap: 12px; }
+.brand img { width: 40px; height: auto; }
+.brand h1 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -0.01em; }
+.brand p { margin: 1px 0 0; font-size: 12px; color: var(--muted); }
+.search { position: relative; }
+.search input {
+  width: 100%; padding: 10px 14px 10px 34px; font: inherit; font-size: 13.5px;
+  color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 10px; transition: border-color 0.15s, box-shadow 0.15s;
+}
+.search input:focus {
+  outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.search svg { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); opacity: 0.55; }
+.tabs { display: flex; flex-direction: column; gap: 2px; }
+.tab {
+  display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 9px;
+  font-size: 13.5px; font-weight: 600; color: var(--muted); cursor: pointer; border: 0;
+  background: transparent; text-align: left; width: 100%; font-family: inherit;
+  transition: background 0.15s, color 0.15s;
+}
+.tab:hover { background: var(--panel-2); color: var(--text); }
+.tab.active { background: var(--accent-soft); color: var(--accent); }
+.tab .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: 0.7; flex-shrink: 0; }
+.tab .count {
+  margin-left: auto; font-size: 11px; padding: 1px 7px; border-radius: 999px;
+  background: var(--panel-2); color: var(--muted);
+}
+.tab.active .count { background: rgba(145,70,255,0.22); color: var(--accent); }
+.side-foot { margin-top: auto; font-size: 11.5px; color: #6B6B76; line-height: 1.5; }
+.side-foot code { background: var(--panel-2); border: 1px solid var(--line); padding: 0 5px; border-radius: 5px; }
+
+main { padding: 40px 44px 80px; max-width: 860px; }
+.panel-title { font-size: 24px; font-weight: 700; letter-spacing: -0.02em; margin: 0 0 4px; }
+.panel-sub { color: var(--muted); font-size: 14px; margin: 0 0 28px; }
+.cards { display: flex; flex-direction: column; gap: 12px; }
+.cards.fade-enter { opacity: 0; transform: translateY(8px); }
+.cards.fade-enter-active { opacity: 1; transform: translateY(0); transition: opacity 0.22s ease, transform 0.22s ease; }
+.cmd-card {
+  position: relative; padding: 16px 18px 16px 22px; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+  transition: transform 0.15s ease, border-color 0.15s ease;
+}
+.cmd-card::before {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--accent);
+}
+.cmd-card.mod::before { background: var(--accent-2); }
+.cmd-card:hover { transform: translateY(-1px); border-color: #3A3A44; }
+.cmd-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+.cmd-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 15px;
+  font-weight: 600; color: var(--text);
+}
+.cmd-alias { font-size: 12px; color: var(--muted); }
+.cmd-badge {
+  margin-left: auto; font-size: 10.5px; font-weight: 700; letter-spacing: 0.04em;
+  text-transform: uppercase; padding: 3px 8px; border-radius: 999px;
+  background: rgba(232,93,117,0.15); color: var(--accent-2); flex-shrink: 0;
+}
+.cmd-desc { color: #D6D6DD; font-size: 13.5px; margin: 0; }
+.cmd-who { display: block; margin-top: 7px; font-size: 11.5px; color: #A98CFF; }
+.empty-state { color: var(--muted); font-size: 14px; padding: 30px 4px; }
+.no-js-note { display: none; }
+@media (max-width: 860px) {
+  .layout { display: block; }
+  .side {
+    position: sticky; top: 0; z-index: 5; height: auto; border-right: 0;
+    border-bottom: 1px solid var(--line); background: var(--bg);
+    padding: 18px 16px 12px;
+  }
+  .tabs { flex-direction: row; overflow-x: auto; gap: 6px; padding-bottom: 2px; }
+  .tab { flex-shrink: 0; width: auto; }
+  .tab .count { display: none; }
+  .side-foot { display: none; }
+  main { padding: 24px 18px 60px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; scroll-behavior: auto !important; }
+}
+noscript .no-js-note { display: block; padding: 14px 16px; margin-bottom: 16px; border-radius: 10px;
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+"""
+
+# Plain string like the CSS above — see its own comment for why.
+_COMMANDS_PAGE_JS = """
+(function () {
+  var tabs = document.querySelectorAll('.tab');
+  var cardsEl = document.getElementById('cards');
+  var searchEl = document.getElementById('search');
+  var titleEl = document.getElementById('panel-title');
+  var subEl = document.getElementById('panel-sub');
+  var DATA = window.__COMMANDS__ || [];
+  var CATS = window.__CATEGORIES__ || [];
+  var active = CATS[0] || '';
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function cardHtml(c) {
+    var alias = c.aliases && c.aliases.length
+      ? '<span class="cmd-alias">also ' + c.aliases.map(function (a) { return escapeHtml(a); }).join(', ') + '</span>'
+      : '';
+    var badge = c.group === 'moderators' ? '<span class="cmd-badge">Mods</span>' : '';
+    return (
+      '<div class="cmd-card' + (c.group === 'moderators' ? ' mod' : '') + '">' +
+        '<div class="cmd-head"><span class="cmd-name">' + escapeHtml(c.usage) + '</span>' + alias + badge + '</div>' +
+        '<p class="cmd-desc">' + escapeHtml(c.description) + '</p>' +
+        '<span class="cmd-who">' + escapeHtml(c.who) + '</span>' +
+      '</div>'
+    );
+  }
+
+  function renderCards(list) {
+    cardsEl.classList.remove('fade-enter-active');
+    cardsEl.classList.add('fade-enter');
+    cardsEl.innerHTML = list.length
+      ? list.map(cardHtml).join('')
+      : '<p class="empty-state">No commands match that search.</p>';
+    // Same enter-transition trick used on the settings/overlay pages:
+    // apply the pre-transition state, then flip to active next frame so
+    // there's something for the CSS transition to animate from.
+    requestAnimationFrame(function () {
+      cardsEl.classList.remove('fade-enter');
+      cardsEl.classList.add('fade-enter-active');
+    });
+  }
+
+  function showTab(cat) {
+    active = cat;
+    tabs.forEach(function (t) { t.classList.toggle('active', t.dataset.cat === cat); });
+    titleEl.textContent = cat;
+    subEl.textContent = 'Everything under ' + cat.toLowerCase() + '.';
+    renderCards(DATA.filter(function (c) { return c.category === cat; }));
+  }
+
+  tabs.forEach(function (t) {
+    t.addEventListener('click', function () {
+      searchEl.value = '';
+      showTab(t.dataset.cat);
+    });
+  });
+
+  var searchTimer = null;
+  searchEl.addEventListener('input', function () {
+    clearTimeout(searchTimer);
+    var q = searchEl.value.trim().toLowerCase();
+    // A short debounce, not because filtering a few dozen commands is
+    // slow, but so the fade transition below doesn't restart on every
+    // single keystroke while someone's still typing.
+    searchTimer = setTimeout(function () {
+      if (!q) { showTab(active); return; }
+      tabs.forEach(function (t) { t.classList.remove('active'); });
+      var matches = DATA.filter(function (c) {
+        return c.name.indexOf(q) !== -1 ||
+               c.description.toLowerCase().indexOf(q) !== -1 ||
+               (c.aliases || []).some(function (a) { return a.indexOf(q) !== -1; });
+      });
+      titleEl.textContent = 'Search: "' + searchEl.value.trim() + '"';
+      subEl.textContent = matches.length + ' match' + (matches.length === 1 ? '' : 'es') + '.';
+      renderCards(matches);
+    }, 120);
+  });
+
+  showTab(active);
+})();
+"""
+
 
 class _AuthRateLimiter:
     """Sliding-window lockout for /settings — HTTP Basic Auth has no
@@ -769,6 +1065,31 @@ class _AuthRateLimiter:
         self._failures.pop(ip, None)
 
 
+class _RequestRateLimiter:
+    """Plain sliding-window throttle — no lockout escalation, since unlike
+    /settings there's no secret here to brute-force. Exists purely so a
+    single client hammering the now-public /commands page can't turn it
+    into a load problem for the same process that's also serving the
+    actual audio stream. Same request.remote-keyed, in-memory, resets-on-
+    restart shape as _AuthRateLimiter above, just without the "blocked"
+    concept — allow() either says yes or no for *this* request."""
+
+    def __init__(self, max_requests: int, window_seconds: float) -> None:
+        self._max = max_requests
+        self._window = window_seconds
+        self._hits: dict[str, list[float]] = {}
+
+    def allow(self, ip: str) -> bool:
+        now = time.monotonic()
+        recent = [t for t in self._hits.get(ip, []) if now - t < self._window]
+        if len(recent) >= self._max:
+            self._hits[ip] = recent
+            return False
+        recent.append(now)
+        self._hits[ip] = recent
+        return True
+
+
 class AdminServer:
     """Binds to 127.0.0.1 by default (see Settings.nowplaying_host). Set it
     to 0.0.0.0 and open the matching firewall port if OBS runs on a
@@ -796,6 +1117,12 @@ class AdminServer:
         self._settings_password = settings_password
         self._broadcast_info = broadcast_info
         self._auth_limiter = _AuthRateLimiter()
+        # 60/min per IP is generous for a human browsing a page of static
+        # text (even reloading it repeatedly) while still meaningfully
+        # capping what a script can do against a route that, unlike
+        # everything else this class serves, is now linked from chat to
+        # every viewer rather than just the streamer's own OBS/mods.
+        self._commands_limiter = _RequestRateLimiter(max_requests=60, window_seconds=60.0)
         self._started_at = time.monotonic()
         # Owned by run_admin_server() (created/closed alongside the aiohttp
         # app — see its on_cleanup hook), not by this instance — reused
@@ -806,6 +1133,10 @@ class AdminServer:
         # page renders without a mark.
         self._logo = _read_logo("logo-96.png")
         self._logo_small = _read_logo("logo-32.png")
+        # Built once from static data (COMMANDS + the configured prefix,
+        # both fixed for this process's lifetime) rather than per request —
+        # see _COMMANDS_PAGE_CSS's module comment for why that's safe here.
+        self._commands_page_html = self._build_commands_page()
 
     def _check_auth(self, request: web.Request) -> bool:
         if self._settings_password is None:
@@ -976,6 +1307,137 @@ class AdminServer:
             body=body,
             content_type="image/png",
             headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    def _build_commands_page(self) -> str:
+        """Assembled once at startup (see __init__) from
+        commands_reference.COMMANDS and the configured prefix — both fixed
+        for the process's lifetime — and served byte-for-byte identical on
+        every request after that. Shows every public=True command exactly
+        like chat's own !commands does (block/unblock/blocklist stay out
+        here too), just organized into tabs with full descriptions instead
+        of a terse pipe-separated line.
+
+        Every displayed string is escaped through json.dumps below — there
+        is no per-request or otherwise untrusted input feeding this method
+        at all, since it runs once against static, owner-controlled data,
+        but the client-side renderer still treats it as data rather than
+        markup (see _COMMANDS_PAGE_JS's escapeHtml) as a second layer.
+        """
+        prefix = self._broadcast_info.get("Chat command prefix", "!")
+        visible = [c for c in COMMANDS if c.public]
+        payload = [
+            {
+                "name": c.name,
+                "aliases": [f"{prefix}{a}" for a in c.aliases],
+                "usage": c.usage_line(prefix),
+                "description": c.description,
+                "who": c.who,
+                "group": c.group,
+                "category": c.category,
+            }
+            for c in visible
+        ]
+        # Guards against a description or usage string ever containing a
+        # literal "</script>" sequence, which would otherwise terminate
+        # the script tag early when this JSON is embedded inline below —
+        # standard defensive practice for inline JSON, not something
+        # today's static command text actually contains.
+        data_json = json.dumps(payload).replace("</", "<\\/")
+        categories_json = json.dumps(list(CATEGORIES))
+
+        counts = {cat: sum(1 for c in payload if c["category"] == cat) for cat in CATEGORIES}
+        tabs_html = "".join(
+            f'<button class="tab{" active" if i == 0 else ""}" data-cat="{escape(cat)}">'
+            f'<span class="dot"></span>{escape(cat)}<span class="count">{counts[cat]}</span></button>'
+            for i, cat in enumerate(CATEGORIES)
+        )
+        logo = '<img src="/logo.png" alt="" onerror="this.remove()">' if self._logo else ""
+
+        return f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="robots" content="noindex">
+<title>Commands</title>
+<link rel="icon" type="image/png" href="/logo.png?s=32">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&display=swap" rel="stylesheet">
+<style>{_COMMANDS_PAGE_CSS}</style>
+</head><body>
+<noscript><div class="no-js-note">This page needs JavaScript enabled to browse and search commands.</div></noscript>
+<div class="layout">
+  <nav class="side">
+    <div class="brand">
+      {logo}
+      <div><h1>Commands</h1><p>prefix: <code>{escape(prefix)}</code></p></div>
+    </div>
+    <div class="search">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4">
+        <circle cx="11" cy="11" r="7"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+      </svg>
+      <input id="search" type="text" placeholder="Search commands\u2026" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="tabs">{tabs_html}</div>
+    <p class="side-foot">Ask a moderator if a command isn't working the way it's described here \u2014 some
+      need optional setup on the streamer's end.</p>
+  </nav>
+  <main>
+    <h2 class="panel-title" id="panel-title">{escape(CATEGORIES[0])}</h2>
+    <p class="panel-sub" id="panel-sub">Everything under {escape(CATEGORIES[0].lower())}.</p>
+    <div class="cards" id="cards"></div>
+  </main>
+</div>
+<script>
+window.__COMMANDS__ = {data_json};
+window.__CATEGORIES__ = {categories_json};
+{_COMMANDS_PAGE_JS}
+</script>
+</body></html>"""
+
+    async def handle_commands_page(self, request: web.Request) -> web.Response:
+        """Public, read-only command reference — linked from chat's
+        !commands (see components/info.py) once TWITCH_PUBLIC_BASE_URL is
+        set, so it's reachable by every viewer, not just moderators with
+        the /settings password. That's exactly why this handler is held to
+        a higher bar than the rest of this file's already-public endpoints
+        (/overlay, /nowplaying.json): a per-IP rate limit (this route is
+        the only thing on this server now advertised to a channel's entire
+        chat at once), and security headers that don't matter much for an
+        OBS browser source or a mod's own tab but do for a page anyone
+        might open — CSP with frame-ancestors 'none' plus the legacy
+        X-Frame-Options for older browsers (stop this from being framed
+        elsewhere), nosniff, and a no-referrer policy. There is no request
+        body, no query parameter, and no cookie this handler ever reads —
+        the page is 100% static output built once in __init__ — so beyond
+        the headers and the rate limit there is nothing here for an
+        attacker to actually act on.
+        """
+        ip = request.remote or "unknown"
+        if not self._commands_limiter.allow(ip):
+            return web.Response(status=429, text="Too many requests \u2014 try again in a minute.")
+        return web.Response(
+            text=self._commands_page_html,
+            content_type="text/html",
+            headers={
+                "Cache-Control": "public, max-age=120",
+                "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "DENY",
+                "Referrer-Policy": "no-referrer",
+                "Content-Security-Policy": (
+                    "default-src 'none'; "
+                    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+                    "font-src https://fonts.gstatic.com; "
+                    "script-src 'self' 'unsafe-inline'; "
+                    "img-src 'self' data:; "
+                    "connect-src 'none'; "
+                    "frame-ancestors 'none'; "
+                    "base-uri 'none'; "
+                    "form-action 'none'"
+                ),
+            },
         )
 
     async def handle_thumb_proxy(self, request: web.Request) -> web.Response:
@@ -1461,6 +1923,7 @@ async def run_admin_server(
     app.router.add_get("/blocklist.json", server.handle_blocklist)
     app.router.add_get("/overlay", server.handle_overlay)
     app.router.add_get("/logo.png", server.handle_logo)
+    app.router.add_get("/commands", server.handle_commands_page)
     app.router.add_get("/thumb-proxy", server.handle_thumb_proxy)
     app.router.add_get("/stream.mp3", server.handle_stream)
     app.router.add_get("/settings", server.handle_settings_get)
@@ -1478,8 +1941,8 @@ async def run_admin_server(
     site = web.TCPSite(runner, host, port)
     await site.start()
     log.info(
-        "Admin server listening on http://%s:%d (/stream.mp3, /overlay, /nowplaying.json, "
-        "/ws/nowplaying, /blocklist.json, /healthz, /logo.png, /settings)",
+        "Admin server listening on http://%s:%d (/stream.mp3, /overlay, /commands, "
+        "/nowplaying.json, /ws/nowplaying, /blocklist.json, /healthz, /logo.png, /settings)",
         host, port,
     )
     return runner

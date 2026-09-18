@@ -175,6 +175,7 @@ class TwitchChatBot(commands.Bot):
         bot_id: str,
         owner_id: str,
         prefix: str,
+        public_base_url: str | None,
         resolver: Resolver,
         player: RadioPlayer,
         tunables_store: JsonStore,
@@ -199,6 +200,10 @@ class TwitchChatBot(commands.Bot):
         self.toggles_store = toggles_store
         self.db = db
         self.prefix = prefix
+        # Set only when TWITCH_PUBLIC_BASE_URL is configured — see !commands
+        # in components/info.py, which falls back to the terse in-chat
+        # listing when this is None rather than showing a broken link.
+        self.public_commands_url = f"{public_base_url}/commands" if public_base_url else None
         self._owner_id = owner_id
         self._bot_id = bot_id
         self._token_storage_path = token_storage_path

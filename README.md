@@ -41,7 +41,10 @@ any Discord bot.
   tracks so the stream never drops.
 - **Browser Source overlay** (`/overlay`) showing the current track,
   elapsed/duration progress bar, and the next two songs, driven by a
-  WebSocket with polling fallback.
+  WebSocket with polling fallback. Track changes animate — the finishing
+  track slides out to the left as the next one slides up into place, and
+  the queue shifts up with it; a track newly added to the queue slides up
+  from the bottom rather than just appearing.
 - **Moderation tools** — `!skip`, `!pause`/`!resume`, `!voteskip`,
   `!block`/`!unblock` by track or uploader, `!clearqueue`, a live
   blocklist, and an optional link/caps chat filter (warn-only by
@@ -56,6 +59,11 @@ any Discord bot.
   needs its own small OAuth scope beyond the base setup and degrades
   gracefully without it — see
   [Alerts, shoutouts, clips & polls](#alerts-shoutouts-clips--polls).
+- **Public `/commands` page** — a searchable, categorized command
+  reference any viewer can open (not just moderators), linked from
+  chat's `!commands` once `TWITCH_PUBLIC_BASE_URL` is set. Read-only,
+  rate-limited, and served with a locked-down Content-Security-Policy —
+  see [Public commands page](#public-commands-page).
 - **`/settings` web page** — adjust request limits, feature toggles, and
   the streamer's PC specs/peripherals (shown to viewers via
   `!specs`/`!peripherals`) without touching a config file, optionally
@@ -156,6 +164,7 @@ required; everything else has a default.
 | `TWITCH_NOWPLAYING_HOST` | `127.0.0.1` | HTTP bind address — `0.0.0.0` to expose beyond localhost |
 | `TWITCH_NOWPLAYING_PORT` | `8098` | HTTP port, 1024–65535 |
 | `TWITCH_SETTINGS_PASSWORD` | unset | Basic Auth password for `/settings` (any username) |
+| `TWITCH_PUBLIC_BASE_URL` | unset | Externally-reachable base URL (e.g. `https://radio.example.com`), no trailing slash. When set, `!commands` links to `<url>/commands` instead of the terse in-chat listing — see [Public commands page](#public-commands-page) |
 | `TWITCH_TOKEN_FILE` / `TWITCH_TUNABLES_FILE` / `TWITCH_BLOCKLIST_FILE` / `TWITCH_SPECS_FILE` / `TWITCH_TOGGLES_FILE` / `TWITCH_DB_FILE` | see `.env.example` | Filenames under `data/` |
 | `YTDLP_COOKIES_FILE` | unset | Path under `data/` to a `cookies.txt` — see [notes below](#cookies-and-youtube-blocking-cloud-ips) |
 | `YTDLP_POT_PROVIDER_URL` | unset | URL of a local PO-token provider, if configured |
@@ -340,6 +349,7 @@ Binds to `127.0.0.1` by default (`TWITCH_NOWPLAYING_HOST`).
 |---|---|---|
 | `GET /stream.mp3` | public | The live audio feed |
 | `GET /overlay` | public | The visual now-playing/up-next widget |
+| `GET /commands` | public, rate-limited | Searchable command reference for every viewer — see [Public commands page](#public-commands-page) |
 | `GET /nowplaying.json` | public | Same data as JSON, for a custom overlay |
 | `GET /ws/nowplaying` | public | WebSocket version, pushed on every change |
 | `GET /healthz` | public | Player state, queue size, rolling resolve success/failure counts |
@@ -350,6 +360,43 @@ Binds to `127.0.0.1` by default (`TWITCH_NOWPLAYING_HOST`).
 "Password-gated" means HTTP Basic Auth if `TWITCH_SETTINGS_PASSWORD` is
 set; unset, those endpoints are open. Everything else is always public,
 since it's meant to be fetched by OBS or a browser without auth.
+
+## Public commands page
+
+`/commands` is a small, self-contained page — a sidebar of categories
+(Song Requests, Points & Leaderboard, Stream Info, Moderator Tools), a
+live search box, and a card for every command with its usage, who can
+use it, and what it does. It shows exactly the same set chat's own
+`!commands` does: `!block`/`!unblock`/`!blocklist` stay out of both,
+since a channel's entire chat can reach this page, not just the mods
+who'd normally see those documented on `/settings`.
+
+Set `TWITCH_PUBLIC_BASE_URL` to your bot's externally-reachable address
+(a domain if you have one, or `http://<your-ip>:<port>` otherwise) and
+`!commands` in chat will link straight to it. Leave it unset and
+`!commands` falls back to the terse in-chat listing exactly as before —
+nothing breaks if you don't set this up.
+
+Because this is the one page on this server explicitly meant to be
+opened by everyone watching a stream rather than just the streamer or a
+mod, it's held to a higher bar than the other public endpoints above:
+
+- **Read-only.** No form, no query parameter the server ever reads, no
+  state anywhere. The page is built once from the command list and the
+  configured prefix at startup and served byte-for-byte identical to
+  every visitor after that.
+- **Rate-limited** at 60 requests/minute per IP — generous for a person
+  browsing, enough to blunt a script hammering the one route now linked
+  to an entire channel's chat at once.
+- **Locked-down headers**: a `Content-Security-Policy` that starts from
+  `default-src 'none'` and only opens exactly what the page needs (its
+  own inline style/script, Google Fonts, same-origin images), plus
+  `frame-ancestors 'none'`/`X-Frame-Options: DENY` so it can't be framed
+  elsewhere, `nosniff`, and `Referrer-Policy: no-referrer`.
+- **`!block`/`!unblock`/`!blocklist` are excluded server-side**, not
+  just hidden by CSS — they're never in the data the page sends to the
+  browser in the first place, so there's nothing to find by reading the
+  page's source or network traffic either.
 
 ## Security
 

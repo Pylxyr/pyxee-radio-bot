@@ -208,6 +208,10 @@ def _check_config() -> int:
         f"  HTTP: http://{settings.nowplaying_host}:{settings.nowplaying_port} "
         f"(settings password {'set' if settings.settings_password else 'NOT set — /settings is open to anyone'})"
     )
+    if settings.public_base_url:
+        print(f"  Public commands page: {settings.public_base_url}/commands (linked from !commands in chat)")
+    else:
+        print("  Public commands page: not configured (TWITCH_PUBLIC_BASE_URL unset) — !commands uses the in-chat listing")
     token_status = "found" if settings.token_path.exists() else "missing — run OAuth setup before starting"
     print(f"  Token file: {settings.token_path} ({token_status})")
     print(f"  Community DB: {settings.db_path}")
