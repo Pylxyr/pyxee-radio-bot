@@ -97,7 +97,7 @@ _OVERLAY_HTML = """<!doctype html>
   }
   .panel {
     width: 420px; padding: 14px 18px;
-    background: var(--panel-bg, rgba(15, 17, 23, 0.82));
+    background: var(--panel-bg, rgba(15, 17, 23));
     border-radius: 16px;
     backdrop-filter: blur(6px);
     box-shadow: 0 8px 24px rgba(0,0,0,0.35);
@@ -281,7 +281,7 @@ function applyPalette(url) {
       secondary = legibilize(secondary);
       panel.style.setProperty('--accent-primary', rgbStr(primary));
       panel.style.setProperty('--accent-secondary', rgbStr(secondary));
-      panel.style.setProperty('--panel-bg', rgbaStr(mix(PANEL_BASE, primary, 0.30), 0.88));
+      panel.style.setProperty('--panel-bg', rgbaStr(mix(PANEL_BASE, primary, 0.30), 1.0));
     } catch (e) {
       // Canvas error (shouldn't happen via the same-origin /thumb-proxy —
       // see the proxy fetch below — but keep the current accents either way).
