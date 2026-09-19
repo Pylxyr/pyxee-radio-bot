@@ -143,6 +143,10 @@ class Settings:
     # automatically the way the other local endpoints are. Unset, !commands
     # falls back to the old terse in-chat listing instead of a broken link.
     public_base_url: str | None
+    # Both set, or both None — parsed together below and only accepted as a
+    # pair, since aiohttp's load_cert_chain needs both to do anything.
+    tls_cert_file: Path | None
+    tls_key_file: Path | None
 
     # Persistence — all under DATA_DIR so one ReadWritePaths entry in the
     # systemd unit covers everything this process writes.
@@ -237,6 +241,32 @@ def load_settings() -> Settings:
             f"ignoring it. !commands will use the terse in-chat listing instead of a link."
         )
         public_base_url = None
+    elif public_base_url is not None and public_base_url.startswith("http://"):
+        print(
+            f"WARNING: TWITCH_PUBLIC_BASE_URL={public_base_url!r} uses http://, not https:// — "
+            f"this is the link every viewer gets from !commands, so it's worth serving over TLS. "
+            f"See the README's \"Serving over HTTPS\" section."
+        )
+
+    tls_cert_raw = os.getenv("TWITCH_TLS_CERT_FILE", "").strip()
+    tls_key_raw = os.getenv("TWITCH_TLS_KEY_FILE", "").strip()
+    tls_cert_file = Path(tls_cert_raw) if tls_cert_raw else None
+    tls_key_file = Path(tls_key_raw) if tls_key_raw else None
+    if bool(tls_cert_file) != bool(tls_key_file):
+        print(
+            "WARNING: TWITCH_TLS_CERT_FILE and TWITCH_TLS_KEY_FILE must both be set to enable "
+            "native HTTPS — only one was provided, so the server will run plain HTTP. (If you're "
+            "terminating TLS with a reverse proxy instead, leave both of these unset — that's the "
+            "normal setup and this warning doesn't apply to you.)"
+        )
+        tls_cert_file = tls_key_file = None
+    elif tls_cert_file is not None:
+        if not tls_cert_file.is_file():
+            print(f"WARNING: TWITCH_TLS_CERT_FILE={tls_cert_file} does not exist — server will run plain HTTP.")
+            tls_cert_file = tls_key_file = None
+        elif not tls_key_file.is_file():  # type: ignore[union-attr]
+            print(f"WARNING: TWITCH_TLS_KEY_FILE={tls_key_file} does not exist — server will run plain HTTP.")
+            tls_cert_file = tls_key_file = None
 
     return Settings(
         client_id=client_id,
@@ -250,6 +280,8 @@ def load_settings() -> Settings:
         nowplaying_port=_clamped_int_env("TWITCH_NOWPLAYING_PORT", 8098, 1024, 65535),
         settings_password=settings_password,
         public_base_url=public_base_url,
+        tls_cert_file=tls_cert_file,
+        tls_key_file=tls_key_file,
         token_path=DATA_DIR / os.getenv("TWITCH_TOKEN_FILE", "twitch_tokens.json").strip(),
         tunables_path=DATA_DIR / os.getenv("TWITCH_TUNABLES_FILE", "tunables.json").strip(),
         blocklist_path=DATA_DIR / os.getenv("TWITCH_BLOCKLIST_FILE", "blocklist.json").strip(),

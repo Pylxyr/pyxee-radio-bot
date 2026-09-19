@@ -165,6 +165,7 @@ required; everything else has a default.
 | `TWITCH_NOWPLAYING_PORT` | `8098` | HTTP port, 1024–65535 |
 | `TWITCH_SETTINGS_PASSWORD` | unset | Basic Auth password for `/settings` (any username) |
 | `TWITCH_PUBLIC_BASE_URL` | unset | Externally-reachable base URL (e.g. `https://radio.example.com`), no trailing slash. When set, `!commands` links to `<url>/commands` instead of the terse in-chat listing — see [Public commands page](#public-commands-page) |
+| `TWITCH_TLS_CERT_FILE` / `TWITCH_TLS_KEY_FILE` | unset | Cert/key file paths for native HTTPS — both or neither. See [Serving over HTTPS](#serving-over-https) |
 | `TWITCH_TOKEN_FILE` / `TWITCH_TUNABLES_FILE` / `TWITCH_BLOCKLIST_FILE` / `TWITCH_SPECS_FILE` / `TWITCH_TOGGLES_FILE` / `TWITCH_DB_FILE` | see `.env.example` | Filenames under `data/` |
 | `YTDLP_COOKIES_FILE` | unset | Path under `data/` to a `cookies.txt` — see [notes below](#cookies-and-youtube-blocking-cloud-ips) |
 | `YTDLP_POT_PROVIDER_URL` | unset | URL of a local PO-token provider, if configured |
@@ -397,6 +398,93 @@ mod, it's held to a higher bar than the other public endpoints above:
   just hidden by CSS — they're never in the data the page sends to the
   browser in the first place, so there's nothing to find by reading the
   page's source or network traffic either.
+
+## Serving over HTTPS
+
+Every page this bot serves — `/settings`, `/commands`, `/overlay`,
+everything — sits behind one TCP listener, so making it HTTPS is a matter
+of putting TLS in front of that one listener rather than anything
+per-page. Two ways to do that, in order of what most people should
+actually use:
+
+### Recommended: a reverse proxy with automatic certificates
+
+If you have a domain pointed at your VPS, [Caddy](https://caddyserver.com)
+gets you a real, browser-trusted, auto-renewing certificate from Let's
+Encrypt with a three-line config and no cron job to remember. Install it
+alongside this bot, point the domain at the VPS, and:
+
+```
+# /etc/caddy/Caddyfile
+radio.example.com {
+    reverse_proxy 127.0.0.1:8098
+}
+```
+
+`sudo systemctl reload caddy` and you're done — Caddy handles the
+certificate, the renewal, and the HTTP→HTTPS redirect. The bot itself
+keeps running exactly as documented above (`TWITCH_NOWPLAYING_HOST` stays
+`127.0.0.1`, nothing in `.env` changes for this) since it's now only ever
+reached through Caddy, not directly. Set:
+
+```
+TWITCH_PUBLIC_BASE_URL=https://radio.example.com
+```
+
+so `!commands` links to the https URL. nginx + certbot is the other
+common combination if you already run nginx for something else, at the
+cost of a bit more manual setup (certbot's renewal timer, a server block
+pointing at `proxy_pass http://127.0.0.1:8098;`).
+
+### Alternative: native TLS in the bot itself
+
+No domain, or you'd rather not run a second process (this is the more
+practical option under Termux). Provide a certificate and key file
+directly and the bot terminates TLS itself:
+
+```
+TWITCH_TLS_CERT_FILE=/path/to/fullchain.pem
+TWITCH_TLS_KEY_FILE=/path/to/privkey.pem
+```
+
+Both or neither — set only one and the bot logs a warning and falls back
+to plain HTTP rather than failing to start. Once both are set, **every**
+route on this port becomes HTTPS-only for as long as the process runs;
+there's no HTTP fallback left on that same port to redirect from, so
+update any saved `http://` links (OBS's Browser Source URL, bookmarks,
+`TWITCH_PUBLIC_BASE_URL`) to `https://` once you turn this on. This path
+has no automatic renewal — a Let's Encrypt certificate obtained via
+`certbot certonly --standalone` (or `--webroot`) still expires every 90
+days and needs `TWITCH_TLS_CERT_FILE`/`TWITCH_TLS_KEY_FILE` to keep
+pointing at current files, which is exactly the manual toil Caddy exists
+to avoid — reach for the reverse proxy above if you have a domain
+available at all.
+
+A self-signed certificate works for this option too (`openssl req -x509
+-newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 365 -subj
+"/CN=your-ip-or-host"`), but every browser will show a certificate
+warning, and **OBS's Browser Source can't click through that warning the
+way a normal browser tab can** — a self-signed cert will leave the
+overlay blank in OBS. Fine for quickly testing that TLS wiring itself
+works; not something to leave running for the overlay or for anything
+handed out to viewers.
+
+If you do point `TWITCH_TLS_CERT_FILE`/`TWITCH_TLS_KEY_FILE` at a real
+Let's Encrypt certificate instead of a self-signed one, note that
+`certbot`'s files under `/etc/letsencrypt/live/` are readable only by
+root by default — and this bot's systemd unit deliberately runs as an
+unprivileged user (see `deploy/twitch-radio.service`), so it won't be
+able to read the private key as-is. Either grant that one user read
+access (`setfacl -m u:youruser:rx` on the containing directories, so a
+renewal doesn't reset a plain `chmod`), or copy the two files somewhere
+the bot's user owns and point the env vars there — but a copy has to be
+kept in sync by hand across renewals, which is one more reason the
+reverse-proxy path above is usually less trouble in the long run.
+
+Either way, once a browser reaches any page here over HTTPS at all, it
+gets sent `Strict-Transport-Security`, so that browser will keep
+insisting on HTTPS for this host afterward even if it's later linked
+somewhere with a stray `http://`.
 
 ## Security
 

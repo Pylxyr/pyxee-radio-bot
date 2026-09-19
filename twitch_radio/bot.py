@@ -91,6 +91,8 @@ async def _async_run(settings: Settings) -> None:
             },
             host=settings.nowplaying_host,
             port=settings.nowplaying_port,
+            tls_cert_file=settings.tls_cert_file,
+            tls_key_file=settings.tls_key_file,
         )
         try:
             bot = TwitchChatBot(
@@ -204,10 +206,16 @@ def _check_config() -> int:
     print("Config OK:")
     print(f"  Twitch: bot_id={settings.bot_id} owner_id={settings.owner_id} prefix={settings.prefix!r}")
     print(f"  Audio: {settings.audio_bitrate_kbps} kbps, pause_when_no_listeners={settings.pause_when_no_listeners}")
+    tls_on = settings.tls_cert_file is not None and settings.tls_key_file is not None
+    scheme = "https" if tls_on else "http"
     print(
-        f"  HTTP: http://{settings.nowplaying_host}:{settings.nowplaying_port} "
+        f"  HTTP: {scheme}://{settings.nowplaying_host}:{settings.nowplaying_port} "
         f"(settings password {'set' if settings.settings_password else 'NOT set — /settings is open to anyone'})"
     )
+    if tls_on:
+        print(f"  TLS: native, cert={settings.tls_cert_file}")
+    else:
+        print("  TLS: not configured natively — plain HTTP unless a reverse proxy terminates TLS in front of this")
     if settings.public_base_url:
         print(f"  Public commands page: {settings.public_base_url}/commands (linked from !commands in chat)")
     else:

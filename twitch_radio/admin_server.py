@@ -5,8 +5,10 @@ import base64
 import hmac
 import json
 import logging
+import ssl
 import time
 from html import escape
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -1896,6 +1898,26 @@ window.__CATEGORIES__ = {categories_json};
 </body></html>"""
 
 
+@web.middleware
+async def _security_headers_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
+    """Adds Strict-Transport-Security to every response this app serves,
+    app-wide, rather than threading a headers dict through each individual
+    handler (/settings alone has three separate response sites: success,
+    validation-error, and the auth challenge). Meaningful once a browser
+    actually reaches this over HTTPS — either via the native TLS support
+    below, or a reverse proxy in front of it (see the README's "Serving
+    over HTTPS") — and harmless otherwise: browsers ignore this header
+    entirely when it arrives over plain http, per spec, and this process
+    has no reliable way to know which case it's in when it's sitting
+    behind a proxy that terminated TLS upstream. setdefault rather than a
+    flat assignment so a handler that ever sets its own value (none do
+    today) isn't silently overridden.
+    """
+    response = await handler(request)
+    response.headers.setdefault("Strict-Transport-Security", "max-age=15552000")
+    return response
+
+
 async def run_admin_server(
     *,
     player: RadioPlayer,
@@ -1908,6 +1930,8 @@ async def run_admin_server(
     broadcast_info: dict[str, str],
     host: str,
     port: int,
+    tls_cert_file: Path | None = None,
+    tls_key_file: Path | None = None,
 ) -> web.AppRunner:
     thumb_session = aiohttp.ClientSession()
     server = AdminServer(
@@ -1916,7 +1940,7 @@ async def run_admin_server(
         settings_password=settings_password, broadcast_info=broadcast_info,
         thumb_session=thumb_session,
     )
-    app = web.Application()
+    app = web.Application(middlewares=[_security_headers_middleware])
     app.router.add_get("/nowplaying.json", server.handle_nowplaying)
     app.router.add_get("/healthz", server.handle_healthz)
     app.router.add_get("/ws/nowplaying", server.handle_ws_nowplaying)
@@ -1936,13 +1960,31 @@ async def run_admin_server(
 
     app.on_cleanup.append(_close_thumb_session)
 
+    # Both TWITCH_TLS_CERT_FILE and TWITCH_TLS_KEY_FILE, or neither — config.py
+    # already validated that and warned + cleared both otherwise, so by the
+    # time either argument reaches here it's trustworthy to act on directly.
+    # This makes EVERY route on this app HTTPS-only for the lifetime of this
+    # listener: aiohttp binds one (host, port) to one protocol, so there is
+    # no plain-http fallback left on this same port once TLS is on — anyone
+    # with an old http:// link gets a connection error, not a redirect. For
+    # a real, browser-trusted certificate that renews itself, a reverse
+    # proxy (Caddy, with automatic Let's Encrypt) in front of the bot is the
+    # easier and more common path — see the README's "Serving over HTTPS"
+    # section — this native option exists for setups (Termux, no separate
+    # process wanted) where standing up a proxy isn't practical.
+    ssl_context: ssl.SSLContext | None = None
+    if tls_cert_file is not None and tls_key_file is not None:
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.load_cert_chain(certfile=str(tls_cert_file), keyfile=str(tls_key_file))
+
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, host, port)
+    site = web.TCPSite(runner, host, port, ssl_context=ssl_context)
     await site.start()
+    scheme = "https" if ssl_context is not None else "http"
     log.info(
-        "Admin server listening on http://%s:%d (/stream.mp3, /overlay, /commands, "
+        "Admin server listening on %s://%s:%d (/stream.mp3, /overlay, /commands, "
         "/nowplaying.json, /ws/nowplaying, /blocklist.json, /healthz, /logo.png, /settings)",
-        host, port,
+        scheme, host, port,
     )
     return runner
