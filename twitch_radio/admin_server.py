@@ -110,13 +110,39 @@ _OVERLAY_HTML = """<!doctype html>
   /* Track-change choreography: the finishing track exits left, the
      incoming one enters by sliding up from below (see render()'s
      trackKey-changed branch, which adds/removes these classes around a
-     single panel.innerHTML swap). Both transform and opacity animate so
-     the motion reads as a genuine transition rather than a hard cut. */
-  .now, .next { transition: transform 0.32s cubic-bezier(.22,.61,.36,1), opacity 0.28s ease; }
-  .now.now-exit { transform: translateX(-42px); opacity: 0; }
-  .now.now-enter { transform: translateY(30px); opacity: 0; }
-  .now.now-enter-active { transform: translateY(0); opacity: 1; }
-  .next.next-exit { transform: translateY(-14px); opacity: 0; }
+     single panel.innerHTML swap). Exit and enter share one duration
+     (0.4s, both transform and opacity) rather than mismatched ones —
+     with different durations, transitionend fires on whichever property
+     finishes first, so the swap could cut the slide-out a beat short of
+     actually finishing. Entrances get a livelier back-out overshoot
+     curve layered on top (see .now-enter-active below); exits use a
+     plainer accelerate, since overshooting on the way OUT reads as an
+     odd wobble rather than a confident pop into place. */
+  .now, .next {
+    transition: transform 0.4s cubic-bezier(.4,0,.2,1), opacity 0.4s cubic-bezier(.4,0,.2,1);
+  }
+  .now.now-exit { transform: translateX(-96px) scale(0.94); opacity: 0; }
+  .now.now-enter { transform: translateY(54px) scale(0.92); opacity: 0; }
+  .now.now-enter-active {
+    transform: translateY(0) scale(1); opacity: 1;
+    transition-timing-function: cubic-bezier(.34,1.56,.64,1);
+  }
+  .next.next-exit { transform: translateY(-28px) scale(0.97); opacity: 0; }
+  /* A brief pulse on the album art itself, timed with the pop-in above —
+     scoped to the compact 56px thumb rather than the whole row so the
+     glow's blur radius has room to breathe without hitting .panel's own
+     overflow:hidden edge (which would look like an abrupt clip rather
+     than a soft glow). Starts and ends at the thumb's own resting
+     ambient glow rather than nothing, so it reads as "the same glow,
+     just brighter for a moment" rather than a shadow popping in from
+     nowhere. Picks up whatever accent color the current thumbnail
+     extracted to (see applyPalette), so the flash always matches. */
+  .now.now-enter-active .thumb { animation: thumb-glow-pulse 900ms cubic-bezier(.22,.61,.36,1); }
+  @keyframes thumb-glow-pulse {
+    0%   { box-shadow: 0 0 0 1px rgba(255,255,255,0.10), 0 0 16px -4px var(--accent-primary); }
+    18%  { box-shadow: 0 0 0 1px rgba(255,255,255,0.28), 0 0 32px 5px var(--accent-primary); }
+    100% { box-shadow: 0 0 0 1px rgba(255,255,255,0.10), 0 0 16px -4px var(--accent-primary); }
+  }
   .thumb {
     width: 56px; height: 56px; border-radius: 10px; flex-shrink: 0;
     background: rgba(255,255,255,0.08) center/cover no-repeat;
@@ -144,16 +170,19 @@ _OVERLAY_HTML = """<!doctype html>
   .next-item {
     font-size: 12px; color: #C7C9D6; white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis; line-height: 1.6;
-    transition: transform 0.3s cubic-bezier(.22,.61,.36,1), opacity 0.3s ease;
+    transition: transform 0.38s cubic-bezier(.34,1.56,.64,1), opacity 0.34s ease;
   }
   /* Applied only to an item that wasn't visible a moment ago — a newly
      !sr'd track landing in the queue, or one promoted into view because
      something ahead of it just left. Already-visible items are left
-     alone so they don't replay an entrance they already played. */
-  .next-item.item-enter { transform: translateY(18px); opacity: 0; }
-  .next-item.item-enter-active { transform: translateY(0); opacity: 1; }
+     alone so they don't replay an entrance they already played. Each
+     gets a small extra transition-delay set in JS (animateNewQueueItems)
+     so multiple new items cascade in one after another instead of
+     popping up all at once. */
+  .next-item.item-enter { transform: translateY(30px) scale(0.95); opacity: 0; }
+  .next-item.item-enter-active { transform: translateY(0) scale(1); opacity: 1; }
   @media (prefers-reduced-motion: reduce) {
-    .now, .next, .next-item { transition: none !important; }
+    .now, .next, .next-item, .thumb { animation: none !important; transition: none !important; }
   }
 </style></head>
 <body><div class="panel" id="panel"></div>
@@ -313,6 +342,12 @@ function animateNewQueueItems(wrap, newTitles, oldTitles) {
   const items = wrap.querySelectorAll('.next-item');
   items.forEach((el, i) => {
     if (newTitles[i] !== undefined && !oldTitles.includes(newTitles[i])) {
+      // Staggered by position, not by how many items are actually new —
+      // so if item 2 is new but item 1 isn't, item 2 still waits its
+      // turn rather than jumping in first. Each fresh render creates
+      // brand-new elements (see innerHTML above), so there's no stale
+      // delay to worry about clearing between renders.
+      el.style.transitionDelay = (i * 70) + 'ms';
       el.classList.add('item-enter');
     }
   });
@@ -406,7 +441,11 @@ function render(data, elapsed) {
       oldNow.addEventListener('transitionend', swap, { once: true });
       // Safety net: prefers-reduced-motion (or any environment where the
       // transition genuinely never fires) would otherwise wait forever.
-      setTimeout(swap, 400);
+      // Comfortably past the 400ms exit transition above, not equal to
+      // it — right at the boundary this could occasionally race ahead of
+      // the real transitionend on a slow frame, which the `swapped` flag
+      // makes harmless either way, but there's no reason to cut it close.
+      setTimeout(swap, 550);
     } else {
       // First render, or coming back from silence — nothing on screen to
       // animate away from, so just build directly.
