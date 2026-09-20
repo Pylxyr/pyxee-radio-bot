@@ -6,6 +6,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from twitch_radio.netutil import is_loopback_host
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 LOG_DIR = BASE_DIR / "logs"
@@ -135,6 +137,11 @@ class Settings:
     nowplaying_host: str
     nowplaying_port: int
     settings_password: str | None
+    # Opt-in escape hatch. With no password set and a bind address reachable off
+    # this machine, /settings and /blocklist.json are disabled outright; this
+    # (TWITCH_SETTINGS_ALLOW_OPEN=true) restores password-less access for
+    # networks the operator trusts.
+    settings_allow_open: bool
     # Externally-reachable base URL for the public /commands page (no
     # trailing slash), e.g. "https://radio.example.com" or
     # "http://203.0.113.5:8098". None if unset — nowplaying_host is almost
@@ -227,12 +234,23 @@ def load_settings() -> Settings:
 
     nowplaying_host = os.getenv("TWITCH_NOWPLAYING_HOST", "127.0.0.1").strip() or "127.0.0.1"
     settings_password = os.getenv("TWITCH_SETTINGS_PASSWORD", "").strip() or None
-    if nowplaying_host not in ("127.0.0.1", "localhost") and settings_password is None:
-        print(
-            f"WARNING: TWITCH_NOWPLAYING_HOST={nowplaying_host!r} is reachable off this machine, "
-            f"but TWITCH_SETTINGS_PASSWORD is unset — anyone who finds the port can change your "
-            f"queue/cooldown settings via /settings. Set TWITCH_SETTINGS_PASSWORD."
-        )
+    settings_allow_open = _bool_env("TWITCH_SETTINGS_ALLOW_OPEN", False)
+    host_is_exposed = not is_loopback_host(nowplaying_host)
+    if host_is_exposed and settings_password is None:
+        if settings_allow_open:
+            print(
+                f"WARNING: TWITCH_NOWPLAYING_HOST={nowplaying_host!r} is reachable off this machine and "
+                f"TWITCH_SETTINGS_PASSWORD is unset, with TWITCH_SETTINGS_ALLOW_OPEN on — anyone who "
+                f"finds the port can change your queue/cooldown settings via /settings. Set "
+                f"TWITCH_SETTINGS_PASSWORD."
+            )
+        else:
+            print(
+                f"WARNING: TWITCH_NOWPLAYING_HOST={nowplaying_host!r} is reachable off this machine but "
+                f"TWITCH_SETTINGS_PASSWORD is unset — /settings and /blocklist.json are DISABLED until "
+                f"you set a password. (TWITCH_SETTINGS_ALLOW_OPEN=true re-enables them without one; "
+                f"only do that on a network you trust.)"
+            )
 
     public_base_url = os.getenv("TWITCH_PUBLIC_BASE_URL", "").strip().rstrip("/") or None
     if public_base_url is not None and not public_base_url.startswith(("http://", "https://")):
@@ -246,6 +264,14 @@ def load_settings() -> Settings:
             f"WARNING: TWITCH_PUBLIC_BASE_URL={public_base_url!r} uses http://, not https:// — "
             f"this is the link every viewer gets from !commands, so it's worth serving over TLS. "
             f"See the README's \"Serving over HTTPS\" section."
+        )
+
+    if settings_password is None and public_base_url is not None and not host_is_exposed:
+        print(
+            "WARNING: TWITCH_PUBLIC_BASE_URL is set but TWITCH_SETTINGS_PASSWORD is not. If that URL "
+            "points at a reverse proxy in front of this server, /settings is reachable through it "
+            "with no login at all (the bot only sees the proxy on 127.0.0.1). Set "
+            "TWITCH_SETTINGS_PASSWORD."
         )
 
     tls_cert_raw = os.getenv("TWITCH_TLS_CERT_FILE", "").strip()
@@ -279,6 +305,7 @@ def load_settings() -> Settings:
         nowplaying_host=nowplaying_host,
         nowplaying_port=_clamped_int_env("TWITCH_NOWPLAYING_PORT", 8098, 1024, 65535),
         settings_password=settings_password,
+        settings_allow_open=settings_allow_open,
         public_base_url=public_base_url,
         tls_cert_file=tls_cert_file,
         tls_key_file=tls_key_file,

@@ -5,7 +5,7 @@ import contextlib
 import logging
 import signal
 
-from twitch_radio.admin_server import run_admin_server
+from twitch_radio.admin.app import run_admin_server
 from twitch_radio.player import RadioPlayer
 from twitch_radio.chatbot import TwitchChatBot
 from twitch_radio.chatfeed import ChatFeed
@@ -101,6 +101,7 @@ async def _async_run(settings: Settings) -> None:
             port=settings.nowplaying_port,
             tls_cert_file=settings.tls_cert_file,
             tls_key_file=settings.tls_key_file,
+            allow_open_settings=settings.settings_allow_open,
         )
         try:
             bot = TwitchChatBot(

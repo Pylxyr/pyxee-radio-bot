@@ -167,7 +167,8 @@ required; everything else has a default.
 | `PAUSE_QUEUE_WHEN_NO_LISTENERS` | `false` | Hold at the track boundary while nobody's connected to `/stream.mp3` |
 | `TWITCH_NOWPLAYING_HOST` | `127.0.0.1` | HTTP bind address — `0.0.0.0` to expose beyond localhost |
 | `TWITCH_NOWPLAYING_PORT` | `8098` | HTTP port, 1024–65535 |
-| `TWITCH_SETTINGS_PASSWORD` | unset | Basic Auth password for `/settings` (any username) |
+| `TWITCH_SETTINGS_PASSWORD` | unset | Basic Auth password for `/settings` and `/blocklist.json` (any username) |
+| `TWITCH_SETTINGS_ALLOW_OPEN` | `false` | Only matters when `TWITCH_NOWPLAYING_HOST` is reachable off this machine *and* no password is set. By default `/settings` and `/blocklist.json` are then **disabled**; `true` lets anyone who can reach the port use them. Set a password instead unless the network is fully trusted |
 | `TWITCH_PUBLIC_BASE_URL` | unset | Externally-reachable base URL (e.g. `https://radio.example.com`), no trailing slash. When set, `!commands` links to `<url>/commands` instead of the terse in-chat listing — see [Public commands page](#public-commands-page) |
 | `TWITCH_TLS_CERT_FILE` / `TWITCH_TLS_KEY_FILE` | unset | Cert/key file paths for native HTTPS — both or neither. See [Serving over HTTPS](#serving-over-https) |
 | `TWITCH_TOKEN_FILE` / `TWITCH_TUNABLES_FILE` / `TWITCH_BLOCKLIST_FILE` / `TWITCH_SPECS_FILE` / `TWITCH_TOGGLES_FILE` / `TWITCH_DB_FILE` | see `.env.example` | Filenames under `data/` |
@@ -266,8 +267,8 @@ If this service runs on the **same machine** as OBS, `<host>` is
 Common case: the bot runs on a cloud VM, OBS runs on your own PC.
 
 **Option A — open the port.** Set `TWITCH_NOWPLAYING_HOST=0.0.0.0` and set
-`TWITCH_SETTINGS_PASSWORD` (a startup warning fires if you leave it unset
-with a non-localhost host). Open `TWITCH_NOWPLAYING_PORT` (default 8098)
+`TWITCH_SETTINGS_PASSWORD` (leave it unset with a non-localhost host and
+`/settings` and `/blocklist.json` are disabled until you set one). Open `TWITCH_NOWPLAYING_PORT` (default 8098)
 in both your cloud firewall (ingress, TCP, source `0.0.0.0/0`) and the
 VM's own OS firewall — on Oracle Cloud's stock Ubuntu images, `ufw` is
 disabled by default and `/etc/iptables/rules.v4` needs editing directly:
@@ -369,9 +370,16 @@ Binds to `127.0.0.1` by default (`TWITCH_NOWPLAYING_HOST`).
 | `GET /blocklist.json` | password-gated | Full blocklist contents |
 | `GET`/`POST /settings` | password-gated | Request-limit and specs/peripherals editor |
 
-"Password-gated" means HTTP Basic Auth if `TWITCH_SETTINGS_PASSWORD` is
-set; unset, those endpoints are open. Everything else is always public,
-since it's meant to be fetched by OBS or a browser without auth.
+"Password-gated" means HTTP Basic Auth with `TWITCH_SETTINGS_PASSWORD`.
+Unset, those endpoints are open only while the server listens on
+localhost (`127.0.0.1`/`::1`); on any other bind address they are disabled
+(HTTP 403) unless you opt in with `TWITCH_SETTINGS_ALLOW_OPEN=true`. That
+rule looks at the bind address only, so if you publish the bot through a
+reverse proxy on the same machine (bot on `127.0.0.1`), set a password —
+the bot can't tell proxied visitors from local ones. Failed logins are
+rate-limited per client address (behind a proxy, all visitors share the
+proxy's address and therefore one limit). Everything else is always
+public, since it's meant to be fetched by OBS or a browser without auth.
 
 ## Public commands page
 
@@ -590,7 +598,15 @@ twitch-radio-bot/
     │   ├── engagement.py          #   !points, !leaderboard, !watchtime, !addcom/!editcom/!delcom
     │   ├── alerts.py              #   follow/sub/cheer/raid announcements, auto-shoutout, !so
     │   └── stream_info.py         #   !uptime, !title, !game, !followage, !clip, !poll
-    ├── admin_server.py            # aiohttp: /stream.mp3, /overlay, /nowplaying.json, /ws/nowplaying, /healthz, /settings (live now-playing + full command reference)
+    ├── netutil.py                 # is_loopback_host(): shared by config warnings and the admin server
+    ├── admin/                     # the aiohttp HTTP surface (/stream.mp3, /overlay, /nowplaying.json, /ws/*, /healthz, /commands, /settings)
+    │   ├── app.py                 #   run_admin_server(): routes, middleware, TLS, startup/teardown
+    │   ├── context.py             #   AdminContext: the shared state every handler reads
+    │   ├── security.py            #   Basic-auth check, CSRF origin check, rate limiters, thumbnail URL allowlist (stdlib only)
+    │   ├── assets.py              #   loads static/ and the logo
+    │   ├── handlers/              #   live.py (now-playing, chat, overlays, /commands), media.py (stream, thumb proxy), settings.py, auth.py
+    │   ├── render/                #   settings_page.py, commands_page.py — pure HTML builders
+    │   └── static/                #   overlay/chat-overlay pages, settings + commands templates, CSS and JS
     └── bot.py                     # wires everything together, owns shutdown, --check-config
 ```
 

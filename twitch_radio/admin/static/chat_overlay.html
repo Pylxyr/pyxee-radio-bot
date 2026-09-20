@@ -1,0 +1,218 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: transparent; }
+  body {
+    /* The emoji families at the end matter: an explicit stack without them can
+       leave Unicode emoji as empty boxes in browser sources on some systems. */
+    font-family: "Sora", -apple-system, "Segoe UI", sans-serif,
+      "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji";
+    color: #F3F1EA;
+    display: flex; flex-direction: column; justify-content: flex-end; align-items: flex-start;
+    height: 100vh; padding: 20px; overflow: hidden;
+  }
+  .chat-list { display: flex; flex-direction: column; gap: 6px; width: 420px; max-width: 100%; }
+  .msg {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px;
+    padding: 7px 12px; border-radius: 10px;
+    background: rgba(15, 17, 23, 0.72);
+    backdrop-filter: blur(6px);
+    box-shadow: 0 4px 14px rgba(0,0,0,0.28);
+    font-size: 13.5px; line-height: 1.4;
+    /* New messages slide up from below with the same lively back-out pop
+       used throughout the now-playing overlay's own motion language;
+       removals fade+drift out more plainly (see .msg-exit) — an
+       overshoot on the way out looks like a wobble, not a feature, same
+       reasoning as the now-playing panel's own exit. */
+    transition: transform 0.42s cubic-bezier(.34,1.56,.64,1), opacity 0.36s ease;
+  }
+  .msg.msg-enter { transform: translateY(26px) scale(0.96); opacity: 0; }
+  .msg.msg-enter-active { transform: translateY(0) scale(1); opacity: 1; }
+  .msg.msg-exit {
+    transform: translateY(-8px); opacity: 0;
+    transition: transform 0.5s cubic-bezier(.4,0,.2,1), opacity 0.5s ease;
+  }
+  .msg-author { font-weight: 700; white-space: nowrap; }
+  .msg-text { color: #E7E7EE; word-break: break-word; }
+  /* Twitch emotes (global and subscriber) — sized to the line so a row of them
+     doesn't blow up the message box. */
+  .emote { height: 1.7em; width: auto; vertical-align: middle; margin: -0.25em 1px; }
+  @media (prefers-reduced-motion: reduce) {
+    .msg { transition: none !important; }
+  }
+</style></head>
+<body>
+<div class="chat-list" id="chat-list"></div>
+<script>
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+// Deterministic username -> color, entirely client-side — see this
+// constant's module-level comment above for why this isn't Twitch's own
+// per-account chat color.
+function hashColor(name) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) { h = (h * 31 + name.charCodeAt(i)) | 0; }
+  return `hsl(${Math.abs(h) % 360}, 70%, 68%)`;
+}
+
+// Identity for diffing is the message's own id, not list position —
+// position shifts every time anything is added or aged out elsewhere in
+// the list, which would make nearly every message look "new" on every
+// render if position were part of the key. The server-assigned id also keeps
+// two identical messages in a row (someone spamming the same emote) as two
+// separate rows; the (author, text) fallback only exists for an older server
+// that doesn't send ids.
+function msgKey(m) { return m.id != null ? 'id:' + m.id : m.author + "\u0000" + m.text; }
+
+// Twitch's own emote CDN — global and subscriber emotes alike, addressed by
+// the id that arrives with each emote fragment. "dark" is the variant made
+// for dark backgrounds, which is what this panel is.
+const EMOTE_CDN = 'https://static-cdn.jtvnw.net/emoticons/v2/';
+function emoteUrl(f) {
+  return EMOTE_CDN + encodeURIComponent(f.id) + '/' + (f.animated ? 'animated' : 'static') + '/dark/2.0';
+}
+
+// Built with DOM nodes and text nodes only (never innerHTML) so chat text can
+// never be interpreted as markup. An emote that fails to load falls back to
+// its name, which is what the overlay showed for every emote before.
+function makeTextEl(m) {
+  const box = document.createElement('span');
+  box.className = 'msg-text';
+  const fragments = Array.isArray(m.fragments) && m.fragments.length
+    ? m.fragments
+    : [{ type: 'text', text: m.text }];
+  for (const f of fragments) {
+    if (f.type === 'emote' && f.id) {
+      const img = document.createElement('img');
+      img.className = 'emote';
+      img.alt = f.name || '';
+      img.title = f.name || '';
+      img.decoding = 'async';
+      img.addEventListener('error', () => img.replaceWith(document.createTextNode(f.name || '')), { once: true });
+      img.src = emoteUrl(f);
+      box.appendChild(img);
+    } else {
+      box.appendChild(document.createTextNode(f.text || ''));
+    }
+  }
+  return box;
+}
+
+function makeMsgEl(m) {
+  const el = document.createElement('div');
+  el.className = 'msg';
+  el.innerHTML = '<span class="msg-author" style="color:' + hashColor(m.author) + '">' + escapeHtml(m.author) + '</span>';
+  el.appendChild(makeTextEl(m));
+  return el;
+}
+
+const list = document.getElementById('chat-list');
+// key -> element currently in the DOM, survivors included so a message
+// that's simply shifted position (something new arrived below it, or an
+// older one above it aged out) is moved rather than destroyed and
+// recreated — recreating it would also wipe out any transition already
+// in progress on that exact node.
+let current = new Map();
+
+function render(messages) {
+  const keep = new Set(messages.map(msgKey));
+  for (const [key, el] of current) {
+    if (keep.has(key)) continue;
+    // No longer in the payload at all (aged out, or pushed off the
+    // 10-message cap) — fade it out in place rather than an abrupt
+    // disappearance, then actually remove it once that's done.
+    el.classList.add('msg-exit');
+    let removed = false;
+    const remove = () => { if (!removed) { removed = true; el.remove(); } };
+    el.addEventListener('transitionend', remove, { once: true });
+    setTimeout(remove, 650);  // safety net — prefers-reduced-motion never fires transitionend at all
+    current.delete(key);
+  }
+
+  // Rebuilding into a fragment and appending it moves already-existing
+  // nodes to their new position (appendChild on a node already in the
+  // document relocates it) rather than recreating them, so a merely-
+  // reordered message keeps whatever transition state it's already in.
+  const frag = document.createDocumentFragment();
+  messages.forEach((m) => {
+    const key = msgKey(m);
+    let el = current.get(key);
+    if (!el) {
+      el = makeMsgEl(m);
+      current.set(key, el);
+      frag.appendChild(el);
+      el.classList.add('msg-enter');
+      requestAnimationFrame(() => {
+        el.classList.remove('msg-enter');
+        el.classList.add('msg-enter-active');
+      });
+    } else {
+      frag.appendChild(el);
+    }
+  });
+  list.appendChild(frag);
+}
+
+// ChatFeed already enforces both the 10-message cap and the 10-minute
+// expiry server-side (see chatfeed.py) — every payload received here is
+// already correctly pruned. The one thing a payload can't do on its own
+// is keep pruning between payloads: if chat goes quiet, no new message
+// ever arrives to trigger a fresh push, so age_seconds ticks forward
+// locally (10 * 60 = 600s here has to match ChatFeed's own default) and
+// this periodically re-renders even with no server activity at all, the
+// same reason the now-playing overlay ticks its own elapsed time between
+// pushes instead of waiting on the server for that too.
+const MAX_AGE_SECONDS = 600;
+let lastPayload = null;
+let receivedAt = 0;
+
+function effectiveMessages() {
+  if (!lastPayload) return [];
+  const elapsed = (performance.now() - receivedAt) / 1000;
+  return lastPayload.messages.filter((m) => (m.age_seconds || 0) + elapsed < MAX_AGE_SECONDS);
+}
+
+function onPayload(data) {
+  lastPayload = data;
+  receivedAt = performance.now();
+  render(effectiveMessages());
+}
+
+async function poll() {
+  if (ws && ws.readyState === WebSocket.OPEN) return;
+  try {
+    const res = await fetch('/chat.json');
+    onPayload(await res.json());
+  } catch (e) { /* keep showing the last known state */ }
+}
+
+let ws = null;
+function connectWs() {
+  let socket;
+  try {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    socket = new WebSocket(`${proto}//${location.host}/ws/chat`);
+  } catch (e) {
+    return;  // no WebSocket support — poll() carries the whole load
+  }
+  ws = socket;
+  socket.onmessage = (ev) => {
+    try { onPayload(JSON.parse(ev.data)); } catch (e) { /* malformed frame — next one (or poll()) recovers */ }
+  };
+  socket.onclose = () => { if (ws === socket) ws = null; setTimeout(connectWs, 2000); };
+  socket.onerror = () => { try { socket.close(); } catch (e) {} };
+}
+
+connectWs();
+poll();
+setInterval(poll, 2000);
+setInterval(() => render(effectiveMessages()), 5000);
+</script>
+</body></html>

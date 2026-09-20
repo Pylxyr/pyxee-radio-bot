@@ -7,7 +7,7 @@ actually implement:
 
 - components/info.py's `!commands` — a terse, space-constrained summary
   in chat, filtered to `public=True` entries.
-- admin_server.py's /settings page — a full reference table with usage
+- the admin server's /settings page (admin/render/settings_page.py) — a full reference table with usage
   and description text, including the `public=False` entries that don't
   appear in chat at all.
 

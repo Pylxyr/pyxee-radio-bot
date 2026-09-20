@@ -90,7 +90,7 @@ from twitchio import eventsub
 from twitchio.exceptions import HTTPException, TwitchioException
 from twitchio.ext import commands
 
-from twitch_radio.chatfeed import ChatFeed
+from twitch_radio.chatfeed import ChatFeed, fragments_to_dicts
 from twitch_radio.components.alerts import AlertsComponent
 from twitch_radio.components.engagement import EngagementComponent
 from twitch_radio.components.info import InfoComponent
@@ -566,7 +566,11 @@ class TwitchChatBot(commands.Bot):
         # stream. This has to happen before the moderator early-return
         # right below, or a mod's own messages would never appear there.
         if text:
-            self.chat_feed.append(chatter.display_name or str(chatter_id), text)
+            self.chat_feed.append(
+                chatter.display_name or str(chatter_id),
+                text,
+                fragments=fragments_to_dicts(getattr(message, "fragments", ())),
+            )
 
         if chatter.moderator:  # covers the broadcaster too — see Chatter.moderator
             return  # mods/broadcaster exempt from the chat filters below

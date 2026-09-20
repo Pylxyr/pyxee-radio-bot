@@ -24,6 +24,9 @@ log = logging.getLogger(__name__)
 # chatbot.py — merged there with moderation.py's own _USAGE.
 USAGE = {"sr": "Usage: !sr <song name or URL>"}
 
+# How much of a chatter's query the "Looking up ..." acknowledgement repeats.
+_MAX_ECHO_CHARS = 80
+
 
 class SongRequestComponent(commands.Component):
     def __init__(self, bot: TwitchChatBot) -> None:
@@ -94,7 +97,11 @@ class SongRequestComponent(commands.Component):
         # failure on THIS message would abort song_request() before the
         # task is ever created — the pending-count reservation made above
         # would leak, and the request would never resolve or queue at all.
-        await self.bot.safe_reply(ctx, f"Looking up {query!r}\u2026")
+        # Echo at most a short prefix: the reply is only an acknowledgement, and
+        # repeating a chatter's full message back verbatim would let anyone
+        # make the bot post up to 500 characters of their choosing.
+        shown = query if len(query) <= _MAX_ECHO_CHARS else query[: _MAX_ECHO_CHARS - 1] + "\u2026"
+        await self.bot.safe_reply(ctx, f"Looking up {shown!r}\u2026")
         self.bot.inflight_query_by_chatter[chatter_key] = normalized_query
 
         requester_name = ctx.chatter.display_name or ctx.chatter.name or "a viewer"

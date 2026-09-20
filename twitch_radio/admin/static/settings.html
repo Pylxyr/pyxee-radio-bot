@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Twitch Radio · Settings</title>
+<link rel="icon" type="image/png" href="/logo.png?s=32">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&display=swap" rel="stylesheet">
+<style>${css}</style>
+</head><body>
+<header class="masthead">
+  ${logo}
+  <div class="titles">
+    <h1>Twitch Radio</h1>
+    <p class="sub">settings &amp; community</p>
+  </div>
+  <div class="chips">${status_chips}</div>
+</header>
+
+<main>
+${banner}
+
+<section class="card live-card" id="live-card">
+  <h2>Now Playing</h2>
+  <div id="np-body"><p class="empty">Loading…</p></div>
+</section>
+
+<form method="post" autocomplete="off">
+<input type="hidden" name="${form_marker}" value="1">
+
+  <section class="card">
+    <h2>Request limits</h2>
+    <p class="section-help">Live — no restart needed. Mods can change the same values from chat with
+      <code>!setlimit &lt;key&gt; &lt;value&gt;</code>.</p>
+    <div class="grid">${tunable_rows}</div>
+  </section>
+
+  <section class="card">
+    <h2>Features</h2>
+    <p class="section-help">Same keys as <code>!toggle &lt;key&gt; on|off</code> in chat.</p>
+    <div class="switches">${toggle_rows}</div>
+  </section>
+
+  <section class="card">
+    <h2>PC specs</h2>
+    <p class="section-help">Shown to viewers by <code>!specs</code>. Blank fields are left out of the reply.</p>
+    <div class="grid">${pc_spec_rows}</div>
+  </section>
+
+  <section class="card">
+    <h2>Peripherals</h2>
+    <p class="section-help">Shown to viewers by <code>!peripherals</code>.</p>
+    <div class="grid">${peripheral_rows}</div>
+  </section>
+
+  <div class="actionbar">
+    <button type="submit">Save changes</button>
+  </div>
+</form>
+
+<section class="card">
+  <h2>Community</h2>
+  <p class="section-help">Read-only — managed from chat with <code>!addcom</code>/<code>!editcom</code>/<code>!delcom</code>.</p>
+  <div class="stats">
+    <div class="stat"><span class="n">${custom_command_count}</span><span class="l">custom commands</span></div>
+  </div>
+  ${custom_commands_html}
+  <h3>Top points</h3>
+  ${leaderboard}
+</section>
+
+<section class="card">
+  <h2>Commands</h2>
+  <p class="section-help">Full reference for every chat command, including a couple of mod tools kept out of
+    <code>!commands</code> in chat to keep that listing short.</p>
+  ${commands_table}
+</section>
+
+<section class="card">
+  <h2>Endpoints</h2>
+  <table class="info">${info_rows}</table>
+</section>
+</main>
+<script>${js}</script>
+</body></html>

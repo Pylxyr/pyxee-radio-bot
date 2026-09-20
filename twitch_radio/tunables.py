@@ -7,7 +7,7 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 # Single source of truth for each tunable's valid range — shared by the
-# /settings form (admin_server.py), the chat !setlimit command (chatbot.py),
+# /settings form (admin/render/settings_page.py), the chat !setlimit command (chatbot.py),
 # and from_dict()'s own clamp below, so all three enforce identical limits.
 TUNABLE_BOUNDS: dict[str, tuple[int, int]] = {
     "max_pending_per_chatter": (1, 10),
@@ -20,7 +20,7 @@ TUNABLE_BOUNDS: dict[str, tuple[int, int]] = {
 
 
 # Label + one-line help for each tunable, shown on the /settings form.
-# Here rather than hand-written into admin_server.py's HTML so that adding a
+# Here rather than hand-written into the /settings page's HTML so that adding a
 # tunable means touching exactly one file: TUNABLE_BOUNDS gets the range,
 # this gets the wording, and the form renders itself from both. The previous
 # arrangement had the inputs typed out in the page template, so a new key

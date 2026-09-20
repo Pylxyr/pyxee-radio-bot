@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="robots" content="noindex">
+<title>Commands</title>
+<link rel="icon" type="image/png" href="/logo.png?s=32">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&display=swap" rel="stylesheet">
+<style>${css}</style>
+</head><body>
+<noscript><div class="no-js-note">This page needs JavaScript enabled to browse and search commands.</div></noscript>
+<div class="layout">
+  <nav class="side">
+    <div class="brand">
+      ${logo}
+      <div><h1>Commands</h1><p>prefix: <code>${prefix}</code></p></div>
+    </div>
+    <div class="search">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4">
+        <circle cx="11" cy="11" r="7"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+      </svg>
+      <input id="search" type="text" placeholder="Search commands…" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="tabs">${tabs_html}</div>
+    <p class="side-foot">Ask a moderator if a command isn't working the way it's described here — some
+      need optional setup on the streamer's end.</p>
+  </nav>
+  <main>
+    <h2 class="panel-title" id="panel-title">${first_category}</h2>
+    <p class="panel-sub" id="panel-sub">Everything under ${first_category_lower}.</p>
+    <div class="cards" id="cards"></div>
+  </main>
+</div>
+<script>
+window.__COMMANDS__ = ${data_json};
+window.__CATEGORIES__ = ${categories_json};
+${js}
+</script>
+</body></html>

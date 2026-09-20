@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from collections import deque
 
-# Same sliding-window shape as admin_server._AuthRateLimiter, generalized:
+# Same sliding-window shape as admin.security.AuthRateLimiter, generalized:
 # each named counter keeps timestamps within `window_seconds` and reports
 # a count. Bounded by maxlen so a runaway event source can't grow this
 # unboundedly between prunes.
@@ -12,7 +12,7 @@ _MAX_SAMPLES = 2000
 
 
 class RollingCounters:
-    """In-memory only (resets on restart, like _AuthRateLimiter) — this is
+    """In-memory only (resets on restart, like AuthRateLimiter) — this is
     operator visibility, not an audit log."""
 
     def __init__(self) -> None:

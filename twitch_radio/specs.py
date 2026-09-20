@@ -10,7 +10,7 @@ from typing import Any
 MAX_FIELD_LENGTH = 40
 
 # Single source of truth for each field's storage key -> chat/web display
-# label and display order — shared by the /settings form (admin_server.py)
+# label and display order — shared by the /settings form (admin/render/settings_page.py)
 # and the !specs / !peripherals chat replies (chatbot.py).
 PC_SPEC_FIELDS: list[tuple[str, str]] = [
     ("cpu", "CPU"),

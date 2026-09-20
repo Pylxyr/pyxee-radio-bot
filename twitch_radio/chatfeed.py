@@ -1,5 +1,5 @@
 """In-memory buffer of the most recent human chat messages, feeding the
-public chat overlay (see admin_server.py's /chat-overlay, /chat.json,
+public chat overlay (see the admin server's /chat-overlay, /chat.json,
 /ws/chat) — the OBS-visible "show what chat's saying" widget.
 
 Deliberately not persisted anywhere: this is a live "what's happening
@@ -15,18 +15,61 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import time
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from typing import Any
 
 _DEFAULT_MAX_MESSAGES = 10
 _DEFAULT_MAX_AGE_SECONDS = 600.0  # 10 minutes
 
 
+# Twitch emote IDs are numeric ("25") or "emotesv2_<hex>" for newer ones. Only
+# IDs matching this are ever sent to the overlay, which splices them into an
+# image URL — anything else is shown as plain text instead.
+_EMOTE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_MAX_FRAGMENTS = 500  # Twitch caps a message at 500 characters, so this never truncates a real one
+
+
+def fragments_to_dicts(fragments: Iterable[Any]) -> list[dict[str, object]]:
+    """Turn a chat message's structured fragments (TwitchIO's ChatMessageFragment
+    list, read by attribute so this module needs no TwitchIO import) into plain
+    JSON-ready dicts the overlay can render:
+
+        {"type": "text", "text": "hello "}
+        {"type": "emote", "id": "25", "name": "Kappa", "animated": False}
+
+    Emotes — global and subscriber alike — reach the bot as fragments with an
+    ID, and the message's plain `text` only has their *names* ("Kappa"), which
+    is why the overlay used to show letters instead of pictures. Everything
+    that isn't an emote (mentions, cheermotes, gifs, ordinary text) becomes
+    text, and adjacent text runs are merged.
+    """
+    out: list[dict[str, object]] = []
+    for frag in list(fragments)[:_MAX_FRAGMENTS]:
+        text = getattr(frag, "text", "") or ""
+        emote = getattr(frag, "emote", None)
+        if getattr(frag, "type", "") == "emote" and emote is not None:
+            emote_id = str(getattr(emote, "id", ""))
+            if _EMOTE_ID.fullmatch(emote_id):
+                formats = getattr(emote, "format", None) or []
+                out.append({"type": "emote", "id": emote_id, "name": text, "animated": "animated" in formats})
+                continue
+        if out and out[-1]["type"] == "text":
+            out[-1]["text"] = str(out[-1]["text"]) + text
+        else:
+            out.append({"type": "text", "text": text})
+    return out
+
+
 @dataclass(slots=True)
 class ChatEntry:
+    id: int  # unique per message, so two identical messages in a row are still two messages
     author: str
     text: str
     at: float  # time.monotonic() — a reference for age pruning, never shown as a clock time
+    fragments: list[dict[str, object]] = field(default_factory=list)
 
 
 class ChatFeed:
@@ -36,32 +79,43 @@ class ChatFeed:
     and every read, so a message doesn't linger past its 10 minutes just
     because fewer than 10 have arrived since to push it out.
 
-    max_messages/max_age_seconds are constructor params rather than module
-    constants purely so tests can use a short age window instead of
-    waiting on a real 10-minute clock; every real caller uses the defaults.
+    max_messages/max_age_seconds are constructor parameters rather than
+    module constants so the limits can be changed (or shortened for
+    experiments) without editing this file; every real caller uses the defaults.
     """
 
     def __init__(self, max_messages: int = _DEFAULT_MAX_MESSAGES, max_age_seconds: float = _DEFAULT_MAX_AGE_SECONDS) -> None:
         self._max_messages = max_messages
         self._max_age_seconds = max_age_seconds
         self._entries: list[ChatEntry] = []
+        self._next_id = 1
         # Same wakeup-queue idea as RadioPlayer's subscribe_state()/
         # _notify_state_changed(): subscribers get an empty "something
         # changed" ping and re-fetch snapshot() themselves, rather than the
         # payload being pushed through the queue directly. Consistent with
         # how /ws/nowplaying already works, and it means this class has no
-        # opinion at all about JSON shape — that's admin_server.py's job.
+        # opinion at all about JSON shape — that's admin/handlers/live.py's job.
         self._state_subscribers: set[asyncio.Queue[None]] = set()
 
     def _prune(self) -> None:
         cutoff = time.monotonic() - self._max_age_seconds
         self._entries = [e for e in self._entries if e.at >= cutoff][-self._max_messages :]
 
-    def append(self, author: str, text: str) -> None:
+    def append(self, author: str, text: str, fragments: list[dict[str, object]] | None = None) -> None:
+        """`fragments` (see fragments_to_dicts) carries emotes as images-to-be;
+        without it the message is shown as plain text."""
         text = text.strip()
         if not text:
             return
-        self._entries.append(ChatEntry(author=author, text=text, at=time.monotonic()))
+        entry = ChatEntry(
+            id=self._next_id,
+            author=author,
+            text=text,
+            at=time.monotonic(),
+            fragments=fragments or [{"type": "text", "text": text}],
+        )
+        self._next_id += 1
+        self._entries.append(entry)
         self._prune()
         self._notify_state_changed()
 
@@ -77,7 +131,10 @@ class ChatFeed:
         _CHAT_OVERLAY_HTML's tick()."""
         self._prune()
         now = time.monotonic()
-        return [{"author": e.author, "text": e.text, "age_seconds": now - e.at} for e in self._entries]
+        return [
+            {"id": e.id, "author": e.author, "text": e.text, "fragments": e.fragments, "age_seconds": now - e.at}
+            for e in self._entries
+        ]
 
     def subscribe_state(self) -> asyncio.Queue[None]:
         q: asyncio.Queue[None] = asyncio.Queue(maxsize=4)
