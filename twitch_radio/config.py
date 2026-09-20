@@ -27,6 +27,29 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+# Every extra emote source the chat overlay understands (see emotes.py).
+EMOTE_SOURCES = ("7tv", "bttv", "ffz", "cheermotes")
+
+
+def _emote_sources_env(name: str) -> tuple[str, ...]:
+    """Comma-separated subset of the known emote sources; unset means all of
+    them, "none" means none. Unknown entries are reported and skipped."""
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return EMOTE_SOURCES
+    if raw in ("none", "off", "false", "0"):
+        return ()
+    chosen: list[str] = []
+    for token in (part.strip() for part in raw.replace(";", ",").split(",")):
+        if not token:
+            continue
+        if token not in EMOTE_SOURCES:
+            print(f"WARNING: {name} lists unknown source {token!r} — known sources: {', '.join(EMOTE_SOURCES)}.")
+        elif token not in chosen:
+            chosen.append(token)
+    return tuple(chosen)
+
+
 _TRUE_TOKENS = {"1", "true", "yes", "on"}
 _FALSE_TOKENS = {"0", "false", "no", "off"}
 
@@ -154,6 +177,10 @@ class Settings:
     # pair, since aiohttp's load_cert_chain needs both to do anything.
     tls_cert_file: Path | None
     tls_key_file: Path | None
+    # Which extra emote sources the chat overlay draws as images: any of
+    # 7tv, bttv, ffz, cheermotes (Twitch's own emotes always work). Empty
+    # tuple = none. TWITCH_CHAT_EMOTE_SOURCES.
+    chat_emote_sources: tuple[str, ...]
 
     # Persistence — all under DATA_DIR so one ReadWritePaths entry in the
     # systemd unit covers everything this process writes.
@@ -232,6 +259,8 @@ def load_settings() -> Settings:
         print(f"WARNING: YTDLP_WORKER_MODE={worker_mode!r} is not 'process' or 'thread' — using 'process'.")
         worker_mode = "process"
 
+    chat_emote_sources = _emote_sources_env("TWITCH_CHAT_EMOTE_SOURCES")
+
     nowplaying_host = os.getenv("TWITCH_NOWPLAYING_HOST", "127.0.0.1").strip() or "127.0.0.1"
     settings_password = os.getenv("TWITCH_SETTINGS_PASSWORD", "").strip() or None
     settings_allow_open = _bool_env("TWITCH_SETTINGS_ALLOW_OPEN", False)
@@ -309,6 +338,7 @@ def load_settings() -> Settings:
         public_base_url=public_base_url,
         tls_cert_file=tls_cert_file,
         tls_key_file=tls_key_file,
+        chat_emote_sources=chat_emote_sources,
         token_path=DATA_DIR / os.getenv("TWITCH_TOKEN_FILE", "twitch_tokens.json").strip(),
         tunables_path=DATA_DIR / os.getenv("TWITCH_TUNABLES_FILE", "tunables.json").strip(),
         blocklist_path=DATA_DIR / os.getenv("TWITCH_BLOCKLIST_FILE", "blocklist.json").strip(),

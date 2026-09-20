@@ -29,6 +29,7 @@ _DEFAULT_MAX_AGE_SECONDS = 600.0  # 10 minutes
 # IDs matching this are ever sent to the overlay, which splices them into an
 # image URL — anything else is shown as plain text instead.
 _EMOTE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_CHEER_PREFIX = re.compile(r"[A-Za-z0-9]{1,40}")
 _MAX_FRAGMENTS = 500  # Twitch caps a message at 500 characters, so this never truncates a real one
 
 
@@ -39,12 +40,15 @@ def fragments_to_dicts(fragments: Iterable[Any]) -> list[dict[str, object]]:
 
         {"type": "text", "text": "hello "}
         {"type": "emote", "id": "25", "name": "Kappa", "animated": False}
+        {"type": "cheermote", "name": "Cheer100", "prefix": "Cheer", "bits": 100, "tier": 100}
 
     Emotes — global and subscriber alike — reach the bot as fragments with an
     ID, and the message's plain `text` only has their *names* ("Kappa"), which
-    is why the overlay used to show letters instead of pictures. Everything
-    that isn't an emote (mentions, cheermotes, gifs, ordinary text) becomes
-    text, and adjacent text runs are merged.
+    is why the overlay used to show letters instead of pictures. Cheermotes are
+    passed along with their prefix/bits/tier so emotes.EmoteService can attach
+    artwork (until it does, the overlay shows the name). Everything else
+    (mentions, gifs, ordinary text) becomes text, and adjacent text runs are
+    merged.
     """
     out: list[dict[str, object]] = []
     for frag in list(fragments)[:_MAX_FRAGMENTS]:
@@ -55,6 +59,16 @@ def fragments_to_dicts(fragments: Iterable[Any]) -> list[dict[str, object]]:
             if _EMOTE_ID.fullmatch(emote_id):
                 formats = getattr(emote, "format", None) or []
                 out.append({"type": "emote", "id": emote_id, "name": text, "animated": "animated" in formats})
+                continue
+        cheer = getattr(frag, "cheermote", None)
+        if getattr(frag, "type", "") == "cheermote" and cheer is not None:
+            prefix = str(getattr(cheer, "prefix", ""))
+            try:
+                bits, tier = int(getattr(cheer, "bits", 0)), int(getattr(cheer, "tier", 0))
+            except (TypeError, ValueError):
+                bits = tier = 0
+            if _CHEER_PREFIX.fullmatch(prefix) and bits > 0:
+                out.append({"type": "cheermote", "name": text, "prefix": prefix, "bits": bits, "tier": tier})
                 continue
         if out and out[-1]["type"] == "text":
             out[-1]["text"] = str(out[-1]["text"]) + text

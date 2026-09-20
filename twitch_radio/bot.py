@@ -120,6 +120,7 @@ async def _async_run(settings: Settings) -> None:
                 db=db,
                 token_storage_path=settings.token_path,
                 public_base_url=settings.public_base_url,
+                emote_sources=settings.chat_emote_sources,
             )
             player.set_track_failure_notifier(bot.announce)
 

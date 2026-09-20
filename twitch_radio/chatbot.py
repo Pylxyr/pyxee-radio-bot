@@ -84,7 +84,7 @@ import re
 import time
 from collections import Counter
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from twitchio import eventsub
 from twitchio.exceptions import HTTPException, TwitchioException
@@ -101,6 +101,7 @@ from twitch_radio.components.song_requests import USAGE as _SONG_REQUEST_USAGE
 from twitch_radio.components.stream_info import StreamInfoComponent
 from twitch_radio.cooldown import CooldownTracker
 from twitch_radio.db import Database
+from twitch_radio.emotes import EmoteService
 from twitch_radio.player import RadioPlayer
 from twitch_radio.store import JsonStore
 from twitch_radio.toggles import FeatureToggles
@@ -186,6 +187,7 @@ class TwitchChatBot(commands.Bot):
         toggles_store: JsonStore,
         db: Database,
         token_storage_path: Path,
+        emote_sources: tuple[str, ...] = (),
     ) -> None:
         super().__init__(
             client_id=client_id,
@@ -197,6 +199,14 @@ class TwitchChatBot(commands.Bot):
         self.resolver = resolver.resolve
         self.player = player
         self.chat_feed = chat_feed
+        # 7TV/BTTV/FFZ emotes and cheermotes for the chat overlay; started in
+        # setup_hook once Twitch API access exists (cheermotes need it).
+        self.emotes = EmoteService(
+            broadcaster_id=owner_id,
+            sources=emote_sources,
+            cheermote_fetcher=self._fetch_cheermotes,
+        )
+        self._emotes_task: asyncio.Task[None] | None = None
         self.tunables_store = tunables_store
         self.blocklist_store = blocklist_store
         self.specs_store = specs_store
@@ -431,6 +441,13 @@ class TwitchChatBot(commands.Bot):
         await self._try_subscribe_chat()
         await self._try_subscribe_alerts()
         self._points_task = asyncio.create_task(self._points_award_loop(), name="points-award-loop")
+        if self.emotes.enabled:
+            self._emotes_task = asyncio.create_task(self.emotes.run(), name="chat-emotes")
+
+    async def _fetch_cheermotes(self) -> list[Any]:
+        # App-token request (no user token needed): global cheermotes plus the
+        # broadcaster's custom ones.
+        return list(await self.fetch_cheermotes(broadcaster_id=self._owner_id))
 
     def _log_token_diagnostics(self) -> None:
         # Catches the single most common cause of "OAuth said success but
@@ -566,11 +583,14 @@ class TwitchChatBot(commands.Bot):
         # stream. This has to happen before the moderator early-return
         # right below, or a mod's own messages would never appear there.
         if text:
-            self.chat_feed.append(
-                chatter.display_name or str(chatter_id),
-                text,
-                fragments=fragments_to_dicts(getattr(message, "fragments", ())),
-            )
+            try:
+                fragments = self.emotes.decorate(fragments_to_dicts(getattr(message, "fragments", ())))
+            except Exception:
+                # Emote artwork is decoration: if building it ever fails, the
+                # message still reaches the overlay as plain text.
+                log.debug("Building emote fragments failed (non-fatal).", exc_info=True)
+                fragments = None
+            self.chat_feed.append(chatter.display_name or str(chatter_id), text, fragments=fragments)
 
         if chatter.moderator:  # covers the broadcaster too — see Chatter.moderator
             return  # mods/broadcaster exempt from the chat filters below
@@ -728,4 +748,9 @@ class TwitchChatBot(commands.Bot):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._points_task
             self._points_task = None
+        if self._emotes_task is not None:
+            self._emotes_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._emotes_task
+            self._emotes_task = None
         await super().close()

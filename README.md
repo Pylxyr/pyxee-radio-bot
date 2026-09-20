@@ -170,6 +170,7 @@ required; everything else has a default.
 | `TWITCH_SETTINGS_PASSWORD` | unset | Basic Auth password for `/settings` and `/blocklist.json` (any username) |
 | `TWITCH_SETTINGS_ALLOW_OPEN` | `false` | Only matters when `TWITCH_NOWPLAYING_HOST` is reachable off this machine *and* no password is set. By default `/settings` and `/blocklist.json` are then **disabled**; `true` lets anyone who can reach the port use them. Set a password instead unless the network is fully trusted |
 | `TWITCH_PUBLIC_BASE_URL` | unset | Externally-reachable base URL (e.g. `https://radio.example.com`), no trailing slash. When set, `!commands` links to `<url>/commands` instead of the terse in-chat listing — see [Public commands page](#public-commands-page) |
+| `TWITCH_CHAT_EMOTE_SOURCES` | `7tv,bttv,ffz,cheermotes` | Extra emote sources the chat overlay draws as images (Twitch's own emotes always are) — any subset, or `none`. See [Chat overlay](#chat-overlay) |
 | `TWITCH_TLS_CERT_FILE` / `TWITCH_TLS_KEY_FILE` | unset | Cert/key file paths for native HTTPS — both or neither. See [Serving over HTTPS](#serving-over-https) |
 | `TWITCH_TOKEN_FILE` / `TWITCH_TUNABLES_FILE` / `TWITCH_BLOCKLIST_FILE` / `TWITCH_SPECS_FILE` / `TWITCH_TOGGLES_FILE` / `TWITCH_DB_FILE` | see `.env.example` | Filenames under `data/` |
 | `YTDLP_COOKIES_FILE` | unset | Path under `data/` to a `cookies.txt` — see [notes below](#cookies-and-youtube-blocking-cloud-ips) |
@@ -436,6 +437,22 @@ confirmations, alert announcements, none of it. Everything else does,
 moderators and the broadcaster included; only the link/caps filters
 exempt mods, not visibility on this overlay.
 
+**Emotes are drawn as images**, not as their names: Twitch's own (global and
+subscriber), plus — on by default — 7TV, BetterTTV and FrankerFaceZ emotes
+(global ones and the ones set up for your channel) and Twitch cheermotes,
+shown as the artwork followed by the bit amount in the tier's colour. 7TV
+"zero-width" emotes (hats and other overlays) are stacked on the emote before
+them. The bot downloads the third-party lists when it starts and refreshes
+them every 30 minutes; an emote added a minute ago shows as text until then,
+and any provider that's down just means its emotes show as text — chat itself
+is never affected. Third-party emotes are matched by exact word (case
+sensitive), the way those providers' own chat clients do it; BetterTTV's
+"effect" codes (`c!`, `h!` …) are left as text. Set
+`TWITCH_CHAT_EMOTE_SOURCES` to a comma-separated subset of
+`7tv,bttv,ffz,cheermotes` (or `none`) to turn sources off. Emote artwork is
+loaded by the OBS browser source directly from those providers' CDNs, so the
+machine running OBS needs internet access.
+
 Nothing here is persisted — a restart starts the strip empty, which is
 correct for a "what's happening right now" widget rather than a log.
 Per-author colors are generated from a hash of the username rather than
@@ -589,6 +606,7 @@ twitch-radio-bot/
     ├── specs.py                  # PCSpecs/Peripherals dataclasses (!specs, !peripherals)
     ├── blocklist.py               # moderation blocklist normalization/lookup
     ├── chatfeed.py                # ChatFeed: bounded/aged recent-chat buffer for /chat-overlay
+    ├── emotes.py                  # 7TV/BTTV/FFZ emote lists + Twitch cheermote artwork for the chat overlay
     ├── player.py                  # RadioPlayer: MP3 encoder + subscriber fan-out, gapless queue, !pause/!resume, radio-autoplay hooks
     ├── chatbot.py                 # TwitchChatBot: OAuth/token lifecycle, component wiring, engagement tracking
     ├── components/                # chat commands, split by concern

@@ -40,6 +40,13 @@
   /* Twitch emotes (global and subscriber) — sized to the line so a row of them
      doesn't blow up the message box. */
   .emote { height: 1.7em; width: auto; vertical-align: middle; margin: -0.25em 1px; }
+  /* 7TV "zero-width" emotes are overlays (a hat, an effect) drawn on top of the
+     emote before them: both go in a shared box the size of the first one. */
+  .emote-stack { position: relative; display: inline-block; vertical-align: middle; margin: -0.25em 1px; }
+  .emote-stack .emote { margin: 0; vertical-align: top; }
+  .emote-stack .emote.zw { position: absolute; left: 0; top: 0; width: 100%; height: 100%; object-fit: contain; }
+  /* Bits: the cheermote artwork followed by the amount, in the tier's colour. */
+  .cheer-bits { font-weight: 700; margin: 0 4px 0 1px; }
   @media (prefers-reduced-motion: reduce) {
     .msg { transition: none !important; }
   }
@@ -73,33 +80,76 @@ function msgKey(m) { return m.id != null ? 'id:' + m.id : m.author + "\u0000" + 
 
 // Twitch's own emote CDN — global and subscriber emotes alike, addressed by
 // the id that arrives with each emote fragment. "dark" is the variant made
-// for dark backgrounds, which is what this panel is.
+// for dark backgrounds, which is what this panel is. 7TV / BTTV / FFZ emotes
+// and cheermotes arrive with a ready-made image url instead (chosen and
+// checked server-side; see emotes.py).
 const EMOTE_CDN = 'https://static-cdn.jtvnw.net/emoticons/v2/';
 function emoteUrl(f) {
+  if (typeof f.url === 'string' && f.url.startsWith('https://')) return f.url;
   return EMOTE_CDN + encodeURIComponent(f.id) + '/' + (f.animated ? 'animated' : 'static') + '/dark/2.0';
 }
 
+function makeEmoteImg(f, className) {
+  const img = document.createElement('img');
+  img.className = className;
+  img.alt = f.name || '';
+  img.title = f.name || '';
+  img.decoding = 'async';
+  img.referrerPolicy = 'no-referrer';
+  img.src = emoteUrl(f);
+  return img;
+}
+
 // Built with DOM nodes and text nodes only (never innerHTML) so chat text can
-// never be interpreted as markup. An emote that fails to load falls back to
-// its name, which is what the overlay showed for every emote before.
+// never be interpreted as markup. An image that fails to load falls back to
+// the emote's name, which is what the overlay showed for every emote before.
 function makeTextEl(m) {
   const box = document.createElement('span');
   box.className = 'msg-text';
   const fragments = Array.isArray(m.fragments) && m.fragments.length
     ? m.fragments
     : [{ type: 'text', text: m.text }];
+  let lastEmote = null;  // the element a following zero-width emote should sit on top of
   for (const f of fragments) {
-    if (f.type === 'emote' && f.id) {
-      const img = document.createElement('img');
-      img.className = 'emote';
-      img.alt = f.name || '';
-      img.title = f.name || '';
-      img.decoding = 'async';
+    if (f.type === 'emote' && (f.id || f.url)) {
+      if (f.zw && lastEmote) {
+        // Overlay on the previous emote: wrap it in a stack box the first time.
+        let stack = lastEmote;
+        if (!stack.classList || !stack.classList.contains('emote-stack')) {
+          stack = document.createElement('span');
+          stack.className = 'emote-stack';
+          lastEmote.replaceWith(stack);
+          stack.appendChild(lastEmote);
+        }
+        const overlay = makeEmoteImg(f, 'emote zw');
+        overlay.addEventListener('error', () => overlay.remove(), { once: true });
+        stack.appendChild(overlay);
+        lastEmote = stack;
+        continue;
+      }
+      const img = makeEmoteImg(f, 'emote');
       img.addEventListener('error', () => img.replaceWith(document.createTextNode(f.name || '')), { once: true });
-      img.src = emoteUrl(f);
       box.appendChild(img);
+      lastEmote = img;
+    } else if (f.type === 'cheermote' && f.url) {
+      const img = makeEmoteImg(f, 'emote cheer');
+      const bits = document.createElement('span');
+      bits.className = 'cheer-bits';
+      bits.textContent = String(f.bits == null ? '' : f.bits);
+      if (typeof f.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(f.color)) bits.style.color = f.color;
+      img.addEventListener('error', () => {
+        img.replaceWith(document.createTextNode(f.name || ''));
+        bits.remove();
+      }, { once: true });
+      box.appendChild(img);
+      box.appendChild(bits);
+      lastEmote = null;
     } else {
-      box.appendChild(document.createTextNode(f.text || ''));
+      const text = f.text != null ? f.text : (f.name || '');
+      box.appendChild(document.createTextNode(text));
+      // Whitespace between two emotes doesn't break the pairing with a
+      // zero-width one; any actual word does.
+      if (String(text).trim() !== '') lastEmote = null;
     }
   }
   return box;
