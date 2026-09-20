@@ -152,11 +152,14 @@ def parse_7tv_set(data: object) -> list[ThirdPartyEmote]:
         name, emote_id = _valid_name(entry.get("name")), entry.get("id") or info.get("id")
         if name is None or not isinstance(emote_id, str) or not _ID.fullmatch(emote_id):
             continue
-        set_flags = entry.get("flags") if isinstance(entry.get("flags"), int) else 0
-        data_flags = info.get("flags") if isinstance(info.get("flags"), int) else 0
+        raw_set_flags = entry.get("flags")
+        set_flags = raw_set_flags if isinstance(raw_set_flags, int) else 0
+        raw_data_flags = info.get("flags")
+        data_flags = raw_data_flags if isinstance(raw_data_flags, int) else 0
         if data_flags & _7TV_DATA_TWITCH_DISALLOWED or info.get("listed") is False:
             continue
-        host = info.get("host") if isinstance(info.get("host"), dict) else {}
+        raw_host = info.get("host")
+        host = raw_host if isinstance(raw_host, dict) else {}
         raw_files = host.get("files")
         files = [f.get("name") for f in raw_files if isinstance(f, dict)] if isinstance(raw_files, list) else []
         if not files:
@@ -167,7 +170,8 @@ def parse_7tv_set(data: object) -> list[ThirdPartyEmote]:
             filename = "1x.webp"
         else:
             continue
-        base = host.get("url") if isinstance(host.get("url"), str) else f"//cdn.7tv.app/emote/{emote_id}"
+        raw_base = host.get("url")
+        base = raw_base if isinstance(raw_base, str) else f"//cdn.7tv.app/emote/{emote_id}"
         url = safe_image_url(f"{base.rstrip('/')}/{filename}") or safe_image_url(
             f"https://cdn.7tv.app/emote/{emote_id}/{filename}"
         )

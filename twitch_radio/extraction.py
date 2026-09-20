@@ -858,8 +858,12 @@ class Resolver:
         # its result still lands in _cache for whoever is left.
         existing = self._inflight.get(dedup_key)
         if existing is not None:
-            track = await asyncio.shield(existing)
-            return dataclasses.replace(track, requester_id=requester_id) if track is not None else None
+            shared_track = await asyncio.shield(existing)
+            return (
+                dataclasses.replace(shared_track, requester_id=requester_id)
+                if shared_track is not None
+                else None
+            )
 
         task = asyncio.ensure_future(self._do_resolve(query, dedup_key, now))
         self._inflight[dedup_key] = task
@@ -881,7 +885,7 @@ class Resolver:
 
         task.add_done_callback(_evict)
         try:
-            track = await asyncio.shield(task)
+            resolved_track = await asyncio.shield(task)
         finally:
             # Only clear our own entry, and only once it's actually
             # finished — a concurrent resolve() call for a *different* query
@@ -895,7 +899,11 @@ class Resolver:
             # running. It cleans itself up via the callback below instead.
             if self._inflight.get(dedup_key) is task and task.done():
                 del self._inflight[dedup_key]
-        return dataclasses.replace(track, requester_id=requester_id) if track is not None else None
+        return (
+            dataclasses.replace(resolved_track, requester_id=requester_id)
+            if resolved_track is not None
+            else None
+        )
 
     async def _do_resolve(self, query: str, dedup_key: str, started_at: float) -> Track | None:
         """The actual extraction + Track-building work, run at most once per

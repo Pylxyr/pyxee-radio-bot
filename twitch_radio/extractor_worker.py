@@ -41,10 +41,9 @@ Three things this file has to get right because the parent can't fix them:
 
 from __future__ import annotations
 
-import io
 import json
 import sys
-from typing import Any
+from typing import Any, TextIO
 
 # Fields the parent's Track building and radio-mix picking actually read
 # (see Resolver._do_resolve, Resolver._has_playable_url, and
@@ -94,7 +93,7 @@ def _project(info: dict[str, Any]) -> dict[str, Any]:
 
 
 class _Worker:
-    def __init__(self, out: io.TextIOBase) -> None:
+    def __init__(self, out: TextIO) -> None:
         self._out = out
         # YoutubeDL instances keyed by their options — see the module
         # docstring on why these are reused rather than rebuilt per request.

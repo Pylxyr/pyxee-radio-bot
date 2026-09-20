@@ -4,10 +4,13 @@ import asyncio
 import logging
 import sqlite3
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 log = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS viewer_stats (
@@ -67,7 +70,7 @@ class Database:
                 await asyncio.to_thread(self._conn.close)
                 self._conn = None
 
-    async def _run(self, fn: Any, *args: Any) -> Any:
+    async def _run(self, fn: Callable[..., _T], *args: Any) -> _T:
         async with self._lock:
             if self._conn is None:
                 raise RuntimeError("Database.connect() was never called")
@@ -135,7 +138,7 @@ class Database:
             return None
         conn.execute("UPDATE custom_commands SET uses = uses + 1 WHERE name = ?", (name,))
         conn.commit()
-        return row[0]
+        return str(row[0])
 
     async def get_command(self, name: str) -> str | None:
         """Returns the response text and increments its use counter, or
@@ -177,7 +180,9 @@ class Database:
             "INSERT INTO quotes (text, added_by, added_at) VALUES (?, ?, ?)", (text, added_by, time.time())
         )
         conn.commit()
-        return int(cur.lastrowid)
+        if cur.lastrowid is None:
+            raise RuntimeError("INSERT into quotes did not produce a rowid")
+        return cur.lastrowid
 
     async def add_quote(self, text: str, added_by: str) -> int:
         return await self._run(self._add_quote_sync, text, added_by)

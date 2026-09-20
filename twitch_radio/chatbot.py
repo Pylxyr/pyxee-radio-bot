@@ -398,6 +398,11 @@ class TwitchChatBot(commands.Bot):
         missing-scope warning for every single raider."""
         if self._shoutout_scope_missing:
             return False
+        # commands.Bot types _owner_id/_bot_id as `str | None` since the base
+        # class allows constructing without them — this subclass requires
+        # both, so they're never actually None here; just narrowing for mypy.
+        assert self._owner_id is not None
+        assert self._bot_id is not None
         try:
             broadcaster = self.create_partialuser(user_id=self._owner_id)
             await broadcaster.send_shoutout(to_broadcaster=to_user_id, moderator=self._bot_id)
@@ -617,6 +622,10 @@ class TwitchChatBot(commands.Bot):
         scope isn't there."""
         if self._delete_scope_missing:
             return
+        # commands.Bot types _bot_id as `str | None` since the base class
+        # allows constructing without one — this subclass requires it, so
+        # it's never actually None here; just narrowing for mypy.
+        assert self._bot_id is not None
         try:
             await message.broadcaster.delete_chat_messages(moderator=self._bot_id, message_id=message.id)
         except HTTPException as e:
@@ -736,13 +745,18 @@ class TwitchChatBot(commands.Bot):
             return
         log.error("Command error in %r: %r", getattr(ctx, "content", "<unknown>"), exc, exc_info=exc)
 
-    async def close(self) -> None:
+    async def close(self, **options: Any) -> None:
         """Deliberately does NOT close self.db. The admin server outlives
         this object during shutdown (bot.py tears it down in the enclosing
         finally), and a /settings request landing in that window used to hit
         RuntimeError("Database.connect() was never called") from the
         already-closed connection. The database is created in bot.py and is
-        closed there too, after the HTTP surface is actually down."""
+        closed there too, after the HTTP surface is actually down.
+
+        `**options` (e.g. `save_tokens`) is passed straight through to
+        commands.Bot.close/Client.close — only this method's own signature
+        is widened here to match the base class; nothing here consumes any
+        of it itself."""
         if self._points_task is not None:
             self._points_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -753,4 +767,4 @@ class TwitchChatBot(commands.Bot):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._emotes_task
             self._emotes_task = None
-        await super().close()
+        await super().close(**options)
