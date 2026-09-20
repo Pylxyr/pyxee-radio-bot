@@ -17,6 +17,7 @@ from aiohttp import web
 
 from twitch_radio.blocklist import clean_list
 from twitch_radio.blocklist import counts as blocklist_counts
+from twitch_radio.chatfeed import ChatFeed
 from twitch_radio.commands_reference import CATEGORIES, COMMANDS
 from twitch_radio.config import BASE_DIR
 from twitch_radio.db import Database
@@ -534,6 +535,198 @@ connectWs();
 poll();
 setInterval(poll, 2000);
 tick();
+</script>
+</body></html>"""
+
+# A stack of recent chat lines, styled to match _OVERLAY_HTML's glass-panel
+# look but laid out as its own independently-positioned/sized OBS Browser
+# Source rather than a second panel bolted onto the now-playing one — a
+# streamer wants to place and size these very differently on their canvas.
+#
+# Per-message author colors are a simple deterministic hash of the
+# username (see hashColor below), not Twitch's own per-account chat color:
+# that's a separate API object (ChatterColor) requiring its own request
+# per unique chatter, not an attribute already sitting on the ChatMessage/
+# Chatter this bot already has in hand — not worth an extra API call and
+# its own failure mode for a purely cosmetic detail. The hash is at least
+# stable: the same username always lands on the same color here.
+_CHAT_OVERLAY_HTML = """<!doctype html>
+<html><head><meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: transparent; }
+  body {
+    font-family: "Sora", -apple-system, "Segoe UI", sans-serif;
+    color: #F3F1EA;
+    display: flex; flex-direction: column; justify-content: flex-end; align-items: flex-start;
+    height: 100vh; padding: 20px; overflow: hidden;
+  }
+  .chat-list { display: flex; flex-direction: column; gap: 6px; width: 420px; max-width: 100%; }
+  .msg {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px;
+    padding: 7px 12px; border-radius: 10px;
+    background: rgba(15, 17, 23, 0.72);
+    backdrop-filter: blur(6px);
+    box-shadow: 0 4px 14px rgba(0,0,0,0.28);
+    font-size: 13.5px; line-height: 1.4;
+    /* New messages slide up from below with the same lively back-out pop
+       used throughout the now-playing overlay's own motion language;
+       removals fade+drift out more plainly (see .msg-exit) — an
+       overshoot on the way out looks like a wobble, not a feature, same
+       reasoning as the now-playing panel's own exit. */
+    transition: transform 0.42s cubic-bezier(.34,1.56,.64,1), opacity 0.36s ease;
+  }
+  .msg.msg-enter { transform: translateY(26px) scale(0.96); opacity: 0; }
+  .msg.msg-enter-active { transform: translateY(0) scale(1); opacity: 1; }
+  .msg.msg-exit {
+    transform: translateY(-8px); opacity: 0;
+    transition: transform 0.5s cubic-bezier(.4,0,.2,1), opacity 0.5s ease;
+  }
+  .msg-author { font-weight: 700; white-space: nowrap; }
+  .msg-text { color: #E7E7EE; word-break: break-word; }
+  @media (prefers-reduced-motion: reduce) {
+    .msg { transition: none !important; }
+  }
+</style></head>
+<body>
+<div class="chat-list" id="chat-list"></div>
+<script>
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+// Deterministic username -> color, entirely client-side — see this
+// constant's module-level comment above for why this isn't Twitch's own
+// per-account chat color.
+function hashColor(name) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) { h = (h * 31 + name.charCodeAt(i)) | 0; }
+  return `hsl(${Math.abs(h) % 360}, 70%, 68%)`;
+}
+
+// Identity for diffing is the (author, text) pair, not list position —
+// position shifts every time anything is added or aged out elsewhere in
+// the list, which would make nearly every message look "new" on every
+// render if position were part of the key. Content staying put for as
+// long as a message is visible is what actually makes something the same
+// message across renders, same reasoning as the now-playing overlay's own
+// title-based (not index-based) queue diffing.
+function msgKey(m) { return m.author + "\\u0000" + m.text; }
+
+function makeMsgEl(m) {
+  const el = document.createElement('div');
+  el.className = 'msg';
+  el.innerHTML =
+    '<span class="msg-author" style="color:' + hashColor(m.author) + '">' + escapeHtml(m.author) + '</span>' +
+    '<span class="msg-text">' + escapeHtml(m.text) + '</span>';
+  return el;
+}
+
+const list = document.getElementById('chat-list');
+// key -> element currently in the DOM, survivors included so a message
+// that's simply shifted position (something new arrived below it, or an
+// older one above it aged out) is moved rather than destroyed and
+// recreated — recreating it would also wipe out any transition already
+// in progress on that exact node.
+let current = new Map();
+
+function render(messages) {
+  const keep = new Set(messages.map(msgKey));
+  for (const [key, el] of current) {
+    if (keep.has(key)) continue;
+    // No longer in the payload at all (aged out, or pushed off the
+    // 10-message cap) — fade it out in place rather than an abrupt
+    // disappearance, then actually remove it once that's done.
+    el.classList.add('msg-exit');
+    let removed = false;
+    const remove = () => { if (!removed) { removed = true; el.remove(); } };
+    el.addEventListener('transitionend', remove, { once: true });
+    setTimeout(remove, 650);  // safety net — prefers-reduced-motion never fires transitionend at all
+    current.delete(key);
+  }
+
+  // Rebuilding into a fragment and appending it moves already-existing
+  // nodes to their new position (appendChild on a node already in the
+  // document relocates it) rather than recreating them, so a merely-
+  // reordered message keeps whatever transition state it's already in.
+  const frag = document.createDocumentFragment();
+  messages.forEach((m) => {
+    const key = msgKey(m);
+    let el = current.get(key);
+    if (!el) {
+      el = makeMsgEl(m);
+      current.set(key, el);
+      frag.appendChild(el);
+      el.classList.add('msg-enter');
+      requestAnimationFrame(() => {
+        el.classList.remove('msg-enter');
+        el.classList.add('msg-enter-active');
+      });
+    } else {
+      frag.appendChild(el);
+    }
+  });
+  list.appendChild(frag);
+}
+
+// ChatFeed already enforces both the 10-message cap and the 10-minute
+// expiry server-side (see chatfeed.py) — every payload received here is
+// already correctly pruned. The one thing a payload can't do on its own
+// is keep pruning between payloads: if chat goes quiet, no new message
+// ever arrives to trigger a fresh push, so age_seconds ticks forward
+// locally (10 * 60 = 600s here has to match ChatFeed's own default) and
+// this periodically re-renders even with no server activity at all, the
+// same reason the now-playing overlay ticks its own elapsed time between
+// pushes instead of waiting on the server for that too.
+const MAX_AGE_SECONDS = 600;
+let lastPayload = null;
+let receivedAt = 0;
+
+function effectiveMessages() {
+  if (!lastPayload) return [];
+  const elapsed = (performance.now() - receivedAt) / 1000;
+  return lastPayload.messages.filter((m) => (m.age_seconds || 0) + elapsed < MAX_AGE_SECONDS);
+}
+
+function onPayload(data) {
+  lastPayload = data;
+  receivedAt = performance.now();
+  render(effectiveMessages());
+}
+
+async function poll() {
+  if (ws && ws.readyState === WebSocket.OPEN) return;
+  try {
+    const res = await fetch('/chat.json');
+    onPayload(await res.json());
+  } catch (e) { /* keep showing the last known state */ }
+}
+
+let ws = null;
+function connectWs() {
+  let socket;
+  try {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    socket = new WebSocket(`${proto}//${location.host}/ws/chat`);
+  } catch (e) {
+    return;  // no WebSocket support — poll() carries the whole load
+  }
+  ws = socket;
+  socket.onmessage = (ev) => {
+    try { onPayload(JSON.parse(ev.data)); } catch (e) { /* malformed frame — next one (or poll()) recovers */ }
+  };
+  socket.onclose = () => { if (ws === socket) ws = null; setTimeout(connectWs, 2000); };
+  socket.onerror = () => { try { socket.close(); } catch (e) {} };
+}
+
+connectWs();
+poll();
+setInterval(poll, 2000);
+setInterval(() => render(effectiveMessages()), 5000);
 </script>
 </body></html>"""
 
@@ -1140,6 +1333,7 @@ class AdminServer:
         self,
         *,
         player: RadioPlayer,
+        chat_feed: ChatFeed,
         tunables_store: JsonStore,
         blocklist_store: JsonStore,
         specs_store: JsonStore,
@@ -1150,6 +1344,7 @@ class AdminServer:
         thumb_session: aiohttp.ClientSession,
     ) -> None:
         self._player = player
+        self._chat_feed = chat_feed
         self._tunables_store = tunables_store
         self._blocklist_store = blocklist_store
         self._specs_store = specs_store
@@ -1314,6 +1509,37 @@ class AdminServer:
             self._player.unsubscribe_state(state_queue)
         return ws
 
+    async def handle_chat(self, request: web.Request) -> web.Response:
+        return web.json_response({"messages": self._chat_feed.snapshot()})
+
+    async def handle_ws_chat(self, request: web.Request) -> web.WebSocketResponse:
+        """Push-based counterpart to /chat.json, mirroring
+        handle_ws_nowplaying's shape exactly: one snapshot on connect, then
+        another whenever ChatFeed.append() fires. There's no equivalent of
+        now-playing's periodic elapsed-time tick server-side here — instead
+        the client ages messages out of its own last-received snapshot on
+        a timer (see _CHAT_OVERLAY_HTML's tick()), since a quiet chat
+        should still see old messages fade away on schedule even though
+        nothing new ever arrives to trigger a fresh push."""
+        ws = web.WebSocketResponse(heartbeat=30)
+        await ws.prepare(request)
+        state_queue = self._chat_feed.subscribe_state()
+        try:
+            await ws.send_json({"messages": self._chat_feed.snapshot()})
+            while True:
+                try:
+                    await asyncio.wait_for(state_queue.get(), timeout=30)
+                except TimeoutError:
+                    pass  # just a periodic wakeup so a dead connection is noticed via ws.closed below
+                if ws.closed:
+                    break
+                await ws.send_json({"messages": self._chat_feed.snapshot()})
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+        finally:
+            self._chat_feed.unsubscribe_state(state_queue)
+        return ws
+
     async def handle_blocklist(self, request: web.Request) -> web.Response:
         """Full blocklist contents, gated like /settings — !blocklist in
         chat only gives counts, so this is where a mod actually audits
@@ -1334,6 +1560,9 @@ class AdminServer:
 
     async def handle_overlay(self, request: web.Request) -> web.Response:
         return web.Response(text=_OVERLAY_HTML, content_type="text/html")
+
+    async def handle_chat_overlay(self, request: web.Request) -> web.Response:
+        return web.Response(text=_CHAT_OVERLAY_HTML, content_type="text/html")
 
     async def handle_logo(self, request: web.Request) -> web.Response:
         """The bot mark, for the settings page and its favicon. Public like
@@ -1960,6 +2189,7 @@ async def _security_headers_middleware(request: web.Request, handler: Any) -> we
 async def run_admin_server(
     *,
     player: RadioPlayer,
+    chat_feed: ChatFeed,
     tunables_store: JsonStore,
     blocklist_store: JsonStore,
     specs_store: JsonStore,
@@ -1974,7 +2204,7 @@ async def run_admin_server(
 ) -> web.AppRunner:
     thumb_session = aiohttp.ClientSession()
     server = AdminServer(
-        player=player, tunables_store=tunables_store, blocklist_store=blocklist_store,
+        player=player, chat_feed=chat_feed, tunables_store=tunables_store, blocklist_store=blocklist_store,
         specs_store=specs_store, toggles_store=toggles_store, db=db,
         settings_password=settings_password, broadcast_info=broadcast_info,
         thumb_session=thumb_session,
@@ -1985,6 +2215,9 @@ async def run_admin_server(
     app.router.add_get("/ws/nowplaying", server.handle_ws_nowplaying)
     app.router.add_get("/blocklist.json", server.handle_blocklist)
     app.router.add_get("/overlay", server.handle_overlay)
+    app.router.add_get("/chat-overlay", server.handle_chat_overlay)
+    app.router.add_get("/chat.json", server.handle_chat)
+    app.router.add_get("/ws/chat", server.handle_ws_chat)
     app.router.add_get("/logo.png", server.handle_logo)
     app.router.add_get("/commands", server.handle_commands_page)
     app.router.add_get("/thumb-proxy", server.handle_thumb_proxy)
@@ -2022,8 +2255,9 @@ async def run_admin_server(
     await site.start()
     scheme = "https" if ssl_context is not None else "http"
     log.info(
-        "Admin server listening on %s://%s:%d (/stream.mp3, /overlay, /commands, "
-        "/nowplaying.json, /ws/nowplaying, /blocklist.json, /healthz, /logo.png, /settings)",
+        "Admin server listening on %s://%s:%d (/stream.mp3, /overlay, /chat-overlay, /commands, "
+        "/nowplaying.json, /ws/nowplaying, /chat.json, /ws/chat, /blocklist.json, /healthz, "
+        "/logo.png, /settings)",
         scheme, host, port,
     )
     return runner
