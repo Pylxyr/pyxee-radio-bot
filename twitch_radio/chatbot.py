@@ -90,6 +90,7 @@ from twitchio import eventsub
 from twitchio.exceptions import HTTPException, TwitchioException
 from twitchio.ext import commands
 
+from twitch_radio.chatfeed import ChatFeed
 from twitch_radio.components.alerts import AlertsComponent
 from twitch_radio.components.engagement import EngagementComponent
 from twitch_radio.components.info import InfoComponent
@@ -176,6 +177,7 @@ class TwitchChatBot(commands.Bot):
         owner_id: str,
         prefix: str,
         public_base_url: str | None,
+        chat_feed: ChatFeed,
         resolver: Resolver,
         player: RadioPlayer,
         tunables_store: JsonStore,
@@ -194,6 +196,7 @@ class TwitchChatBot(commands.Bot):
         )
         self.resolver = resolver.resolve
         self.player = player
+        self.chat_feed = chat_feed
         self.tunables_store = tunables_store
         self.blocklist_store = blocklist_store
         self.specs_store = specs_store
@@ -555,10 +558,18 @@ class TwitchChatBot(commands.Bot):
             return
         self.last_seen[chatter_id] = time.monotonic()
         self.last_seen_name[chatter_id] = chatter.display_name or chatter_id
+        text = message.text or ""
+
+        # Every non-bot message reaches the chat overlay, mods and the
+        # broadcaster included — only the exemption from the link/caps
+        # filters below is mod-only, not exemption from being shown on
+        # stream. This has to happen before the moderator early-return
+        # right below, or a mod's own messages would never appear there.
+        if text:
+            self.chat_feed.append(chatter.display_name or str(chatter_id), text)
 
         if chatter.moderator:  # covers the broadcaster too — see Chatter.moderator
             return  # mods/broadcaster exempt from the chat filters below
-        text = message.text
         if not text:
             return
         toggles = FeatureToggles.from_dict(await self.toggles_store.read())
