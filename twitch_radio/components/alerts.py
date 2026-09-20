@@ -66,7 +66,12 @@ class AlertsComponent(commands.Component):
         # missing moderator:manage:shoutouts scope (or Twitch's own
         # once-per-2-minutes cooldown, on a raid train) means the
         # announcement still goes out even if this doesn't.
-        await self.bot.try_shoutout(payload.from_broadcaster.id, payload.from_broadcaster.display_name)
+        raider_name = (
+            payload.from_broadcaster.display_name
+            or payload.from_broadcaster.name
+            or str(payload.from_broadcaster.id)
+        )
+        await self.bot.try_shoutout(payload.from_broadcaster.id, raider_name)
 
     @commands.is_moderator()
     @commands.command(name="so", aliases=["shoutout"])
@@ -86,6 +91,6 @@ class AlertsComponent(commands.Component):
         if await self.bot.try_shoutout(user_id, username):
             await self.bot.safe_reply(ctx, f"Shouting out {username}!")
         else:
-            await self.bot.safe_reply(ctx, 
+            await self.bot.safe_reply(ctx,
                 "Couldn't send that shoutout — check the bot's log (likely a missing scope or Twitch's cooldown)."
             )

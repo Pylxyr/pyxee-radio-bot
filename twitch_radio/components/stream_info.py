@@ -126,6 +126,7 @@ class StreamInfoComponent(commands.Component):
             await self.bot.safe_reply(ctx, f"Just made one — try again in {remaining:.0f}s.")
             return
         self._clip_cooldown.mark(_CLIP_COOLDOWN_KEY)
+        assert self.bot.owner_id is not None
         try:
             clip = await self._broadcaster().create_clip(token_for=self.bot.owner_id)
         except HTTPException as e:

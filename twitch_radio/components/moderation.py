@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from twitchio.ext import commands
 
@@ -90,7 +90,7 @@ class ModerationComponent(commands.Component):
             await self.bot.safe_reply(ctx, f"Unknown key {key!r} — keys: {', '.join(TOGGLE_KEYS)}")
             return
 
-        def _mutate(current: dict[str, object]) -> dict[str, object]:
+        def _mutate(current: dict[str, Any]) -> dict[str, Any]:
             toggles = FeatureToggles.from_dict(current)
             setattr(toggles, key, value)
             return toggles.to_dict()

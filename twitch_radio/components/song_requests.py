@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from twitchio import Chatter
 from twitchio.ext import commands
@@ -375,7 +375,7 @@ class SongRequestComponent(commands.Component):
             await self.bot.safe_reply(ctx, "Usage: !radio [on|off]")
             return
 
-        def _mutate(current: dict[str, object]) -> dict[str, object]:
+        def _mutate(current: dict[str, Any]) -> dict[str, Any]:
             toggles = FeatureToggles.from_dict(current)
             toggles.radio_autoplay_enabled = arg == "on"
             return toggles.to_dict()
