@@ -8,6 +8,7 @@ import signal
 from twitch_radio.admin_server import run_admin_server
 from twitch_radio.player import RadioPlayer
 from twitch_radio.chatbot import TwitchChatBot
+from twitch_radio.chatfeed import ChatFeed
 from twitch_radio.config import Settings, load_settings
 from twitch_radio.db import Database
 from twitch_radio.extraction import Resolver
@@ -47,6 +48,11 @@ async def _async_run(settings: Settings) -> None:
     toggles_store = JsonStore(settings.toggles_path)
     db = Database(settings.db_path)
     await db.connect()
+    # Shared between the chat bot (appends every non-bot message — see
+    # chatbot.py's _track_and_filter) and the admin server (reads it for
+    # /chat-overlay, /chat.json, /ws/chat) the same way `player` is shared
+    # between the two for now-playing state.
+    chat_feed = ChatFeed()
 
     # Fire-and-forget: warms up yt-dlp's worker threads (and, once cached,
     # persists across restarts too) before the first real !sr arrives. Never
@@ -77,6 +83,7 @@ async def _async_run(settings: Settings) -> None:
     try:
         admin_runner = await run_admin_server(
             player=player,
+            chat_feed=chat_feed,
             tunables_store=tunables_store,
             blocklist_store=blocklist_store,
             specs_store=specs_store,
@@ -86,6 +93,7 @@ async def _async_run(settings: Settings) -> None:
             broadcast_info={
                 "Audio stream": "/stream.mp3",
                 "Overlay": "/overlay",
+                "Chat overlay": "/chat-overlay",
                 "Audio bitrate": f"{settings.audio_bitrate_kbps} kbps",
                 "Chat command prefix": settings.prefix,
             },
@@ -103,6 +111,7 @@ async def _async_run(settings: Settings) -> None:
                 prefix=settings.prefix,
                 resolver=resolver,
                 player=player,
+                chat_feed=chat_feed,
                 tunables_store=tunables_store,
                 blocklist_store=blocklist_store,
                 specs_store=specs_store,
