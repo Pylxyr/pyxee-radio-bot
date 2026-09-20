@@ -45,6 +45,10 @@ any Discord bot.
   track slides out to the left as the next one slides up into place, and
   the queue shifts up with it; a track newly added to the queue slides up
   from the bottom rather than just appearing.
+- **Chat overlay** (`/chat-overlay`) — a separate Browser Source showing
+  recent chat on stream, last 10 messages or 10 minutes each, whichever's
+  first; the bot's own messages never appear in it — see
+  [Chat overlay](#chat-overlay).
 - **Moderation tools** — `!skip`, `!pause`/`!resume`, `!voteskip`,
   `!block`/`!unblock` by track or uploader, `!clearqueue`, a live
   blocklist, and an optional link/caps chat filter (warn-only by
@@ -243,12 +247,16 @@ missing, so leaving some out is always safe.
 
 ## Adding the stream to OBS
 
-Two sources, both pointed at the HTTP surface below:
+Three sources, all pointed at the HTTP surface below:
 
 - **Media Source** → `http://<host>:<port>/stream.mp3` (uncheck "Local
   File")
 - **Browser Source** (optional) → `http://<host>:<port>/overlay` —
   transparent background, size to taste
+- **Browser Source** (optional) → `http://<host>:<port>/chat-overlay` —
+  a separate source from the one above, since chat wants its own size and
+  position on your canvas, not to share the now-playing widget's corner.
+  See [Chat overlay](#chat-overlay) below.
 
 If this service runs on the **same machine** as OBS, `<host>` is
 `localhost` and nothing else is needed.
@@ -350,9 +358,12 @@ Binds to `127.0.0.1` by default (`TWITCH_NOWPLAYING_HOST`).
 |---|---|---|
 | `GET /stream.mp3` | public | The live audio feed |
 | `GET /overlay` | public | The visual now-playing/up-next widget |
+| `GET /chat-overlay` | public | Recent-chat widget — see [Chat overlay](#chat-overlay) |
 | `GET /commands` | public, rate-limited | Searchable command reference for every viewer — see [Public commands page](#public-commands-page) |
 | `GET /nowplaying.json` | public | Same data as JSON, for a custom overlay |
 | `GET /ws/nowplaying` | public | WebSocket version, pushed on every change |
+| `GET /chat.json` | public | Recent chat messages as JSON, for a custom chat overlay |
+| `GET /ws/chat` | public | WebSocket version, pushed on every new message |
 | `GET /healthz` | public | Player state, queue size, rolling resolve success/failure counts |
 | `GET /logo.png` | public | The bot mark (add `?s=32` for the favicon size) |
 | `GET /blocklist.json` | password-gated | Full blocklist contents |
@@ -398,6 +409,32 @@ mod, it's held to a higher bar than the other public endpoints above:
   just hidden by CSS — they're never in the data the page sends to the
   browser in the first place, so there's nothing to find by reading the
   page's source or network traffic either.
+
+## Chat overlay
+
+`/chat-overlay` shows recent chat on stream — a stack of `Author: message`
+lines, each sliding up into place as it arrives. Two limits keep it from
+turning into a wall of text, whichever one a given message hits first:
+
+- **The last 10 messages.** An 11th pushes the oldest off.
+- **10 minutes.** A message disappears once it's been up that long, even
+  if fewer than 10 have come in since to push it off on their own — the
+  overlay keeps re-checking this on its own, so a message doesn't linger
+  past 10 minutes just because chat went quiet and nothing new arrived to
+  trigger a recheck.
+
+**The bot's own messages never appear here** — `!sr` replies, `!skip`
+confirmations, alert announcements, none of it. Everything else does,
+moderators and the broadcaster included; only the link/caps filters
+exempt mods, not visibility on this overlay.
+
+Nothing here is persisted — a restart starts the strip empty, which is
+correct for a "what's happening right now" widget rather than a log.
+Per-author colors are generated from a hash of the username rather than
+pulled from Twitch's own per-account chat color, which would need a
+separate API call per unique chatter for a purely cosmetic detail; the
+hash is at least stable, so the same username always lands on the same
+color here.
 
 ## Serving over HTTPS
 
@@ -543,6 +580,7 @@ twitch-radio-bot/
     ├── cooldown.py                # reusable per-chatter cooldown tracker
     ├── specs.py                  # PCSpecs/Peripherals dataclasses (!specs, !peripherals)
     ├── blocklist.py               # moderation blocklist normalization/lookup
+    ├── chatfeed.py                # ChatFeed: bounded/aged recent-chat buffer for /chat-overlay
     ├── player.py                  # RadioPlayer: MP3 encoder + subscriber fan-out, gapless queue, !pause/!resume, radio-autoplay hooks
     ├── chatbot.py                 # TwitchChatBot: OAuth/token lifecycle, component wiring, engagement tracking
     ├── components/                # chat commands, split by concern
