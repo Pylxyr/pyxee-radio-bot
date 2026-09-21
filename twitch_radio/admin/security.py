@@ -8,56 +8,42 @@ spread through the request handlers.
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
 import re
 import time
 from collections.abc import Callable
 from urllib.parse import urljoin, urlsplit
 
 # ---------------------------------------------------------------------------
-# /settings credentials
+# Login redirects and CSRF
 # ---------------------------------------------------------------------------
 
+DEFAULT_LANDING = "/settings"
+_MAX_NEXT_LENGTH = 512
+_NEXT_DENYLIST = ("/login", "/logout")
 
-def check_basic_password(authorization: str, expected: str) -> bool:
-    """Validate an HTTP Basic `Authorization` header against `expected`.
 
-    Any username is accepted (only the password is checked). Compared as
-    SHA-256 digests of the UTF-8 *bytes*: hmac.compare_digest on two `str`
-    values raises TypeError for non-ASCII input, which used to turn a
-    non-ASCII password (or a non-ASCII guess) into a 500 instead of a plain
-    yes/no, and hashing first also hides the expected password's length.
-    """
-    scheme, _, credentials = authorization.partition(" ")
-    if scheme.lower() != "basic":
-        return False
+def safe_next_path(raw: str | None, default: str = DEFAULT_LANDING) -> str:
+    """A same-site absolute path from the `next` field, else `default`."""
+    if not raw or len(raw) > _MAX_NEXT_LENGTH:
+        return default
+    if not raw.startswith("/") or raw.startswith("//") or "\\" in raw:
+        return default
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw):
+        return default
     try:
-        decoded = base64.b64decode(credentials.strip())
-    except ValueError:  # binascii.Error is a ValueError subclass
-        return False
-    _, separator, password = decoded.partition(b":")
-    if not separator:
-        return False
-    return hmac.compare_digest(
-        hashlib.sha256(password).digest(),
-        hashlib.sha256(expected.encode("utf-8")).digest(),
-    )
+        parts = urlsplit(raw)
+    except ValueError:
+        return default
+    if parts.scheme or parts.netloc:
+        return default
+    if parts.path.rstrip("/") in _NEXT_DENYLIST:
+        return default
+    return raw
 
 
-def origin_matches_host(origin: str | None, referer: str | None, host: str | None) -> bool:
-    """CSRF defense for state-changing requests (OWASP "Verifying Origin With
-    Standard Headers"). HTTP Basic credentials are cached per-origin by the
-    browser and attach automatically to a cross-site form POST, so a
-    browser-sent Origin (or, failing that, Referer) must name this server's
-    own Host.
-
-    Only enforced when one of the headers is present: non-browser callers
-    (curl, a Stream Deck script) send neither and are let through, while every
-    real browser sends Origin on a cross-site POST, so the attack itself is
-    still stopped.
-    """
+def origin_matches_host(origin: str | None, referer: str | None, hosts: tuple[str | None, ...]) -> bool:
+    """Origin (or Referer) must name one of `hosts`. Requests carrying neither
+    header (curl, scripts) pass; browsers always send Origin on cross-site POSTs."""
     source = origin
     if source is None and referer:
         try:
@@ -67,10 +53,18 @@ def origin_matches_host(origin: str | None, referer: str | None, host: str | Non
         source = f"{parts.scheme}://{parts.netloc}"
     if source is None:
         return True
-    host = (host or "").strip().lower()
-    if not host:
-        return False
-    return source.lower() in (f"http://{host}", f"https://{host}")
+    allowed: set[str] = set()
+    for host in hosts:
+        host = (host or "").strip().lower()
+        if host:
+            allowed.update((f"http://{host}", f"https://{host}"))
+    return source.lower() in allowed
+
+
+def fetch_site_ok(sec_fetch_site: str | None) -> bool:
+    if sec_fetch_site is None:
+        return True
+    return sec_fetch_site.strip().lower() in ("same-origin", "none")
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +116,13 @@ class _SlidingWindow:
     def clear(self, key: str) -> None:
         self._events.pop(key, None)
 
+    def seconds_until_below(self, key: str, limit: int) -> float:
+        now = self._clock()
+        events = self._live(key, now)
+        if len(events) < limit:
+            return 0.0
+        return max(0.0, events[len(events) - limit] + self._window - now)
+
     def _shrink(self, now: float) -> None:
         for key in list(self._events):
             self._live(key, now)
@@ -137,17 +138,7 @@ class _SlidingWindow:
 
 
 class AuthRateLimiter:
-    """Lockout for failed /settings logins — HTTP Basic Auth has no built-in
-    rate limiting, so without this it's brute-forceable at whatever rate the
-    network allows. In-memory only (resets on restart): enough to blunt a
-    sustained guessing script, not meant to survive a determined attacker who
-    can just restart the service.
-
-    Keyed by the direct TCP peer (request.remote). Behind a reverse proxy every
-    client shares the proxy's address and therefore one bucket; trusting
-    X-Forwarded-For instead would fix that but opens a spoofing vector without
-    a proxy allowlist to go with it.
-    """
+    """Lockout for failed /login attempts, keyed by client address. In-memory."""
 
     def __init__(
         self,
@@ -167,6 +158,11 @@ class AuthRateLimiter:
 
     def record_success(self, key: str) -> None:
         self._failures.clear(key)
+
+    def retry_after(self, key: str) -> int:
+        if not self.is_blocked(key):
+            return 0
+        return max(1, int(self._failures.seconds_until_below(key, self._max_attempts)) + 1)
 
 
 class RequestRateLimiter:

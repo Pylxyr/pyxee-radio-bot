@@ -686,8 +686,8 @@ class RadioPlayer:
                         # branch spawned a fresh task every ~100ms forever,
                         # each one taking the toggles-store lock and reading
                         # the toggle only to return. Ten pointless tasks a
-                        # second is invisible on a VPS and very much not on
-                        # a phone running this under Termux.
+                        # second is easy to miss on a fast box and very much
+                        # not on a small VPS.
                         self._radio_fill_failed_at = time.monotonic()
                         return
             seed = self._last_played_webpage_url

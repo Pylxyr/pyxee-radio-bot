@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Installs the Twitch radio service on the same box as (or separate from) the
-# Discord bot. Does NOT touch the Discord bot's files, venv, or service.
+# Installs the Twitch radio service, and optionally Caddy in front of it.
+# Non-interactive Caddy setup: CADDY_DOMAIN=radio.example.com [CADDY_EMAIL=you@example.com] deploy/setup.sh
 set -euo pipefail
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; CYAN=$'\033[0;36m'; RESET=$'\033[0m'
@@ -54,6 +54,145 @@ detect_cloud_vm() {  # exit 0 if this looks like a cloud/datacenter VM
   # so deliberately no -f here) means something answered there, which is
   # signal enough; a closed connection or timeout means it didn't.
   curl -s -m 2 -o /dev/null http://169.254.169.254/ 2>/dev/null
+}
+
+detect_public_ip() {
+  local svc ip=""
+  for svc in "https://ifconfig.me" "https://api.ipify.org" "https://icanhazip.com"; do
+    ip="$(curl -4 -fsS --max-time 4 "${svc}" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ -n "${ip}" ]]; then
+      break
+    fi
+  done
+  printf '%s' "${ip}"
+}
+
+generate_password() {
+  openssl rand -hex 12 2>/dev/null || head -c16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c20
+}
+
+hash_password_for_env() {  # prints a scrypt hash of $1, or $1 itself if hashing fails
+  local hashed=""
+  hashed="$(cd "${APP_DIR}" && PW="$1" "${APP_DIR}/.venv/bin/python" -c 'import os; from twitch_radio.admin.passwords import hash_password; print(hash_password(os.environ["PW"]))' 2>/dev/null)" || hashed=""
+  printf '%s' "${hashed:-$1}"
+}
+
+prompt_settings_password() {
+  local pw=""
+  echo ""
+  echo "${CYAN}TWITCH_SETTINGS_PASSWORD${RESET}"
+  echo "  Sign-in password for /settings. Required once the bot is reachable from the internet."
+  read -r -s -p "  Value (input hidden, Enter to auto-generate one): " pw || true
+  echo ""
+  pw="$(trim "${pw}")"
+  if [[ -z "${pw}" ]]; then
+    pw="$(generate_password)"
+    echo "  Generated: ${pw}"
+    echo "  It is stored hashed in .env — write this one down."
+  fi
+  set_env_var "TWITCH_SETTINGS_PASSWORD" "$(hash_password_for_env "${pw}")" "${ENV_PATH}"
+  success "TWITCH_SETTINGS_PASSWORD saved."
+}
+
+prompt_caddy_site() {
+  local domain="" public_ip="" resolved=""
+  public_ip="$(detect_public_ip)"
+  echo ""
+  echo "${CYAN}Domain for Caddy${RESET}"
+  echo "  A domain whose DNS A record points at this machine, e.g. radio.example.com."
+  if [[ -n "${public_ip}" ]]; then
+    echo "  No domain? Press Enter to use ${public_ip//./-}.sslip.io, which already points here."
+  fi
+  read -r -p "  Domain: " domain || true
+  domain="$(trim "${domain}")"
+  domain="${domain#https://}"
+  domain="${domain#http://}"
+  domain="${domain%%/*}"
+  if [[ -z "${domain}" && -n "${public_ip}" ]]; then
+    domain="${public_ip//./-}.sslip.io"
+  fi
+  if [[ -z "${domain}" ]]; then
+    warn "No domain given and the public IP couldn't be detected — skipping Caddy."
+    return
+  fi
+  resolved="$(getent ahostsv4 "${domain}" 2>/dev/null | awk 'NR==1 {print $1}')"
+  if [[ -n "${public_ip}" && "${resolved}" != "${public_ip}" ]]; then
+    warn "${domain} resolves to ${resolved:-nothing}, not ${public_ip}. Certificates won't issue until DNS points here."
+  fi
+  SITE_ADDRESS="${domain}"
+  read -r -p "  Email for certificate expiry notices (optional): " CADDY_EMAIL || true
+  CADDY_EMAIL="$(trim "${CADDY_EMAIL}")"
+}
+
+install_caddy() {
+  if command -v caddy >/dev/null 2>&1; then
+    info "Caddy already installed ($(caddy version | head -n1)) — skipping."
+    return 0
+  fi
+  sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https gpg || return 1
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+    | sudo gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg || return 1
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+    | sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null || return 1
+  sudo apt update || return 1
+  sudo apt install -y caddy || return 1
+}
+
+configure_caddy() {  # configure_caddy PORT
+  local port="$1" main="/etc/caddy/Caddyfile" site="/etc/caddy/conf.d/twitch-radio.caddy"
+  local import_line="import /etc/caddy/conf.d/*.caddy"
+  sudo mkdir -p /etc/caddy/conf.d || return 1
+  sed -e "s#__SITE_ADDRESS__#${SITE_ADDRESS}#g" -e "s#__UPSTREAM__#127.0.0.1:${port}#g" \
+    "${APP_DIR}/deploy/Caddyfile" | sudo tee "${site}" >/dev/null || return 1
+
+  if ! sudo grep -qsF "${import_line}" "${main}"; then
+    if ! sudo test -s "${main}" || sudo grep -q 'root \* /usr/share/caddy' "${main}"; then
+      if sudo test -s "${main}"; then
+        sudo cp "${main}" "${main}.pre-twitch-radio" || return 1
+      fi
+      {
+        if [[ -n "${CADDY_EMAIL}" ]]; then
+          printf '{\n\temail %s\n}\n\n' "${CADDY_EMAIL}"
+        fi
+        printf '%s\n' "${import_line}"
+      } | sudo tee "${main}" >/dev/null || return 1
+    else
+      printf '\n%s\n' "${import_line}" | sudo tee -a "${main}" >/dev/null || return 1
+      warn "Your existing ${main} was kept and the import line appended."
+    fi
+  fi
+
+  if ! sudo caddy validate --config "${main}" --adapter caddyfile >/dev/null 2>&1; then
+    error "Caddy rejected the configuration:"
+    sudo caddy validate --config "${main}" --adapter caddyfile || true
+    return 1
+  fi
+  sudo systemctl enable caddy >/dev/null 2>&1 || true
+  sudo systemctl reload-or-restart caddy || return 1
+}
+
+open_web_ports() {
+  if command -v ufw >/dev/null 2>&1 && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
+    sudo ufw allow 80/tcp >/dev/null && sudo ufw allow 443/tcp >/dev/null && sudo ufw allow 443/udp >/dev/null \
+      && success "ufw: allowed ports 80 and 443."
+  fi
+  echo ""
+  echo "─────────────────────────────────────────────────────────────"
+  echo " Caddy needs ports 80 and 443 reachable from the internet."
+  echo " Port ${1} stays private on 127.0.0.1 — do not open it."
+  echo ""
+  echo " 1. Cloud firewall: ingress rules for TCP 80 and TCP+UDP 443 from"
+  echo "    0.0.0.0/0. On Oracle Cloud: the VCN's Security List or NSG."
+  echo ""
+  echo " 2. The VM's own firewall. On Oracle's Ubuntu images:"
+  echo "      sudo cp /etc/iptables/rules.v4 /etc/iptables/rules.v4.bak"
+  echo "      sudo sed -i '/--dport 22 -j ACCEPT/a -A INPUT -p tcp -m state --state NEW -m multiport --dports 80,443 -j ACCEPT' /etc/iptables/rules.v4"
+  echo "      sudo sed -i '/--dport 22 -j ACCEPT/a -A INPUT -p udp --dport 443 -j ACCEPT' /etc/iptables/rules.v4"
+  echo "      sudo iptables-restore < /etc/iptables/rules.v4"
+  echo "      sudo netfilter-persistent save"
+  echo "    Then confirm SSH (port 22) is still allowed:"
+  echo "      sudo iptables -L INPUT -n --line-numbers"
+  echo "─────────────────────────────────────────────────────────────"
 }
 
 REQUIRED_ENV_KEYS=(TWITCH_CLIENT_ID TWITCH_CLIENT_SECRET TWITCH_BOT_ID TWITCH_OWNER_ID)
@@ -154,6 +293,8 @@ APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVICE_USER="${SUDO_USER:-$(whoami)}"
 SERVICE_NAME="twitch-radio"
 ENV_PATH="${APP_DIR}/.env"
+SITE_ADDRESS="${CADDY_DOMAIN:-}"
+CADDY_EMAIL="${CADDY_EMAIL:-}"
 
 echo "Twitch Radio Bot — setup"
 echo "App directory: ${APP_DIR}"
@@ -176,11 +317,11 @@ if [[ "${SERVICE_USER}" == "root" && -z "${SUDO_USER:-}" ]]; then
   warn "Proceeding as root (ALLOW_ROOT=1) — the service will run as User=root."
 fi
 
-echo "[1/7] Installing system packages"
+echo "[1/8] Installing system packages"
 sudo apt update
 sudo apt install -y python3 python3-venv ffmpeg logrotate curl unzip openssl
 
-echo "[2/7] Installing a JS runtime for yt-dlp (Deno)"
+echo "[2/8] Installing a JS runtime for yt-dlp (Deno)"
 # yt-dlp needs an external JS runtime to solve YouTube's JS challenges as of
 # the version pinned in requirements.txt. Installed system-wide to
 # /usr/local/bin so it's on PATH for the systemd unit too (that unit sets an
@@ -228,19 +369,19 @@ else
   fi
 fi
 
-echo "[3/7] Preparing app directories"
+echo "[3/8] Preparing app directories"
 mkdir -p "${APP_DIR}/data" "${APP_DIR}/logs" "${APP_DIR}/data/deno-cache"
 
-echo "[4/7] Creating virtual environment"
+echo "[4/8] Creating virtual environment"
 if [[ ! -d "${APP_DIR}/.venv" ]]; then
   python3 -m venv "${APP_DIR}/.venv"
 fi
 
-echo "[5/7] Installing Python dependencies"
+echo "[5/8] Installing Python dependencies"
 "${APP_DIR}/.venv/bin/pip" install --upgrade pip -q
 "${APP_DIR}/.venv/bin/pip" install -r "${APP_DIR}/requirements.txt" -q
 
-echo "[6/7] Environment file"
+echo "[6/8] Environment file"
 if [[ -f "${ENV_PATH}" ]]; then
   info "Found an existing ${ENV_PATH} — keeping it, only filling in anything still blank below."
   chmod 600 "${ENV_PATH}" 2>/dev/null || true
@@ -314,95 +455,39 @@ else
     "    someone (re)connects. A track already playing always finishes."
 
   echo ""
-  echo "${CYAN}-- Local HTTP surface (/stream.mp3, /overlay, /settings) --${RESET}"
+  echo "${CYAN}-- HTTP surface (/stream.mp3, /overlay, /settings) --${RESET}"
   if [[ -n "$(get_env_var "TWITCH_NOWPLAYING_HOST" "${ENV_PATH}")" ]]; then
     info "TWITCH_NOWPLAYING_HOST is already set — leaving it alone."
     prompt_optional_field TWITCH_NOWPLAYING_PORT "8098" 0 1 \
-      "— Port for the local HTTP surface (1024-65535)."
+      "— Port for the HTTP surface (1024-65535)."
     prompt_optional_field TWITCH_SETTINGS_PASSWORD "" 1 0 \
-      "— Basic Auth password for /settings. Strongly recommended if the host" \
-      "    above isn't 127.0.0.1 — otherwise anyone who finds the port can" \
-      "    change your queue/cooldown settings."
+      "— Sign-in password for /settings. Required once the bot is reachable" \
+      "    from anywhere but this machine."
   else
-    echo ""
-    echo "${CYAN}TWITCH_NOWPLAYING_HOST${RESET}"
-    echo "  This bot doesn't stream to Twitch itself — OBS pulls the audio"
-    echo "  stream and overlay from here over plain HTTP instead."
-    same_machine=""
-    read -r -p "  Does OBS run on THIS machine? [Y/n]: " same_machine || true
-    same_machine="$(trim "${same_machine}")"
-    remote_obs=0
-    if [[ "${same_machine}" =~ ^[Nn] ]]; then
-      remote_obs=1
-      set_env_var "TWITCH_NOWPLAYING_HOST" "0.0.0.0" "${ENV_PATH}"
-      success "TWITCH_NOWPLAYING_HOST = 0.0.0.0 (reachable from other machines)"
-    else
-      set_env_var "TWITCH_NOWPLAYING_HOST" "127.0.0.1" "${ENV_PATH}"
-      success "TWITCH_NOWPLAYING_HOST = 127.0.0.1"
-    fi
-
+    set_env_var "TWITCH_NOWPLAYING_HOST" "127.0.0.1" "${ENV_PATH}"
+    success "TWITCH_NOWPLAYING_HOST = 127.0.0.1 (Caddy is the only thing that faces the internet)"
     prompt_optional_field TWITCH_NOWPLAYING_PORT "8098" 0 1 \
-      "— Port for the local HTTP surface (1024-65535)."
+      "— Port for the HTTP surface (1024-65535)."
 
-    if [[ "${remote_obs}" -eq 1 ]]; then
-      echo ""
-      echo "  A settings password is required when OBS is on another machine —"
-      echo "  this surface is now reachable off this box, and /settings changes"
-      echo "  your queue/cooldown limits."
-      echo ""
-      echo "${CYAN}TWITCH_SETTINGS_PASSWORD${RESET}"
-      pw=""
-      read -r -s -p "  Value (input hidden, Enter to auto-generate one): " pw || true
-      echo ""
-      pw="$(trim "${pw}")"
-      if [[ -z "${pw}" ]]; then
-        pw="$(openssl rand -hex 12 2>/dev/null || head -c16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c20)"
-        echo "  Generated: ${pw}"
-        echo "  (also saved in .env, so you don't need to remember it)"
-      fi
-      set_env_var "TWITCH_SETTINGS_PASSWORD" "${pw}" "${ENV_PATH}"
-      success "TWITCH_SETTINGS_PASSWORD saved."
-
-      port="$(get_env_var "TWITCH_NOWPLAYING_PORT" "${ENV_PATH}")"
-      echo ""
-      echo "  Detecting this machine's public IP..."
-      public_ip=""
-      for ip_svc in "https://ifconfig.me" "https://api.ipify.org" "https://icanhazip.com"; do
-        public_ip="$(curl -fsS --max-time 4 "${ip_svc}" 2>/dev/null | tr -d '[:space:]' || true)"
-        if [[ -n "${public_ip}" ]]; then
-          break
-        fi
-      done
-      if [[ -z "${public_ip}" ]]; then
-        warn "Couldn't auto-detect it (no outbound network, or it timed out)."
-        warn "Find it with: curl ifconfig.me — or your cloud provider's console."
-        public_ip="<your-public-ip>"
-      else
-        success "Public IP: ${public_ip}"
-      fi
-      echo ""
-      echo "─────────────────────────────────────────────────────────────"
-      echo " Open port ${port} so OBS can reach it — in TWO places:"
-      echo ""
-      echo " 1. Your cloud provider's firewall/security rule (ingress, TCP,"
-      echo "    port ${port}, source 0.0.0.0/0). On Oracle Cloud: the VCN's"
-      echo "    Security List or NSG, in the OCI console."
-      echo ""
-      echo " 2. This VM's own OS firewall — commonly ALSO blocks it even"
-      echo "    after step 1. On Oracle's Ubuntu images specifically:"
-      echo "      sudo cp /etc/iptables/rules.v4 /etc/iptables/rules.v4.bak"
-      echo "      sudo sed -i '/--dport 22 -j ACCEPT/a -A INPUT -p tcp -m state --state NEW -m tcp --dport ${port} -j ACCEPT' /etc/iptables/rules.v4"
-      echo "      sudo iptables-restore < /etc/iptables/rules.v4"
-      echo "      sudo netfilter-persistent save"
-      echo "    Double-check the SSH (port 22) rule is still there afterward:"
-      echo "      sudo iptables -L INPUT -n --line-numbers"
-      echo ""
-      echo " Then in OBS: http://${public_ip}:${port}/stream.mp3 and .../overlay"
-      echo "─────────────────────────────────────────────────────────────"
+    echo ""
+    echo "${CYAN}Caddy (automatic HTTPS)${RESET}"
+    echo "  Needed if OBS runs on another machine, or so viewers can open the"
+    echo "  /commands page. Skip it if OBS runs on this machine."
+    default_caddy="n"
+    if detect_cloud_vm; then
+      default_caddy="y"
+    fi
+    want_caddy=""
+    read -r -p "  Set up Caddy? [y/n] (${default_caddy}): " want_caddy || true
+    want_caddy="$(trim "${want_caddy}")"
+    want_caddy="${want_caddy:-${default_caddy}}"
+    if [[ "${want_caddy}" =~ ^[Yy] ]]; then
+      prompt_caddy_site
+      prompt_settings_password
     else
       prompt_optional_field TWITCH_SETTINGS_PASSWORD "" 1 0 \
-        "— Basic Auth password for /settings. Only matters if you later" \
-        "    change TWITCH_NOWPLAYING_HOST away from 127.0.0.1."
+        "— Sign-in password for /settings. Only needed if you later put" \
+        "    the bot behind a reverse proxy."
     fi
   fi
 
@@ -480,7 +565,7 @@ else
   echo ""
 fi
 
-echo "[7/7] Installing logrotate config and systemd unit"
+echo "[7/8] Installing logrotate config and systemd unit"
 # Template the path/user instead of installing verbatim — otherwise a custom
 # APP_DIR/SERVICE_USER silently doesn't take effect here even though the
 # rest of the install honors it.
@@ -493,6 +578,27 @@ sed \
   "${APP_DIR}/deploy/${SERVICE_NAME}.service" | sudo tee "/etc/systemd/system/${SERVICE_NAME}.service" >/dev/null
 sudo systemctl daemon-reload
 success "Installed /etc/systemd/system/${SERVICE_NAME}.service (not started yet)."
+
+echo "[8/8] Caddy"
+caddy_ok=0
+bot_port="$(get_env_var TWITCH_NOWPLAYING_PORT "${ENV_PATH}")"
+bot_port="${bot_port:-8098}"
+if [[ -z "${SITE_ADDRESS}" ]]; then
+  info "Skipping. To add it later: CADDY_DOMAIN=radio.example.com ${BASH_SOURCE[0]}"
+elif install_caddy && configure_caddy "${bot_port}"; then
+  caddy_ok=1
+  if [[ -z "$(get_env_var "TWITCH_PUBLIC_BASE_URL" "${ENV_PATH}")" ]]; then
+    set_env_var "TWITCH_PUBLIC_BASE_URL" "https://${SITE_ADDRESS}" "${ENV_PATH}"
+  fi
+  success "Caddy is serving https://${SITE_ADDRESS} -> 127.0.0.1:${bot_port}"
+  if [[ -z "$(get_env_var "TWITCH_SETTINGS_PASSWORD" "${ENV_PATH}")" ]]; then
+    warn "No TWITCH_SETTINGS_PASSWORD set — /settings will refuse everyone arriving through Caddy."
+    warn "Set one with: ${APP_DIR}/.venv/bin/python ${APP_DIR}/bot.py --hash-password"
+  fi
+  open_web_ports "${bot_port}"
+else
+  error "Caddy setup failed. The bot itself is installed; fix the error above and re-run this script."
+fi
 
 echo ""
 echo "─────────────────────────────────────────────────────────────"
@@ -508,8 +614,6 @@ if [[ -n "${still_missing}" ]]; then
   echo "   or just re-run this script interactively to pick up where you left off.)"
 else
   echo "1. All required credentials are set in ${ENV_PATH}."
-  echo "   If OBS is on a different machine than this one, double-check"
-  echo "   TWITCH_NOWPLAYING_HOST and TWITCH_SETTINGS_PASSWORD in the same file."
 fi
 echo ""
 echo "2. Start the service:"
@@ -528,8 +632,14 @@ echo "   Use two SEPARATE browser sessions for these two — reusing one"
 echo "   logged-in session for both silently authorizes the same account"
 echo "   twice. Watch step 5's logs right after starting to catch that."
 echo ""
-echo "4. In OBS, add a Media Source pointed at /stream.mp3 and (optionally) a"
-echo "   Browser Source pointed at /overlay — see README.md."
+if [[ "${caddy_ok}" -eq 1 ]]; then
+  echo "4. In OBS, add a Media Source pointed at https://${SITE_ADDRESS}/stream.mp3 and"
+  echo "   (optionally) a Browser Source pointed at https://${SITE_ADDRESS}/overlay."
+  echo "   Sign in to settings at https://${SITE_ADDRESS}/login."
+else
+  echo "4. In OBS, add a Media Source pointed at http://127.0.0.1:${bot_port}/stream.mp3 and"
+  echo "   (optionally) a Browser Source pointed at /overlay — see README.md."
+fi
 echo ""
 echo "5. journalctl -u ${SERVICE_NAME} -f -o cat    — watch it come up"
 echo "─────────────────────────────────────────────────────────────"

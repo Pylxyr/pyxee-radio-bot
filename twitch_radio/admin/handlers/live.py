@@ -13,7 +13,7 @@ from typing import Any
 from aiohttp import web
 
 from twitch_radio.admin.assets import static_text
-from twitch_radio.admin.context import AdminContext, get_ctx
+from twitch_radio.admin.context import AdminContext, client_ip, get_ctx
 from twitch_radio.telemetry import counters
 
 # Everything the public /commands page may load: its own inline style and
@@ -172,7 +172,7 @@ async def handle_commands_page(request: web.Request) -> web.Response:
     the page itself is static output built once at startup, so beyond those
     there is nothing here for an attacker to act on."""
     ctx = get_ctx(request)
-    if not ctx.commands_limiter.allow(request.remote or "unknown"):
+    if not ctx.commands_limiter.allow(client_ip(request)):
         return web.Response(status=429, text="Too many requests — try again in a minute.")
     return web.Response(
         text=ctx.commands_page_html,

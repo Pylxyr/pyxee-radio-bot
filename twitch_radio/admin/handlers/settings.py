@@ -1,4 +1,4 @@
-"""The password-gated routes: /settings (view and save) and /blocklist.json."""
+"""The sign-in-gated routes: /settings (view and save) and /blocklist.json."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Any
 
 from aiohttp import web
 
-from twitch_radio.admin.context import AdminContext, get_ctx
+from twitch_radio.admin.context import AdminContext, client_ip, get_ctx
 from twitch_radio.admin.handlers.auth import authorize, origin_ok, protect
 from twitch_radio.admin.render.settings_page import FORM_MARKER, LiveStatus, render_settings_page
 from twitch_radio.blocklist import clean_list
@@ -90,6 +90,7 @@ async def _page_response(
         broadcast_info=ctx.broadcast_info,
         status=_live_status(ctx),
         has_logo=ctx.logo is not None,
+        can_sign_out=ctx.settings_password is not None,
         message=message,
         error=error,
     )
@@ -172,7 +173,7 @@ async def handle_settings_post(request: web.Request) -> web.Response:
     toggles_result = await ctx.toggles_store.update(_mutate_toggles)
     log.info(
         "Settings updated via /settings from %s: tunables=%s specs=%s toggles=%s",
-        request.remote,
+        client_ip(request),
         tunables_result,
         specs_result,
         toggles_result,

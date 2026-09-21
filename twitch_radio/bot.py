@@ -6,6 +6,7 @@ import logging
 import signal
 
 from twitch_radio.admin.app import run_admin_server
+from twitch_radio.admin.passwords import is_password_hash
 from twitch_radio.player import RadioPlayer
 from twitch_radio.chatbot import TwitchChatBot
 from twitch_radio.chatfeed import ChatFeed
@@ -99,8 +100,9 @@ async def _async_run(settings: Settings) -> None:
             },
             host=settings.nowplaying_host,
             port=settings.nowplaying_port,
-            tls_cert_file=settings.tls_cert_file,
-            tls_key_file=settings.tls_key_file,
+            trusted_proxies=settings.trusted_proxies,
+            session_hours=settings.session_hours,
+            session_remember_days=settings.session_remember_days,
             allow_open_settings=settings.settings_allow_open,
         )
         try:
@@ -194,11 +196,38 @@ def run() -> None:
         action="store_true",
         help="Validate .env and exit — doesn't start the bot, spawn ffmpeg, or touch Twitch/yt-dlp.",
     )
+    parser.add_argument(
+        "--hash-password",
+        action="store_true",
+        help="Prompt for a /settings password and print the hash to put in TWITCH_SETTINGS_PASSWORD.",
+    )
     args = parser.parse_args()
 
     if args.check_config:
         sys.exit(_check_config())
+    if args.hash_password:
+        sys.exit(_hash_password())
     asyncio.run(_async_run(_load_settings_or_exit()))
+
+
+def _hash_password() -> int:
+    import getpass
+
+    from twitch_radio.admin.passwords import MAX_PASSWORD_LENGTH, hash_password
+
+    password = getpass.getpass("New /settings password: ")
+    if not password:
+        print("Nothing entered — aborting.")
+        return 1
+    if len(password) > MAX_PASSWORD_LENGTH:
+        print(f"Too long — the login form accepts at most {MAX_PASSWORD_LENGTH} characters.")
+        return 1
+    if getpass.getpass("Repeat it: ") != password:
+        print("Those didn't match — aborting.")
+        return 1
+    print("\nPut this line in .env (replacing any existing TWITCH_SETTINGS_PASSWORD), then restart:\n")
+    print(f"TWITCH_SETTINGS_PASSWORD={hash_password(password)}")
+    return 0
 
 
 def _check_config() -> int:
@@ -218,16 +247,16 @@ def _check_config() -> int:
     print("Config OK:")
     print(f"  Twitch: bot_id={settings.bot_id} owner_id={settings.owner_id} prefix={settings.prefix!r}")
     print(f"  Audio: {settings.audio_bitrate_kbps} kbps, pause_when_no_listeners={settings.pause_when_no_listeners}")
-    tls_on = settings.tls_cert_file is not None and settings.tls_key_file is not None
-    scheme = "https" if tls_on else "http"
-    print(
-        f"  HTTP: {scheme}://{settings.nowplaying_host}:{settings.nowplaying_port} "
-        f"(settings password {'set' if settings.settings_password else 'NOT set — /settings is open to anyone'})"
-    )
-    if tls_on:
-        print(f"  TLS: native, cert={settings.tls_cert_file}")
+    if settings.settings_password is None:
+        login = "no password — /settings is reachable only from this machine, never through a proxy"
     else:
-        print("  TLS: not configured natively — plain HTTP unless a reverse proxy terminates TLS in front of this")
+        login = f"password {'hashed' if is_password_hash(settings.settings_password) else 'set (plain text)'}"
+    print(f"  HTTP: http://{settings.nowplaying_host}:{settings.nowplaying_port} ({login})")
+    print(
+        f"  Sessions: {settings.session_hours}h"
+        + (f", or {settings.session_remember_days}d with 'keep me signed in'" if settings.session_remember_days else "")
+    )
+    print(f"  Trusted proxies: {', '.join(str(net) for net in settings.trusted_proxies) or 'none'}")
     if settings.public_base_url:
         print(f"  Public commands page: {settings.public_base_url}/commands (linked from !commands in chat)")
     else:

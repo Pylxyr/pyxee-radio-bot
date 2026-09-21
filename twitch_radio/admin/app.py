@@ -5,21 +5,20 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import ssl
 from collections.abc import Awaitable, Callable
-from pathlib import Path
 
 import aiohttp
 from aiohttp import web
 
 from twitch_radio.admin.assets import preload_static, read_logo
-from twitch_radio.admin.context import CTX_KEY, AdminContext
-from twitch_radio.admin.handlers import live, media
+from twitch_radio.admin.context import CTX_KEY, AdminContext, is_https
+from twitch_radio.admin.handlers import live, login, media
 from twitch_radio.admin.handlers import settings as settings_handlers
 from twitch_radio.admin.render.commands_page import build_commands_page
+from twitch_radio.admin.sessions import SessionStore
 from twitch_radio.chatfeed import ChatFeed
 from twitch_radio.db import Database
-from twitch_radio.netutil import is_loopback_host
+from twitch_radio.netutil import IPNetwork, is_loopback_host
 from twitch_radio.player import RadioPlayer
 from twitch_radio.store import JsonStore
 
@@ -40,6 +39,9 @@ _ROUTES: tuple[tuple[str, str, _Handler], ...] = (
     ("GET", "/commands", live.handle_commands_page),
     ("GET", "/thumb-proxy", media.handle_thumb_proxy),
     ("GET", "/stream.mp3", media.handle_stream),
+    ("GET", "/login", login.handle_login_get),
+    ("POST", "/login", login.handle_login_post),
+    ("POST", "/logout", login.handle_logout),
     ("GET", "/settings", settings_handlers.handle_settings_get),
     ("POST", "/settings", settings_handlers.handle_settings_post),
 )
@@ -50,38 +52,19 @@ async def _security_headers_middleware(request: web.Request, handler: _Handler) 
     """Headers every response gets, app-wide, rather than threading them
     through each handler (/settings alone has several response sites).
 
-    Strict-Transport-Security is meaningful once a browser reaches this over
-    HTTPS — natively or via a reverse proxy — and ignored over plain http, so
-    it is harmless otherwise. setdefault so a handler that sets its own value
+    Strict-Transport-Security is only sent when the visitor arrived over HTTPS
+    (directly or through the reverse proxy). setdefault so a handler that sets its own value
     isn't silently overridden. (Referrer-Policy is deliberately not set here:
     `no-referrer` makes browsers send `Origin: null` on same-origin form POSTs,
-    which /settings' CSRF check would then reject.) Responses already
-    prepared by their handler (the audio stream, WebSockets) have sent their
-    headers by now, so this is a no-op for them.
+    which the CSRF check on /login and /settings would then reject.) Responses
+    already prepared by their handler (the audio stream, WebSockets) have sent
+    their headers by now, so this is a no-op for them.
     """
     response = await handler(request)
-    response.headers.setdefault("Strict-Transport-Security", "max-age=15552000")
+    if is_https(request):
+        response.headers.setdefault("Strict-Transport-Security", "max-age=15552000")
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     return response
-
-
-def _build_ssl_context(tls_cert_file: Path | None, tls_key_file: Path | None) -> ssl.SSLContext | None:
-    """Both TWITCH_TLS_CERT_FILE and TWITCH_TLS_KEY_FILE, or neither — config.py
-    already validated that and cleared both otherwise, so by the time either
-    reaches here it can be acted on directly.
-
-    This makes EVERY route HTTPS-only for the lifetime of the listener:
-    aiohttp binds one (host, port) to one protocol, so there is no plain-http
-    fallback on the same port. For a browser-trusted, self-renewing
-    certificate a reverse proxy (Caddy) is the easier path — see the README's
-    "Serving over HTTPS"; this native option is for setups (Termux) where
-    standing up a proxy isn't practical.
-    """
-    if tls_cert_file is None or tls_key_file is None:
-        return None
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.load_cert_chain(certfile=str(tls_cert_file), keyfile=str(tls_key_file))
-    return context
 
 
 async def run_admin_server(
@@ -97,16 +80,15 @@ async def run_admin_server(
     broadcast_info: dict[str, str],
     host: str,
     port: int,
-    tls_cert_file: Path | None = None,
-    tls_key_file: Path | None = None,
+    trusted_proxies: tuple[IPNetwork, ...],
+    session_hours: int,
+    session_remember_days: int,
     allow_open_settings: bool = False,
 ) -> web.AppRunner:
     preload_static()
-    ssl_context = _build_ssl_context(tls_cert_file, tls_key_file)
 
     exposed = not is_loopback_host(host)
-    settings_locked = settings_password is None and exposed and not allow_open_settings
-    if settings_locked:
+    if settings_password is None and exposed and not allow_open_settings:
         log.warning(
             "/settings and /blocklist.json are DISABLED: the server listens on %s (reachable off this "
             "machine) but TWITCH_SETTINGS_PASSWORD is not set. Set a password to enable them.",
@@ -137,7 +119,13 @@ async def run_admin_server(
         logo_small=read_logo("logo-32.png"),
         commands_page_html=build_commands_page(commands_prefix, has_logo=logo is not None),
         settings_password=settings_password,
-        settings_locked=settings_locked,
+        exposed=exposed,
+        allow_open=allow_open_settings,
+        trusted_proxies=trusted_proxies,
+        sessions=SessionStore(
+            lifetime_seconds=session_hours * 3600,
+            remember_seconds=session_remember_days * 86400,
+        ),
     )
 
     app = web.Application(middlewares=[_security_headers_middleware])
@@ -157,7 +145,7 @@ async def run_admin_server(
     runner = web.AppRunner(app)
     try:
         await runner.setup()
-        await web.TCPSite(runner, host, port, ssl_context=ssl_context).start()
+        await web.TCPSite(runner, host, port).start()
     except BaseException:
         # e.g. the port is already taken: release what was acquired instead of
         # leaking an open client session, without masking the original error.
@@ -165,12 +153,10 @@ async def run_admin_server(
             await runner.cleanup()
         await thumb_session.close()
         raise
-    scheme = "https" if ssl_context is not None else "http"
     log.info(
-        "Admin server listening on %s://%s:%d (/stream.mp3, /overlay, /chat-overlay, /commands, "
+        "Admin server listening on http://%s:%d (/stream.mp3, /overlay, /chat-overlay, /commands, "
         "/nowplaying.json, /ws/nowplaying, /chat.json, /ws/chat, /blocklist.json, /healthz, "
-        "/logo.png, /settings)",
-        scheme,
+        "/logo.png, /login, /settings)",
         host,
         port,
     )

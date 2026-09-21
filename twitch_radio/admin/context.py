@@ -1,8 +1,8 @@
 """The shared state every admin handler reads.
 
-Handlers are plain functions rather than methods on one large class; what they
-used to reach through `self` lives here, is built once by run_admin_server(),
-and is fetched from the aiohttp app with get_ctx(request).
+Handlers are plain functions rather than methods on one large class; the state
+they share lives here, is built once by run_admin_server(), and is fetched from
+the aiohttp app with get_ctx(request).
 """
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 from aiohttp import web
 
 from twitch_radio.admin.security import AuthRateLimiter, RequestRateLimiter
+from twitch_radio.admin.sessions import SessionStore
+from twitch_radio.netutil import IPNetwork, is_trusted_peer, resolve_client_ip
 
 if TYPE_CHECKING:
     import aiohttp
@@ -42,13 +44,12 @@ class AdminContext:
     logo_small: bytes | None
     # Built once at startup — see render/commands_page.py.
     commands_page_html: str
-    # None means no password is configured.
+    # Plain text or a scrypt hash; None means no password is configured.
     settings_password: str | None
-    # True when there is no password AND the server is reachable off this
-    # machine AND the operator hasn't explicitly opted in to open access:
-    # /settings and /blocklist.json then refuse every request rather than
-    # letting anyone who finds the port change the bot's configuration.
-    settings_locked: bool
+    exposed: bool
+    allow_open: bool
+    trusted_proxies: tuple[IPNetwork, ...]
+    sessions: SessionStore
     started_at: float = field(default_factory=time.monotonic)
     auth_limiter: AuthRateLimiter = field(default_factory=AuthRateLimiter)
     # 60/min per IP is generous for a human browsing a page of static text
@@ -65,3 +66,26 @@ CTX_KEY = web.AppKey("admin_ctx", AdminContext)
 
 def get_ctx(request: web.Request) -> AdminContext:
     return request.app[CTX_KEY]
+
+
+def client_ip(request: web.Request) -> str:
+    return resolve_client_ip(
+        request.remote, request.headers.get("X-Forwarded-For"), get_ctx(request).trusted_proxies
+    )
+
+
+def _trusted_header(request: web.Request, name: str) -> str | None:
+    if not is_trusted_peer(request.remote, get_ctx(request).trusted_proxies):
+        return None
+    value = request.headers.get(name)
+    return value.split(",")[0].strip() if value else None
+
+
+def is_https(request: web.Request) -> bool:
+    if request.secure:
+        return True
+    return (_trusted_header(request, "X-Forwarded-Proto") or "").lower() == "https"
+
+
+def forwarded_host(request: web.Request) -> str | None:
+    return _trusted_header(request, "X-Forwarded-Host")

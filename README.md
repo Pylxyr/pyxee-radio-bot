@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/twitchio-3.3.2-9146FF?logo=twitch&logoColor=white" alt="TwitchIO 3.3.2">
   <img src="https://img.shields.io/badge/yt--dlp-2026.08.19-FF0000" alt="yt-dlp 2026.08.19">
   <img src="https://img.shields.io/badge/ffmpeg-required-007808?logo=ffmpeg&logoColor=white" alt="ffmpeg required">
-  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20Termux-lightgrey" alt="Platform: Linux or Termux">
+  <img src="https://img.shields.io/badge/platform-Linux-lightgrey" alt="Platform: Linux">
 </p>
 
 A standalone Twitch chat bot for song requests. `!sr <query>` searches and
@@ -20,10 +20,7 @@ Browser Source overlay (thumbnail, progress bar, up-next).
 
 The bot does **not** stream to Twitch itself and has no Twitch stream key —
 Twitch has no "join a voice channel" equivalent, so OBS has to pull the
-audio in on its own. Originally a module of a larger Discord music bot,
-split out so a Twitch credential problem or a stuck `ffmpeg` process can't
-take the rest of that system down; it has no dependency on or awareness of
-any Discord bot.
+audio in on its own.
 
 ## Features
 
@@ -70,8 +67,8 @@ any Discord bot.
   see [Public commands page](#public-commands-page).
 - **`/settings` web page** — adjust request limits, feature toggles, and
   the streamer's PC specs/peripherals (shown to viewers via
-  `!specs`/`!peripherals`) without touching a config file, optionally
-  password-protected. A "Now Playing" section updates live over the same
+  `!specs`/`!peripherals`) without touching a config file, behind a
+  sign-in page. A "Now Playing" section updates live over the same
   WebSocket the overlay uses — no page refresh needed to see what's
   queued or playing — alongside a full command reference (every command,
   including a couple kept out of `!commands` in chat) and a read-only
@@ -89,8 +86,7 @@ any Discord bot.
 ## Requirements
 
 - A Linux server (Ubuntu/Debian assumed by `deploy/setup.sh`; any
-  distribution works), or an Android phone via Termux
-  (`deploy/setup_termux.sh`)
+  distribution works)
 - Python 3.11+, `ffmpeg`
 - A Twitch account for the bot to chat as (a dedicated account, made a
   moderator in your channel, is recommended over reusing your own), and an
@@ -111,32 +107,9 @@ Installs system packages, [Deno](https://deno.com) (yt-dlp's JS runtime for
 full YouTube support), a virtualenv, and a systemd unit (installed, not
 started), then walks through `.env` interactively — the four required
 credentials first, then every other setting with its current default
-shown. Safe to re-run; already-filled values are left alone.
+shown. It also offers to set up [Caddy](#publishing-with-caddy) for HTTPS.
+Safe to re-run; already-filled values are left alone.
 `SKIP_WIZARD=1` skips the interactive part for a scripted install.
-
-### Termux (Android)
-
-Runs directly on a phone, no VPS needed:
-
-```bash
-pkg install git
-git clone https://github.com/Pylxyr/pyxee-radio-bot.git twitch-radio-bot
-cd twitch-radio-bot
-bash deploy/setup_termux.sh
-```
-
-Same service and `.env`; two differences from the Linux install:
-
-- Uses **Node** instead of Deno for yt-dlp's JS runtime (Deno doesn't
-  reliably run on Android's Bionic libc; Termux's `nodejs` package is
-  built natively for it).
-- **No systemd** — uses `termux-services` if available, otherwise a
-  detached `tmux` session, to keep the process running.
-
-Since OBS doesn't run on Android, the phone is always the "OBS on a
-different machine" case (see [below](#running-the-bot-on-a-separate-machine-from-obs)).
-The one-time OAuth step is actually simpler here, too — the bot and the
-browser are the same device, so there's no SSH tunnel to set up.
 
 ### Manual install
 
@@ -165,13 +138,15 @@ required; everything else has a default.
 | `TWITCH_PREFIX` | `!` | Chat command prefix |
 | `AUDIO_BITRATE_KBPS` | `128` | MP3 bitrate, 64–320 |
 | `PAUSE_QUEUE_WHEN_NO_LISTENERS` | `false` | Hold at the track boundary while nobody's connected to `/stream.mp3` |
-| `TWITCH_NOWPLAYING_HOST` | `127.0.0.1` | HTTP bind address — `0.0.0.0` to expose beyond localhost |
+| `TWITCH_NOWPLAYING_HOST` | `127.0.0.1` | HTTP bind address. Leave it on loopback and publish through [Caddy](#publishing-with-caddy) |
 | `TWITCH_NOWPLAYING_PORT` | `8098` | HTTP port, 1024–65535 |
-| `TWITCH_SETTINGS_PASSWORD` | unset | Basic Auth password for `/settings` and `/blocklist.json` (any username) |
-| `TWITCH_SETTINGS_ALLOW_OPEN` | `false` | Only matters when `TWITCH_NOWPLAYING_HOST` is reachable off this machine *and* no password is set. By default `/settings` and `/blocklist.json` are then **disabled**; `true` lets anyone who can reach the port use them. Set a password instead unless the network is fully trusted |
+| `TWITCH_SETTINGS_PASSWORD` | unset | Password for the `/login` page that gates `/settings` and `/blocklist.json`. Plain text, or a hash from `python bot.py --hash-password` |
+| `TWITCH_SETTINGS_ALLOW_OPEN` | `false` | With no password, `/settings` and `/blocklist.json` work only from this machine itself — never through a reverse proxy or a non-loopback bind. `true` lifts that for a fully trusted network |
+| `TWITCH_SESSION_HOURS` | `12` | How long a sign-in lasts, 1–168 |
+| `TWITCH_SESSION_REMEMBER_DAYS` | `30` | Length of a "keep me signed in" session, 0–365; `0` hides the checkbox |
+| `TWITCH_TRUSTED_PROXIES` | `127.0.0.1/32,::1/128` | IPs/CIDRs of reverse proxies whose `X-Forwarded-*` headers are believed |
 | `TWITCH_PUBLIC_BASE_URL` | unset | Externally-reachable base URL (e.g. `https://radio.example.com`), no trailing slash. When set, `!commands` links to `<url>/commands` instead of the terse in-chat listing — see [Public commands page](#public-commands-page) |
 | `TWITCH_CHAT_EMOTE_SOURCES` | `7tv,bttv,ffz,cheermotes` | Extra emote sources the chat overlay draws as images (Twitch's own emotes always are) — any subset, or `none`. See [Chat overlay](#chat-overlay) |
-| `TWITCH_TLS_CERT_FILE` / `TWITCH_TLS_KEY_FILE` | unset | Cert/key file paths for native HTTPS — both or neither. See [Serving over HTTPS](#serving-over-https) |
 | `TWITCH_TOKEN_FILE` / `TWITCH_TUNABLES_FILE` / `TWITCH_BLOCKLIST_FILE` / `TWITCH_SPECS_FILE` / `TWITCH_TOGGLES_FILE` / `TWITCH_DB_FILE` | see `.env.example` | Filenames under `data/` |
 | `YTDLP_COOKIES_FILE` | unset | Path under `data/` to a `cookies.txt` — see [notes below](#cookies-and-youtube-blocking-cloud-ips) |
 | `YTDLP_POT_PROVIDER_URL` | unset | URL of a local PO-token provider, if configured |
@@ -201,7 +176,6 @@ port 4343.
    ```bash
    ssh -L 4343:localhost:4343 <user>@<host>
    ```
-   (Skip this on Termux — the bot and browser are the same device.)
 3. In a browser, **as the bot account**, visit:
    `http://localhost:4343/oauth?scopes=user:read:chat+user:write:chat+user:bot+moderator:manage:chat_messages+moderator:read:followers+moderator:manage:shoutouts&force_verify=true`
    Then, in a **separate** browser session, **as the broadcaster account**:
@@ -251,40 +225,26 @@ missing, so leaving some out is always safe.
 
 Three sources, all pointed at the HTTP surface below:
 
-- **Media Source** → `http://<host>:<port>/stream.mp3` (uncheck "Local
+- **Media Source** → `https://<your-domain>/stream.mp3` (uncheck "Local
   File")
-- **Browser Source** (optional) → `http://<host>:<port>/overlay` —
+- **Browser Source** (optional) → `https://<your-domain>/overlay` —
   transparent background, size to taste
-- **Browser Source** (optional) → `http://<host>:<port>/chat-overlay` —
+- **Browser Source** (optional) → `https://<your-domain>/chat-overlay` —
   a separate source from the one above, since chat wants its own size and
   position on your canvas, not to share the now-playing widget's corner.
   See [Chat overlay](#chat-overlay) below.
 
-If this service runs on the **same machine** as OBS, `<host>` is
-`localhost` and nothing else is needed.
+If this service runs on the **same machine** as OBS, use
+`http://localhost:8098` in place of `https://<your-domain>` and nothing
+else is needed.
 
 ### Running the bot on a separate machine from OBS
 
 Common case: the bot runs on a cloud VM, OBS runs on your own PC.
 
-**Option A — open the port.** Set `TWITCH_NOWPLAYING_HOST=0.0.0.0` and set
-`TWITCH_SETTINGS_PASSWORD` (leave it unset with a non-localhost host and
-`/settings` and `/blocklist.json` are disabled until you set one). Open `TWITCH_NOWPLAYING_PORT` (default 8098)
-in both your cloud firewall (ingress, TCP, source `0.0.0.0/0`) and the
-VM's own OS firewall — on Oracle Cloud's stock Ubuntu images, `ufw` is
-disabled by default and `/etc/iptables/rules.v4` needs editing directly:
-
-```bash
-sudo cp /etc/iptables/rules.v4 /etc/iptables/rules.v4.bak
-sudo sed -i '/--dport 22 -j ACCEPT/a -A INPUT -p tcp -m state --state NEW -m tcp --dport 8098 -j ACCEPT' /etc/iptables/rules.v4
-sudo iptables-restore < /etc/iptables/rules.v4
-sudo netfilter-persistent save
-```
-
-Double-check the SSH rule is still present before disconnecting. Then
-point OBS at `http://<VM's public IP>:8098/stream.mp3` and `.../overlay`.
-This surface has no TLS; put a reverse proxy (e.g. Caddy) in front if you'd
-rather not send the `/settings` password in cleartext.
+**Option A — Caddy (recommended).** Keep the bot on `127.0.0.1`, put Caddy
+in front, and point OBS at your HTTPS domain. `deploy/setup.sh` does it;
+see [Publishing with Caddy](#publishing-with-caddy).
 
 **Option B — SSH tunnel.** Nothing exposed to the internet; the tunnel has
 to stay connected for the whole stream. Add a second `-L` to your existing
@@ -298,13 +258,6 @@ Point OBS at `http://localhost:8098/stream.mp3` (not the VM's public IP)
 while that session is open. Add `-o ServerAliveInterval=30 -o
 ServerAliveCountMax=3` if a dropped connection tends to hang silently
 instead of closing.
-
-**On Termux**, neither option applies directly — there's no cloud firewall
-or public IP. `setup_termux.sh` configures for the phone's local network
-IP instead (`http://<phone's-local-IP>:8098/stream.mp3`, for an OBS
-machine on the same Wi-Fi); reaching it from outside that network
-generally needs a tunneling tool (Tailscale, Cloudflare Tunnel) since most
-mobile carriers block inbound connections outright.
 
 ## Commands (in Twitch chat)
 
@@ -368,19 +321,23 @@ Binds to `127.0.0.1` by default (`TWITCH_NOWPLAYING_HOST`).
 | `GET /ws/chat` | public | WebSocket version, pushed on every new message |
 | `GET /healthz` | public | Player state, queue size, rolling resolve success/failure counts |
 | `GET /logo.png` | public | The bot mark (add `?s=32` for the favicon size) |
-| `GET /blocklist.json` | password-gated | Full blocklist contents |
-| `GET`/`POST /settings` | password-gated | Request-limit and specs/peripherals editor |
+| `GET`/`POST /login` | public | Sign-in page |
+| `POST /logout` | signed in | Ends the session |
+| `GET /blocklist.json` | signed in | Full blocklist contents |
+| `GET`/`POST /settings` | signed in | Request-limit and specs/peripherals editor |
 
-"Password-gated" means HTTP Basic Auth with `TWITCH_SETTINGS_PASSWORD`.
-Unset, those endpoints are open only while the server listens on
-localhost (`127.0.0.1`/`::1`); on any other bind address they are disabled
-(HTTP 403) unless you opt in with `TWITCH_SETTINGS_ALLOW_OPEN=true`. That
-rule looks at the bind address only, so if you publish the bot through a
-reverse proxy on the same machine (bot on `127.0.0.1`), set a password —
-the bot can't tell proxied visitors from local ones. Failed logins are
-rate-limited per client address (behind a proxy, all visitors share the
-proxy's address and therefore one limit). Everything else is always
-public, since it's meant to be fetched by OBS or a browser without auth.
+"Signed in" means a session from the `/login` page, using
+`TWITCH_SETTINGS_PASSWORD`. Browsers hitting a gated page are redirected
+to `/login` and sent back afterwards; scripts get a `401` with a JSON body
+and can sign in by POSTing `password=...` to `/login` and reusing the
+cookie (`curl -c jar -d password=... https://<domain>/login`).
+
+With no password set, those endpoints work only from this machine itself:
+any request that arrives through a reverse proxy, or over a non-loopback
+bind address, gets a `403` unless you opt in with
+`TWITCH_SETTINGS_ALLOW_OPEN=true`. Failed sign-ins are rate-limited per
+visitor address. Everything else is always public, since it's meant to be
+fetched by OBS or a browser without auth.
 
 ## Public commands page
 
@@ -461,92 +418,55 @@ separate API call per unique chatter for a purely cosmetic detail; the
 hash is at least stable, so the same username always lands on the same
 color here.
 
-## Serving over HTTPS
+## Publishing with Caddy
 
-Every page this bot serves — `/settings`, `/commands`, `/overlay`,
-everything — sits behind one TCP listener, so making it HTTPS is a matter
-of putting TLS in front of that one listener rather than anything
-per-page. Two ways to do that, in order of what most people should
-actually use:
+The bot listens on `127.0.0.1` only. [Caddy](https://caddyserver.com) sits
+in front on ports 80 and 443, gets a browser-trusted certificate from
+Let's Encrypt, renews it, redirects HTTP to HTTPS, and forwards everything
+to the bot. A reverse proxy is the right shape for this bot: one listener
+already carries the audio stream, WebSockets and every page, and TLS,
+renewal and internet-facing hardening are better handled by a proxy built
+for it than by the bot.
 
-### Recommended: a reverse proxy with automatic certificates
+`deploy/setup.sh` sets it up — answer yes at the Caddy prompt, or later:
 
-If you have a domain pointed at your VPS, [Caddy](https://caddyserver.com)
-gets you a real, browser-trusted, auto-renewing certificate from Let's
-Encrypt with a three-line config and no cron job to remember. Install it
-alongside this bot, point the domain at the VPS, and:
-
-```
-# /etc/caddy/Caddyfile
-radio.example.com {
-    reverse_proxy 127.0.0.1:8098
-}
+```bash
+CADDY_DOMAIN=radio.example.com CADDY_EMAIL=you@example.com bash deploy/setup.sh
 ```
 
-`sudo systemctl reload caddy` and you're done — Caddy handles the
-certificate, the renewal, and the HTTP→HTTPS redirect. The bot itself
-keeps running exactly as documented above (`TWITCH_NOWPLAYING_HOST` stays
-`127.0.0.1`, nothing in `.env` changes for this) since it's now only ever
-reached through Caddy, not directly. Set:
+The domain's A record must point at the VPS. With no domain, leave it
+blank and the script uses `<ip-with-dashes>.sslip.io`, a public wildcard
+DNS name that resolves to that IP, which Caddy can get a real certificate
+for. The script:
 
-```
-TWITCH_PUBLIC_BASE_URL=https://radio.example.com
-```
+- installs Caddy from its official apt repository
+- writes `/etc/caddy/conf.d/twitch-radio.caddy` from `deploy/Caddyfile` and
+  adds one `import` line to `/etc/caddy/Caddyfile` (the stock file is
+  backed up first; a customised one is kept and only appended to)
+- validates and reloads Caddy, opens ports 80/443 in `ufw` if it's active,
+  and prints the cloud-firewall and Oracle `iptables` steps for 80/443
+- sets `TWITCH_PUBLIC_BASE_URL` and generates a hashed sign-in password if
+  you ask it to
 
-so `!commands` links to the https URL. nginx + certbot is the other
-common combination if you already run nginx for something else, at the
-cost of a bit more manual setup (certbot's renewal timer, a server block
-pointing at `proxy_pass http://127.0.0.1:8098;`).
+Open **80/tcp, 443/tcp and 443/udp** (HTTP/3). Keep the bot's own port
+closed to the internet.
 
-### Alternative: native TLS in the bot itself
+`deploy/Caddyfile` compresses text but not the MP3, flushes the stream
+without buffering, retries for up to 5 seconds while the bot restarts
+instead of returning 502, and caps request bodies at 1 MB.
 
-No domain, or you'd rather not run a second process (this is the more
-practical option under Termux). Provide a certificate and key file
-directly and the bot terminates TLS itself:
+Behind the proxy the bot reads the visitor's real address from
+`X-Forwarded-For` (only when the connection comes from a trusted proxy,
+loopback by default — see `TWITCH_TRUSTED_PROXIES`), so lockouts and rate
+limits apply per visitor instead of to everyone at once. It marks the
+session cookie `Secure` when the proxy says the visitor used HTTPS, and
+with no password set it refuses `/settings` for anything that came through
+a proxy.
 
-```
-TWITCH_TLS_CERT_FILE=/path/to/fullchain.pem
-TWITCH_TLS_KEY_FILE=/path/to/privkey.pem
-```
-
-Both or neither — set only one and the bot logs a warning and falls back
-to plain HTTP rather than failing to start. Once both are set, **every**
-route on this port becomes HTTPS-only for as long as the process runs;
-there's no HTTP fallback left on that same port to redirect from, so
-update any saved `http://` links (OBS's Browser Source URL, bookmarks,
-`TWITCH_PUBLIC_BASE_URL`) to `https://` once you turn this on. This path
-has no automatic renewal — a Let's Encrypt certificate obtained via
-`certbot certonly --standalone` (or `--webroot`) still expires every 90
-days and needs `TWITCH_TLS_CERT_FILE`/`TWITCH_TLS_KEY_FILE` to keep
-pointing at current files, which is exactly the manual toil Caddy exists
-to avoid — reach for the reverse proxy above if you have a domain
-available at all.
-
-A self-signed certificate works for this option too (`openssl req -x509
--newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 365 -subj
-"/CN=your-ip-or-host"`), but every browser will show a certificate
-warning, and **OBS's Browser Source can't click through that warning the
-way a normal browser tab can** — a self-signed cert will leave the
-overlay blank in OBS. Fine for quickly testing that TLS wiring itself
-works; not something to leave running for the overlay or for anything
-handed out to viewers.
-
-If you do point `TWITCH_TLS_CERT_FILE`/`TWITCH_TLS_KEY_FILE` at a real
-Let's Encrypt certificate instead of a self-signed one, note that
-`certbot`'s files under `/etc/letsencrypt/live/` are readable only by
-root by default — and this bot's systemd unit deliberately runs as an
-unprivileged user (see `deploy/twitch-radio.service`), so it won't be
-able to read the private key as-is. Either grant that one user read
-access (`setfacl -m u:youruser:rx` on the containing directories, so a
-renewal doesn't reset a plain `chmod`), or copy the two files somewhere
-the bot's user owns and point the env vars there — but a copy has to be
-kept in sync by hand across renewals, which is one more reason the
-reverse-proxy path above is usually less trouble in the long run.
-
-Either way, once a browser reaches any page here over HTTPS at all, it
-gets sent `Strict-Transport-Security`, so that browser will keep
-insisting on HTTPS for this host afterward even if it's later linked
-somewhere with a stray `http://`.
+Other setups: nginx needs `proxy_buffering off`, a long `proxy_read_timeout`,
+`Upgrade` headers for `/ws/`, and `Host`, `X-Forwarded-For` and
+`X-Forwarded-Proto` passed through. If only your own machines need access,
+an SSH tunnel (Option B above) or Tailscale exposes nothing to the internet.
 
 ## Security
 
@@ -555,10 +475,16 @@ somewhere with a stray `http://`.
   those two extractors as a second layer — not configurable. Arbitrary
   sites can serve crafted metadata into the overlay page and chat replies,
   so every additional extractor is attack surface, not just a feature.
-- **`/settings` is protected against CSRF** — a cross-site POST with a
-  mismatched `Origin`/`Referer` is rejected with 403.
-- **`/settings` has brute-force lockout** — 10 failed password attempts
-  from the same address within 5 minutes get a 429 (in-memory, resets on
+- **`/settings` sits behind a sign-in page.** Sessions are server-side,
+  in memory (a restart signs everyone out), in an `HttpOnly`,
+  `SameSite=Lax` cookie that becomes `Secure` and `__Host-`-prefixed over
+  HTTPS. `TWITCH_SETTINGS_PASSWORD` may be a scrypt hash
+  (`python bot.py --hash-password`) so `.env` doesn't hold the password.
+- **Sign-in and `/settings` are protected against CSRF** — a POST whose
+  `Origin`/`Referer` doesn't match the host, or that the browser marks
+  cross-site, is rejected with 403.
+- **Sign-in has brute-force lockout** — 10 failed attempts from the same
+  visitor address within 5 minutes get a 429 (in-memory, resets on
   restart).
 - **The OAuth token file** (`data/twitch_tokens.json`) is `chmod 600`
   after every save.
@@ -572,61 +498,8 @@ somewhere with a stray `http://`.
 
 This isn't a hardened public-internet service — the intent is "one
 streamer's own bot, reachable by the people who need it," not "safe to
-expose to strangers with no other precautions." Put a reverse proxy in
-front if exposing this beyond your own network.
-
-## Project structure
-
-```
-twitch-radio-bot/
-├── bot.py                     # entry point
-├── requirements.txt
-├── pyproject.toml             # ruff/mypy config
-├── assets/
-│   └── logo.png                # also served at /logo.png
-├── deploy/
-│   ├── .env.example
-│   ├── setup.sh                # installer (Ubuntu/Debian VPS)
-│   ├── setup_termux.sh         # installer (Termux/Android — standalone, no systemd)
-│   ├── twitch-radio.service    # systemd unit
-│   └── twitch-radio-logrotate
-└── twitch_radio/
-    ├── config.py               # Settings dataclass, env var loading
-    ├── models.py                # Track dataclass
-    ├── extraction.py            # yt-dlp resolver + short-lived cache (YouTube/SoundCloud only)
-    ├── extractor_worker.py       # the child process `extraction.py` drives (YTDLP_WORKER_MODE=process)
-    ├── radio.py                  # RadioSuggester: radio-autoplay picks via YouTube's own Mix playlist
-    ├── store.py                 # atomic JSON persistence
-    ├── db.py                     # SQLite persistence for per-viewer data (points, custom commands)
-    ├── tunables.py               # TwitchTunables dataclass (request limits + points rate)
-    ├── toggles.py                 # FeatureToggles dataclass (radio autoplay, chat filters)
-    ├── commands_reference.py     # single source of truth for !commands + /settings' command table
-    ├── telemetry.py               # rolling event counters, exposed via /healthz
-    ├── cooldown.py                # reusable per-chatter cooldown tracker
-    ├── specs.py                  # PCSpecs/Peripherals dataclasses (!specs, !peripherals)
-    ├── blocklist.py               # moderation blocklist normalization/lookup
-    ├── chatfeed.py                # ChatFeed: bounded/aged recent-chat buffer for /chat-overlay
-    ├── emotes.py                  # 7TV/BTTV/FFZ emote lists + Twitch cheermote artwork for the chat overlay
-    ├── player.py                  # RadioPlayer: MP3 encoder + subscriber fan-out, gapless queue, !pause/!resume, radio-autoplay hooks
-    ├── chatbot.py                 # TwitchChatBot: OAuth/token lifecycle, component wiring, engagement tracking
-    ├── components/                # chat commands, split by concern
-    │   ├── song_requests.py       #   !sr, !skip, !pause/!resume, !voteskip, !remove, !position, !queue, !nowplaying, !radio
-    │   ├── moderation.py          #   !setlimit, !toggle, !block/!unblock, !blocklist, !clearqueue
-    │   ├── info.py                #   !specs, !peripherals, !commands
-    │   ├── engagement.py          #   !points, !leaderboard, !watchtime, !addcom/!editcom/!delcom
-    │   ├── alerts.py              #   follow/sub/cheer/raid announcements, auto-shoutout, !so
-    │   └── stream_info.py         #   !uptime, !title, !game, !followage, !clip, !poll
-    ├── netutil.py                 # is_loopback_host(): shared by config warnings and the admin server
-    ├── admin/                     # the aiohttp HTTP surface (/stream.mp3, /overlay, /nowplaying.json, /ws/*, /healthz, /commands, /settings)
-    │   ├── app.py                 #   run_admin_server(): routes, middleware, TLS, startup/teardown
-    │   ├── context.py             #   AdminContext: the shared state every handler reads
-    │   ├── security.py            #   Basic-auth check, CSRF origin check, rate limiters, thumbnail URL allowlist (stdlib only)
-    │   ├── assets.py              #   loads static/ and the logo
-    │   ├── handlers/              #   live.py (now-playing, chat, overlays, /commands), media.py (stream, thumb proxy), settings.py, auth.py
-    │   ├── render/                #   settings_page.py, commands_page.py — pure HTML builders
-    │   └── static/                #   overlay/chat-overlay pages, settings + commands templates, CSS and JS
-    └── bot.py                     # wires everything together, owns shutdown, --check-config
-```
+expose to strangers with no other precautions." Publish it through Caddy
+rather than binding it to a public address.
 
 ## Notes
 
@@ -806,7 +679,7 @@ way.
 
 `YTDLP_WORKER_MODE=thread` restores the old in-process behaviour if you
 need it — and if the pool can't be spawned at all (an unusual container, a
-locked-down Termux install), the bot logs a warning and falls back to
+locked-down container), the bot logs a warning and falls back to
 threads by itself rather than leaving `!sr` broken.
 
 ### Every resolve needs one JS-runtime call, by design

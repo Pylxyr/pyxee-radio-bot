@@ -31,6 +31,9 @@ STATIC_FILES = (
     "commands.html",
     "commands.css",
     "commands.js",
+    "login.html",
+    "login.css",
+    "login.js",
 )
 
 

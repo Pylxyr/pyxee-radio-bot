@@ -109,9 +109,9 @@ _FAST_EXTRACT_TIMEOUT_SECONDS = 15.0
 _RADIO_MIX_TIMEOUT_SECONDS = 15.0
 
 # How long a freshly spawned extraction worker gets to import yt_dlp and
-# announce itself. The import alone is most of a second on a VPS and can be
-# several on a phone, so this is deliberately generous — it only ever costs
-# anything when something is genuinely wrong.
+# announce itself. The import alone is most of a second on a small VPS and can
+# be several on a loaded one, so this is deliberately generous — it only ever
+# costs anything when something is genuinely wrong.
 _WORKER_START_TIMEOUT_SECONDS = 60.0
 # Grace period between SIGTERM and SIGKILL when recycling a worker. A wedged
 # worker is wedged inside yt-dlp or a JS runtime and will not be returning,
@@ -167,7 +167,7 @@ class ThreadBackend(ExtractionBackend):
 
     Retained as an escape hatch rather than deleted, because it has no
     dependency on being able to spawn child processes — which is the sort of
-    thing a hardened container or an unusual Termux setup can take away.
+    thing a hardened container or an unusual sandbox can take away.
     Its known limitation is unchanged and is why ProcessBackend exists: a
     timed-out wait_for() cancels only the *wait*, never the thread, so a
     wedged extraction occupies a worker for as long as it feels like.

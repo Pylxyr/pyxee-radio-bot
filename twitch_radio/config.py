@@ -6,7 +6,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from twitch_radio.netutil import is_loopback_host
+from twitch_radio.admin.passwords import validate_stored_password
+from twitch_radio.netutil import DEFAULT_TRUSTED_PROXIES, IPNetwork, is_loopback_host, parse_networks
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
@@ -160,23 +161,12 @@ class Settings:
     nowplaying_host: str
     nowplaying_port: int
     settings_password: str | None
-    # Opt-in escape hatch. With no password set and a bind address reachable off
-    # this machine, /settings and /blocklist.json are disabled outright; this
-    # (TWITCH_SETTINGS_ALLOW_OPEN=true) restores password-less access for
-    # networks the operator trusts.
     settings_allow_open: bool
-    # Externally-reachable base URL for the public /commands page (no
-    # trailing slash), e.g. "https://radio.example.com" or
-    # "http://203.0.113.5:8098". None if unset — nowplaying_host is almost
-    # always 127.0.0.1 or 0.0.0.0, neither of which means anything typed
-    # into a browser on someone else's machine, so it can't be derived
-    # automatically the way the other local endpoints are. Unset, !commands
-    # falls back to the old terse in-chat listing instead of a broken link.
+    session_hours: int
+    session_remember_days: int
+    trusted_proxies: tuple[IPNetwork, ...]
+    # Public base URL for the /commands link (no trailing slash); None if unset.
     public_base_url: str | None
-    # Both set, or both None — parsed together below and only accepted as a
-    # pair, since aiohttp's load_cert_chain needs both to do anything.
-    tls_cert_file: Path | None
-    tls_key_file: Path | None
     # Which extra emote sources the chat overlay draws as images: any of
     # 7tv, bttv, ffz, cheermotes (Twitch's own emotes always work). Empty
     # tuple = none. TWITCH_CHAT_EMOTE_SOURCES.
@@ -263,23 +253,34 @@ def load_settings() -> Settings:
 
     nowplaying_host = os.getenv("TWITCH_NOWPLAYING_HOST", "127.0.0.1").strip() or "127.0.0.1"
     settings_password = os.getenv("TWITCH_SETTINGS_PASSWORD", "").strip() or None
+    if settings_password is not None:
+        password_problem = validate_stored_password(settings_password)
+        if password_problem is not None:
+            raise RuntimeError(f"TWITCH_SETTINGS_PASSWORD {password_problem}")
     settings_allow_open = _bool_env("TWITCH_SETTINGS_ALLOW_OPEN", False)
     host_is_exposed = not is_loopback_host(nowplaying_host)
-    if host_is_exposed and settings_password is None:
-        if settings_allow_open:
-            print(
-                f"WARNING: TWITCH_NOWPLAYING_HOST={nowplaying_host!r} is reachable off this machine and "
-                f"TWITCH_SETTINGS_PASSWORD is unset, with TWITCH_SETTINGS_ALLOW_OPEN on — anyone who "
-                f"finds the port can change your queue/cooldown settings via /settings. Set "
-                f"TWITCH_SETTINGS_PASSWORD."
-            )
-        else:
-            print(
-                f"WARNING: TWITCH_NOWPLAYING_HOST={nowplaying_host!r} is reachable off this machine but "
-                f"TWITCH_SETTINGS_PASSWORD is unset — /settings and /blocklist.json are DISABLED until "
-                f"you set a password. (TWITCH_SETTINGS_ALLOW_OPEN=true re-enables them without one; "
-                f"only do that on a network you trust.)"
-            )
+    if settings_password is None and settings_allow_open:
+        print(
+            "WARNING: TWITCH_SETTINGS_PASSWORD is unset with TWITCH_SETTINGS_ALLOW_OPEN on — anyone "
+            "who can reach this server (directly, or through a reverse proxy) can change your "
+            "queue/cooldown settings via /settings. Set TWITCH_SETTINGS_PASSWORD."
+        )
+    elif settings_password is None and host_is_exposed:
+        print(
+            f"WARNING: TWITCH_NOWPLAYING_HOST={nowplaying_host!r} is reachable off this machine but "
+            f"TWITCH_SETTINGS_PASSWORD is unset — /settings and /blocklist.json are DISABLED until "
+            f"you set a password. (TWITCH_SETTINGS_ALLOW_OPEN=true re-enables them without one; "
+            f"only do that on a network you trust.)"
+        )
+
+    trusted_proxies, rejected_proxies = parse_networks(
+        os.getenv("TWITCH_TRUSTED_PROXIES", "").strip() or DEFAULT_TRUSTED_PROXIES
+    )
+    if rejected_proxies:
+        print(
+            f"WARNING: TWITCH_TRUSTED_PROXIES has entries that aren't an IP or CIDR range, ignoring "
+            f"them: {', '.join(rejected_proxies)}"
+        )
 
     public_base_url = os.getenv("TWITCH_PUBLIC_BASE_URL", "").strip().rstrip("/") or None
     if public_base_url is not None and not public_base_url.startswith(("http://", "https://")):
@@ -292,36 +293,15 @@ def load_settings() -> Settings:
         print(
             f"WARNING: TWITCH_PUBLIC_BASE_URL={public_base_url!r} uses http://, not https:// — "
             f"this is the link every viewer gets from !commands, so it's worth serving over TLS. "
-            f"See the README's \"Serving over HTTPS\" section."
+            f"See the README's \"Publishing with Caddy\" section."
         )
 
-    if settings_password is None and public_base_url is not None and not host_is_exposed:
+    if settings_password is None and public_base_url is not None and not settings_allow_open:
         print(
-            "WARNING: TWITCH_PUBLIC_BASE_URL is set but TWITCH_SETTINGS_PASSWORD is not. If that URL "
-            "points at a reverse proxy in front of this server, /settings is reachable through it "
-            "with no login at all (the bot only sees the proxy on 127.0.0.1). Set "
-            "TWITCH_SETTINGS_PASSWORD."
+            "WARNING: TWITCH_PUBLIC_BASE_URL is set but TWITCH_SETTINGS_PASSWORD is not. /settings "
+            "will refuse everyone arriving through the reverse proxy — set a password to use it "
+            "from anywhere but this machine."
         )
-
-    tls_cert_raw = os.getenv("TWITCH_TLS_CERT_FILE", "").strip()
-    tls_key_raw = os.getenv("TWITCH_TLS_KEY_FILE", "").strip()
-    tls_cert_file = Path(tls_cert_raw) if tls_cert_raw else None
-    tls_key_file = Path(tls_key_raw) if tls_key_raw else None
-    if bool(tls_cert_file) != bool(tls_key_file):
-        print(
-            "WARNING: TWITCH_TLS_CERT_FILE and TWITCH_TLS_KEY_FILE must both be set to enable "
-            "native HTTPS — only one was provided, so the server will run plain HTTP. (If you're "
-            "terminating TLS with a reverse proxy instead, leave both of these unset — that's the "
-            "normal setup and this warning doesn't apply to you.)"
-        )
-        tls_cert_file = tls_key_file = None
-    elif tls_cert_file is not None:
-        if not tls_cert_file.is_file():
-            print(f"WARNING: TWITCH_TLS_CERT_FILE={tls_cert_file} does not exist — server will run plain HTTP.")
-            tls_cert_file = tls_key_file = None
-        elif not tls_key_file.is_file():  # type: ignore[union-attr]
-            print(f"WARNING: TWITCH_TLS_KEY_FILE={tls_key_file} does not exist — server will run plain HTTP.")
-            tls_cert_file = tls_key_file = None
 
     return Settings(
         client_id=client_id,
@@ -335,9 +315,10 @@ def load_settings() -> Settings:
         nowplaying_port=_clamped_int_env("TWITCH_NOWPLAYING_PORT", 8098, 1024, 65535),
         settings_password=settings_password,
         settings_allow_open=settings_allow_open,
+        session_hours=_clamped_int_env("TWITCH_SESSION_HOURS", 12, 1, 168),
+        session_remember_days=_clamped_int_env("TWITCH_SESSION_REMEMBER_DAYS", 30, 0, 365),
+        trusted_proxies=trusted_proxies,
         public_base_url=public_base_url,
-        tls_cert_file=tls_cert_file,
-        tls_key_file=tls_key_file,
         chat_emote_sources=chat_emote_sources,
         token_path=DATA_DIR / os.getenv("TWITCH_TOKEN_FILE", "twitch_tokens.json").strip(),
         tunables_path=DATA_DIR / os.getenv("TWITCH_TUNABLES_FILE", "tunables.json").strip(),

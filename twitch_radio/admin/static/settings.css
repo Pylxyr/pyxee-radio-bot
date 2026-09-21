@@ -33,6 +33,12 @@ body::before {
 h1 { margin: 0; font-size: 26px; font-weight: 700; letter-spacing: -0.02em; }
 .sub { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.signout { margin: 0; }
+.signout button {
+  padding: 5px 12px; font-size: 12px; font-weight: 600; color: var(--muted);
+  background: transparent; border: 1px solid var(--line); border-radius: 999px;
+}
+.signout button:hover { color: var(--text); border-color: var(--muted); filter: none; }
 .chip {
   font-size: 12px; padding: 4px 10px; border-radius: 999px;
   background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
