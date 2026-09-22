@@ -52,13 +52,12 @@ async def _security_headers_middleware(request: web.Request, handler: _Handler) 
     """Headers every response gets, app-wide, rather than threading them
     through each handler (/settings alone has several response sites).
 
-    Strict-Transport-Security is only sent when the visitor arrived over HTTPS
-    (directly or through the reverse proxy). setdefault so a handler that sets its own value
-    isn't silently overridden. (Referrer-Policy is deliberately not set here:
-    `no-referrer` makes browsers send `Origin: null` on same-origin form POSTs,
-    which the CSRF check on /login and /settings would then reject.) Responses
-    already prepared by their handler (the audio stream, WebSockets) have sent
-    their headers by now, so this is a no-op for them.
+    Strict-Transport-Security only sends over HTTPS (direct or via the
+    reverse proxy); setdefault so a handler's own value isn't overridden.
+    Referrer-Policy is deliberately not set: `no-referrer` makes browsers
+    send `Origin: null` on same-origin form POSTs, which the CSRF check on
+    /login and /settings would then reject. A no-op for responses already
+    prepared by their handler (the audio stream, WebSockets).
     """
     response = await handler(request)
     if is_https(request):

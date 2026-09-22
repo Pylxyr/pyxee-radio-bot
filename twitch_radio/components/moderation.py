@@ -29,10 +29,8 @@ USAGE = {
     "toggle": "Usage: !toggle <key> [on|off] — keys: " + ", ".join(TOGGLE_KEYS),
 }
 
-# Every @commands.is_moderator() below also admits the broadcaster — see the
-# note in chatbot.py's module docstring area (unchanged from the original
-# single-file version); repeated per-component since that's the verified
-# behavior each mod-only command here relies on.
+# Every @commands.is_moderator() below also admits the broadcaster —
+# repeated here per-component since each mod-only command relies on it.
 
 
 class ModerationComponent(commands.Component):
@@ -102,11 +100,10 @@ class ModerationComponent(commands.Component):
     @commands.is_moderator()
     @commands.command(name="block")
     async def block(self, ctx: commands.Context, *, args: str) -> None:
-        """Mod-only: blocks a track (by URL) or an uploader (by name) from
-        being requested again, and pulls any already-queued copy out of the
-        queue too — by URL for a track block, and by uploader name for an
-        uploader block (QueuedRequest carries the uploader from the resolve
-        that created it, so this needs no re-resolution)."""
+        """Mod-only: blocks a track (URL) or uploader (name) from being
+        requested again, and pulls any already-queued copy out too —
+        QueuedRequest already carries the uploader, so no re-resolution
+        is needed to match on it."""
         target = args.strip()
         if not target:
             await self.bot.safe_reply(ctx, USAGE["block"])

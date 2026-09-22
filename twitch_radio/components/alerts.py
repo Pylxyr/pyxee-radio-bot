@@ -16,11 +16,10 @@ _TIER_NAMES = {"1000": "Tier 1", "2000": "Tier 2", "3000": "Tier 3"}
 
 class AlertsComponent(commands.Component):
     """Follow/sub/cheer/raid announcements, gated by one toggle
-    (alerts_enabled) regardless of which of the underlying EventSub
-    subscriptions actually succeeded — see chatbot.py's
-    _try_subscribe_alerts and module docstring for the scopes each needs.
-    Listeners here are additive (Component.listener(), not an event_message-
-    style override) — they can't interfere with anything else handling the
+    (alerts_enabled) regardless of which underlying EventSub subscription
+    actually succeeded — see chatbot.py's _try_subscribe_alerts. Listeners
+    here are additive (Component.listener(), not an event_message
+    override), so they can't interfere with anything else handling the
     same event."""
 
     def __init__(self, bot: TwitchChatBot) -> None:

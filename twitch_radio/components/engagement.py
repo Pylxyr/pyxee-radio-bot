@@ -5,24 +5,19 @@ from typing import TYPE_CHECKING
 
 from twitchio.ext import commands
 
+from twitch_radio.commands_reference import BY_NAME
+
 if TYPE_CHECKING:
     from twitch_radio.chatbot import TwitchChatBot
 
 log = logging.getLogger(__name__)
 
 # Custom commands can't shadow a built-in — checked in add_command_cmd below.
-# Kept as a flat, hand-maintained set (not introspected from the other
-# components) to avoid a wiring-time import cycle between this module and
-# the ones that define these names.
-_RESERVED_NAMES = frozenset(
-    {
-        "sr", "songrequest", "skip", "voteskip", "vs", "remove", "cancel", "unqueue",
-        "position", "pos", "queue", "nowplaying", "np", "radio", "pause", "resume", "unpause",
-        "specs", "peripherals", "commands", "help", "setlimit", "toggle", "block", "unblock",
-        "blocklist", "clearqueue", "points", "balance", "leaderboard", "top", "watchtime",
-        "addcom", "editcom", "delcom",
-    }
-)
+# Sourced from commands_reference.BY_NAME (every command name + alias) rather
+# than a hand-maintained list, so a new built-in command is reserved
+# automatically instead of silently staying spoofable until this set is
+# remembered and updated too.
+_RESERVED_NAMES = frozenset(BY_NAME)
 
 
 def _format_duration(seconds: int) -> str:
@@ -92,11 +87,3 @@ class EngagementComponent(commands.Component):
         name = name.strip().lstrip("!").lower()
         removed = await self.bot.db.delete_command(name)
         await self.bot.safe_reply(ctx, f"Removed !{name}." if removed else f"No custom command !{name}.")
-
-    # !quote/!addquote/!delquote lived here and were removed on request.
-    # Database.add_quote/get_quote/delete_quote/count_quotes and the
-    # `quotes` table are left completely untouched in db.py — any quotes
-    # already saved in production stay in place, and the feature is a
-    # small re-add away if it's ever wanted back. "quote"/"addquote"/
-    # "delquote" were also dropped from _RESERVED_NAMES above, so a mod
-    # can freely use those as custom command names now.

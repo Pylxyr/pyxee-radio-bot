@@ -27,20 +27,18 @@ _MAX_BACKOFF = 300.0
 _STABLE_UPTIME_SECONDS = 30.0
 _DECODER_START_TIMEOUT = 20.0
 # Guards every stdout read for the rest of a track (separate from
-# _DECODER_START_TIMEOUT, which only covers the first chunk). Without it, a
-# decoder that stops producing output mid-track just hangs in
-# `await stdout.read()` forever — !skip still works, but nothing recovers
-# on its own. 20s is generous: chunks normally arrive every _CHUNK_DURATION
-# via ffmpeg's -re real-time pacing, so a real 20s gap means the source is
-# actually stuck.
+# _DECODER_START_TIMEOUT, which only covers the first chunk) — without it,
+# a decoder that stops producing output mid-track hangs forever in
+# `stdout.read()` with nothing to recover on its own. 20s is generous:
+# chunks normally arrive every _CHUNK_DURATION via ffmpeg's -re pacing, so
+# a real gap that long means the source is actually stuck.
 _STALL_TIMEOUT_SECONDS = 20.0
-# How long before a track ends to pre-resolve whatever's next in queue (see
-# _prefetch_next_when_close). Comfortably above the ~8-18s a warm resolve
-# actually takes (see extraction.py's fast-path fix) so the prefetch lands
-# well inside Resolver's TTL cache before _play_one_inner needs the result
-# for real — without this, a queue backlog that outlives
-# YTDLP_CACHE_TTL_SECONDS turns every transition into a full cold resolve
-# again, i.e. audible silence mid-stream, not just at startup.
+# How long before a track ends to pre-resolve what's next (see
+# _prefetch_next_when_close) — comfortably above the ~8-18s a warm resolve
+# takes, so it lands inside Resolver's TTL cache before it's needed for
+# real. Without this, a queue backlog outliving YTDLP_CACHE_TTL_SECONDS
+# turns every transition into a full cold resolve — audible silence
+# mid-stream, not just at startup.
 _PREFETCH_LEAD_SECONDS = 20.0
 
 
@@ -52,9 +50,8 @@ class RadioSuggestFn(Protocol):
     async def __call__(self, seed_webpage_url: str) -> "QueuedRequest | None": ...
 
 
-# Sliding-window "don't immediately hammer a broken/empty radio mix" guard —
-# a fast-failing suggestion (e.g. no mix data at all) could otherwise refire
-# every ~0.1s idle tick.
+# "Don't hammer a broken/empty radio mix" guard — a fast-failing
+# suggestion could otherwise refire every ~0.1s idle tick.
 _RADIO_RETRY_BACKOFF_SECONDS = 30.0
 
 
@@ -64,24 +61,20 @@ class QueuedRequest:
     requester_id: int
     requester_name: str
     title: str = ""
-    # Whatever the resolve that produced this request reported as the
-    # uploader/channel. Carried on the request purely so !block <uploader>
-    # can purge already-queued entries the same way !block <url> already
-    # does — the queue holds URLs, and re-resolving every pending request
-    # just to answer "who uploaded this" would be absurdly expensive.
-    # Empty string when unknown (nothing depends on it being accurate).
+    # Uploader/channel as reported by the resolve. Carried here so !block
+    # <uploader> can purge already-queued entries like !block <url> does,
+    # without re-resolving every pending request just to find out who
+    # uploaded it. Empty string when unknown.
     uploader: str = ""
     cancelled: bool = False
     on_start: Callable[[], None] | None = field(default=None, repr=False)
 
 
 class PlayerState(str, Enum):
-    """Derived, read-only view over the existing _resolving/_now_playing
-    flags below — added for external observability (/healthz, future
-    features that care "what's the player doing") without touching how
-    those flags are actually maintained. Not a real state machine: nothing
-    here is authoritative, it's just a label for whatever the existing
-    flags currently say."""
+    """Derived, read-only view over the _resolving/_now_playing flags below
+    — for external observability (/healthz, etc.) without changing how
+    those flags are maintained. Not a real state machine, just a label for
+    whatever the flags currently say."""
 
     IDLE = "idle"
     RESOLVING = "resolving"
@@ -120,11 +113,9 @@ class RadioPlayer:
         self._resolver = resolver
         self._audio_bitrate_kbps = audio_bitrate_kbps
         self._pause_when_no_listeners = pause_when_no_listeners
-        # Pointless (and wasteful — a redundant resolve for every track,
-        # same anti-pattern the extraction.py fast-path fix removed) when
-        # Resolver's own cache is disabled (YTDLP_CACHE_TTL_SECONDS=0): the
-        # prefetch's result would just be discarded instead of reused. See
-        # bot.py for how this gets computed from settings.
+        # Pointless when Resolver's cache is disabled
+        # (YTDLP_CACHE_TTL_SECONDS=0) — the prefetch's result would just be
+        # discarded instead of reused. See bot.py for how this is computed.
         self._prefetch_enabled = prefetch_enabled
         self._prefetch_task: asyncio.Task[None] | None = None
 
@@ -137,11 +128,11 @@ class RadioPlayer:
         self._backoff_reset_done = False
         self._current_decoder: asyncio.subprocess.Process | None = None
         self._now_playing: NowPlaying | None = None
-        # The request currently occupying the player's one "slot" — set the
-        # instant it's dequeued, cleared when done (or failed). now_playing
-        # alone isn't enough: it stays None through the whole resolve/decoder-
-        # startup window, so active_requester_id covers that gap too, letting
-        # a chatter !skip their own song before it's technically "playing" yet.
+        # The request occupying the player's one "slot" — set the instant
+        # it's dequeued, cleared when done/failed. now_playing alone isn't
+        # enough: it stays None through the resolve/decoder-startup window,
+        # so this covers that gap too, letting a chatter !skip their own
+        # song before it's technically "playing" yet.
         self._active_request: QueuedRequest | None = None
         self._stopping = False
         self._resolving = False
@@ -169,17 +160,14 @@ class RadioPlayer:
         # call snaps it to now.
         self._silence_deadline: float = 0.0
 
-        # Manual mod pause (!pause/!resume) — deliberately separate from
+        # Manual mod pause (!pause/!resume) — separate from
         # _pause_when_no_listeners above, which is automatic and driven by
-        # subscriber count. This one is only ever set by an explicit chat
-        # command and never cleared by anything else. See pause()/resume().
+        # subscriber count. Only ever set by an explicit chat command.
         self._paused = False
-        # Holds the track that was interrupted mid-play by pause(), so
-        # resume() plays it again first rather than skipping straight to
-        # whatever's next in _pending. There's no seek support anywhere in
-        # this pipeline (ffmpeg runs with -re and no -ss), so "resume"
-        # always means "play the same track again from 0:00", not from the
-        # interrupted position — see pause()'s docstring.
+        # Holds the track pause() interrupted, so resume() replays it first
+        # instead of skipping to _pending's next item. No seek support
+        # anywhere in this pipeline (ffmpeg runs with -re, no -ss), so
+        # "resume" always means from 0:00, never from the cut-off point.
         self._priority_request: QueuedRequest | None = None
 
     # -- public interface used by the chat bot / admin server ------------
@@ -209,17 +197,14 @@ class RadioPlayer:
         return None
 
     def queue_size(self) -> int:
-        """Requests still waiting to play. Deliberately len(self._pending)
-        and not self._queue.qsize(): purge_pending()/cancel_pending_for()
-        only mark an entry cancelled and drop it from _pending — the
+        """Requests still waiting to play. Deliberately len(self._pending),
+        not self._queue.qsize(): purge_pending()/cancel_pending_for() only
+        mark an entry cancelled and drop it from _pending — the
         asyncio.Queue keeps the tombstone until _feed_loop next dequeues
-        and discards it. Normally that's milliseconds, but with
-        PAUSE_QUEUE_WHEN_NO_LISTENERS=true and nobody connected, _feed_loop
-        never reaches get_nowait() at all, so qsize() stayed at its
-        pre-!clearqueue value indefinitely and !sr answered "Queue's full
-        right now" over a visibly empty queue. _pending is the authoritative
-        not-yet-played list and is also what !queue and the overlay already
-        render, so this makes all three agree."""
+        it, which never happens while paused for no listeners, so qsize()
+        could stay at its pre-!clearqueue value indefinitely. _pending is
+        the authoritative list and what !queue/the overlay already render,
+        so this keeps all three in agreement."""
         return len(self._pending)
 
     def queued_items(self) -> list[QueuedRequest]:
@@ -251,12 +236,10 @@ class RadioPlayer:
     @property
     def state(self) -> PlayerState:
         # Checked first, ahead of now_playing/resolving: killing the
-        # decoder in pause() is asynchronous (see skip_current()), so
-        # there's a brief window where _now_playing hasn't been cleared
-        # yet even though a mod already asked to pause. Reporting "paused"
-        # through that window is the answer that actually matches what a
-        # mod just did, not an internal implementation detail of how fast
-        # ffmpeg happens to exit.
+        # decoder in pause() is asynchronous, so there's a brief window
+        # where _now_playing hasn't cleared yet even though a mod already
+        # asked to pause. "Paused" is the answer that matches what the mod
+        # just did, not an implementation detail of how fast ffmpeg exits.
         if self._paused:
             return PlayerState.PAUSED
         if self._now_playing is not None:
@@ -340,17 +323,14 @@ class RadioPlayer:
         return False
 
     def pause(self) -> bool:
-        """Mod-only manual pause. Returns False if already paused (nothing
-        changed), True otherwise.
+        """Mod-only manual pause. Returns False if already paused.
 
-        Interrupts whatever's currently playing or resolving immediately —
-        this deliberately does NOT wait for a track boundary the way
-        _pause_when_no_listeners does, because the whole point of a mod
-        reaching for !pause is usually "stop it right now" (an ad break, an
-        announcement), not "stop it in four minutes when this song ends".
-        The interrupted request (if any) is preserved and replayed from the
-        top on resume() — see _priority_request's docstring for why "from
-        the top" rather than from where it was cut off."""
+        Interrupts playback/resolving immediately — deliberately doesn't
+        wait for a track boundary like _pause_when_no_listeners does, since
+        a mod reaching for !pause usually means "stop it right now", not
+        "in four minutes when this song ends". The interrupted request (if
+        any) is preserved and replayed from the top on resume() — see
+        _priority_request's docstring for why "from the top"."""
         if self._paused:
             return False
         self._paused = True
@@ -490,26 +470,22 @@ class RadioPlayer:
         while True:
             chunk = await stdout.read(_STREAM_CHUNK_BYTES)
             if not chunk:
-                # EOF here means the ffmpeg process itself exited (crashed,
-                # OOM-killed) — during a normal stop(), this task is
-                # cancelled directly before a read like this could return
-                # empty. Raising (not returning cleanly) routes this through
-                # the same backoff/restart path as any other encoder failure,
-                # with a log line explaining why, instead of silently
-                # respawning with no trace of what happened.
+                # EOF means ffmpeg itself exited (crashed, OOM-killed) —
+                # stop() cancels this task directly before a read could
+                # return empty during a normal shutdown. Raising routes
+                # this through the same backoff/restart path as any other
+                # encoder failure, with a log line explaining why.
                 returncode = self._encoder.returncode if self._encoder is not None else None
                 raise RuntimeError(f"Encoder stdout closed unexpectedly (exit code {returncode})")
             for q in list(self._subscribers):
                 try:
                     q.put_nowait(chunk)
                 except asyncio.QueueFull:
-                    # This subscriber's handle_stream() is still awaiting
-                    # queue.get(), and nothing more will ever be queued for
-                    # it once it's out of self._subscribers — evict one old
-                    # chunk to make room, then push an empty-bytes sentinel
-                    # (never produced by a real read) that handle_stream()
-                    # treats as "stop", so its coroutine and socket actually
-                    # close instead of hanging forever.
+                    # A stalled subscriber's handle_stream() is still
+                    # awaiting queue.get() — evict one old chunk to make
+                    # room, then push an empty-bytes sentinel (never
+                    # produced by a real read) that handle_stream() treats
+                    # as "stop", so it actually closes instead of hanging.
                     self._subscribers.discard(q)
                     with contextlib.suppress(asyncio.QueueEmpty):
                         q.get_nowait()
@@ -526,19 +502,17 @@ class RadioPlayer:
                 self._backoff = _MIN_BACKOFF
                 self._backoff_reset_done = True
             if self._paused:
-                # Checked before anything else in the loop, every tick —
-                # unlike _pause_when_no_listeners below, this never falls
-                # through to a dequeue, and _maybe_start_radio_fill() is
-                # never reached from here either, so autoplay can't sneak a
-                # new track in while a mod has explicitly paused things.
+                # Checked first, every tick — unlike _pause_when_no_listeners
+                # below, this never falls through to a dequeue or reaches
+                # _maybe_start_radio_fill(), so autoplay can't sneak a track
+                # in while a mod has explicitly paused things.
                 await self._write_paced_silence(encoder_stdin)
                 continue
             try:
                 if self._priority_request is not None:
-                    # Set by pause() when it interrupted something — takes
-                    # priority over the normal queue exactly once, so
-                    # resume() picks up the same track again rather than
-                    # whatever else is now at the front of _pending.
+                    # Set by pause() — takes priority over the normal queue
+                    # exactly once, so resume() picks up the same track
+                    # again rather than whatever's now at _pending's front.
                     request = self._priority_request
                     self._priority_request = None
                 elif self._pause_when_no_listeners and not self._subscribers:
@@ -550,10 +524,9 @@ class RadioPlayer:
                 else:
                     request = self._queue.get_nowait()
             except asyncio.QueueEmpty:
-                # Catches the case the prefetch-timer hook above doesn't:
-                # a skip or early end that empties the queue before that
-                # timer ever fired. Guarded/deduped inside the method
-                # itself, so calling it every idle tick is cheap.
+                # Catches what the prefetch-timer hook doesn't: a skip or
+                # early end that empties the queue first. Guarded/deduped
+                # inside the method, so calling it every idle tick is cheap.
                 self._maybe_start_radio_fill()
                 await self._write_paced_silence(encoder_stdin)
                 continue
@@ -572,23 +545,21 @@ class RadioPlayer:
 
     async def _write_paced_silence(self, encoder_stdin: asyncio.StreamWriter) -> None:
         """Writes one silence chunk and sleeps until the *deadline* for the
-        next one, rather than sleeping a flat _CHUNK_DURATION.
+        next one, rather than a flat _CHUNK_DURATION sleep.
 
-        The flat-sleep version fed 0.1s of audio per (0.1s + write time +
-        event-loop latency) of wall clock, so the encoder ran permanently
-        slower than real time whenever the stream was silent. Measured at
-        ~0.3% on an idle box — roughly 11 seconds of listener-buffer drain
-        per hour of silence — and much worse under load, since every
-        oversleep is kept rather than amortised: yt-dlp's extraction work is
-        GIL-bound and runs on this same interpreter, so a resolve in flight
-        is exactly when these sleeps overshoot. OBS's Media Source pays for
-        it as a progressive underrun.
+        The flat-sleep version fed 0.1s of audio per (0.1s + write + event-
+        loop latency) of wall clock, so the encoder ran slower than real
+        time whenever silent — ~0.3% on an idle box (~11s of listener-buffer
+        drain per hour), worse under load since yt-dlp's GIL-bound
+        extraction runs on this same interpreter and every oversleep is
+        kept, not amortised. OBS's Media Source pays for it as a
+        progressive underrun.
 
-        Accumulating against a monotonic deadline makes a late tick borrow
-        from the next one instead of adding to a permanent debt. The max()
-        clamps the deadline forward after a long gap (a track just played,
-        the loop was paused) so it never tries to "catch up" by dumping a
-        burst of silence into the encoder.
+        Accumulating against a monotonic deadline lets a late tick borrow
+        from the next one instead of building permanent debt. The max()
+        clamps the deadline forward after a long gap (a track just ended,
+        the loop was paused) so it never "catches up" by dumping a burst
+        of silence into the encoder.
         """
         await self._write_silence_chunk(encoder_stdin)
         self._silence_deadline = max(self._silence_deadline + _CHUNK_DURATION, time.monotonic())
@@ -615,10 +586,9 @@ class RadioPlayer:
             log.exception("Error playing queued request: %s", request.webpage_url)
         finally:
             self._active_request = None
-            # However this track ended (finished, skipped, stalled, errored),
-            # any prefetch scheduled for it is no longer relevant — the next
-            # _play_one_inner call will schedule its own once it knows the
-            # new track's real duration.
+            # However this track ended, its prefetch is no longer relevant
+            # — the next _play_one_inner schedules its own once it knows
+            # the new track's real duration.
             task = self._prefetch_task
             self._prefetch_task = None
             if task is not None:
@@ -628,21 +598,17 @@ class RadioPlayer:
             self._notify_state_changed()
 
     async def _prefetch_next_when_close(self, current_duration: int) -> None:
-        """Best-effort: once the currently-playing track is close to
-        ending, resolves whatever is now at the front of the queue so it's
-        already cache-warm by the time _play_one_inner re-resolves it for
-        real (see the module comment above _PREFETCH_LEAD_SECONDS). Never
-        raises and never touches playback state — a failure here just means
-        that transition pays the normal resolve cost, exactly as if this
-        didn't run at all. Deliberately re-checks the queue at fire time
-        (not whatever was next when this task was scheduled), since what's
-        "next" can change — a request ahead of it could get skipped,
+        """Best-effort: once playback is close to ending, resolves what's
+        now at the front of the queue so it's cache-warm by the time
+        _play_one_inner re-resolves it for real (see _PREFETCH_LEAD_SECONDS).
+        Never raises; a failure just means that transition pays the normal
+        resolve cost. Re-checks the queue at fire time, not what was next
+        when scheduled, since a request ahead of it could get skipped,
         blocked, or cleared while this was sleeping.
         """
         delay = max(0.0, current_duration - _PREFETCH_LEAD_SECONDS)
         await asyncio.sleep(delay)  # cancelled cleanly by _play_one's finally when the track ends first
-        # Queue's still empty this close to the end — try to auto-fill it
-        # from radio mode *before* checking what's next, so the freshly
+        # Try radio auto-fill before checking what's next, so a freshly
         # queued pick gets the same pre-warming resolve below instead of a
         # cold one right when it's needed.
         self._maybe_start_radio_fill()
@@ -657,15 +623,14 @@ class RadioPlayer:
     def _maybe_start_radio_fill(self) -> None:
         """Kicks off a background radio-suggestion lookup when the queue is
         empty and nothing's already in flight. Called from both the
-        prefetch timer above (pre-warms the common "track ends naturally"
-        case) and _feed_loop's idle branch below (catches a skip/early-end,
-        where the prefetch timer never got to fire). Both funnel through
-        this one guarded entry point so they can't double-queue a pick.
+        prefetch timer (pre-warms the normal "track ends naturally" case)
+        and _feed_loop's idle branch (catches a skip/early-end that beat
+        the timer) — both funnel through this one guarded entry point so
+        they can't double-queue a pick.
 
-        The _feed_loop caller path can never reach this while paused (the
-        pause check above returns before getting here), but the prefetch-
-        timer caller is a background task scheduled minutes earlier — it
-        could still fire mid-pause, so the guard is repeated here too."""
+        _feed_loop can never reach this while paused, but the prefetch
+        timer is a background task scheduled minutes earlier and could
+        still fire mid-pause, so the guard is repeated here too."""
         if self._paused or self._radio_fill_task is not None or self._pending:
             return
         if self._radio_suggest is None or self._last_played_webpage_url is None:
@@ -680,14 +645,11 @@ class RadioPlayer:
                 with contextlib.suppress(Exception):
                     if not await self._radio_enabled_getter():
                         # Arm the same backoff a failed suggestion uses.
-                        # Without this, "radio autoplay is off" — the single
-                        # most common state, since the queue being empty is
-                        # exactly when this runs — meant _feed_loop's idle
-                        # branch spawned a fresh task every ~100ms forever,
-                        # each one taking the toggles-store lock and reading
-                        # the toggle only to return. Ten pointless tasks a
-                        # second is easy to miss on a fast box and very much
-                        # not on a small VPS.
+                        # Without this, the common "radio autoplay is off"
+                        # state meant _feed_loop's idle branch spawned a
+                        # fresh task every ~100ms forever — cheap per-call,
+                        # but ten pointless tasks a second isn't free on a
+                        # small VPS.
                         self._radio_fill_failed_at = time.monotonic()
                         return
             seed = self._last_played_webpage_url
@@ -756,10 +718,9 @@ class RadioPlayer:
                 started_at=time.monotonic(),
                 duration=track.duration,
             )
-            # Seed for the *next* radio-autoplay pick — set as soon as we
-            # know playback is actually going ahead, so a track that fails
-            # to resolve/decode (returns before this point) never becomes
-            # a seed.
+            # Seed for the next radio-autoplay pick — set only once
+            # playback is actually going ahead, so a track that fails to
+            # resolve/decode never becomes a seed.
             self._last_played_webpage_url = track.webpage_url
             self._notify_state_changed()
             log.info("Now playing: %s (requested by %s)", track.title, request.requester_name)

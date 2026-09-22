@@ -50,15 +50,15 @@ async def _async_run(settings: Settings) -> None:
     db = Database(settings.db_path)
     await db.connect()
     # Shared between the chat bot (appends every non-bot message — see
-    # chatbot.py's _track_and_filter) and the admin server (reads it for
-    # /chat-overlay, /chat.json, /ws/chat) the same way `player` is shared
-    # between the two for now-playing state.
+    # chatbot.py's _track_and_filter) and the admin server (/chat-overlay,
+    # /chat.json, /ws/chat) — same idea as sharing `player` between the two
+    # for now-playing state.
     chat_feed = ChatFeed()
 
     # Fire-and-forget: warms up yt-dlp's worker threads (and, once cached,
     # persists across restarts too) before the first real !sr arrives. Never
-    # awaited inline — must not delay the rest of startup — and warm_up()
-    # itself is non-fatal on failure, so this is pure upside.
+    # awaited inline — must not delay startup — and warm_up() is non-fatal
+    # on failure, so this is pure upside.
     warmup_task = asyncio.create_task(resolver.warm_up(), name="resolver-warmup")
     _bg_tasks.add(warmup_task)
     warmup_task.add_done_callback(_bg_tasks.discard)
@@ -138,9 +138,8 @@ async def _async_run(settings: Settings) -> None:
 
             def _handle_shutdown_signal(signum: int) -> None:
                 # systemd sends SIGTERM and an impatient operator adds
-                # Ctrl-C; without this guard each one spawned its own
-                # bot.close() task, and two concurrent closes race over the
-                # same websocket/token teardown.
+                # Ctrl-C — without this guard, both would spawn their own
+                # bot.close() and race over the same teardown.
                 nonlocal shutting_down
                 if shutting_down:
                     log.info("%s received — shutdown already in progress.", signal.Signals(signum).name)
@@ -160,11 +159,10 @@ async def _async_run(settings: Settings) -> None:
         finally:
             await admin_runner.cleanup()
     finally:
-        # Order matters and is the reverse of setup: the HTTP surface is
-        # already down (inner finally above), so nothing can still be
-        # serving a request against the player or the database by now.
-        # TwitchChatBot.close() deliberately no longer closes the database
-        # for exactly this reason — see its docstring.
+        # Reverse of setup order: the HTTP surface is already down (inner
+        # finally above), so nothing can still be serving a request
+        # against the player/database — see TwitchChatBot.close()'s
+        # docstring for why it doesn't close the database itself.
         if not warmup_task.done():
             warmup_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

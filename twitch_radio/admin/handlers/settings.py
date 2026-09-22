@@ -119,9 +119,9 @@ async def handle_settings_post(request: web.Request) -> web.Response:
         return protect(web.Response(status=403, text="Origin check failed — refusing to save."))
     form = await request.post()
 
-    # Validate every tunable BEFORE writing anything anywhere, so one
-    # out-of-range number can't leave the three stores disagreeing about what
-    # the operator just submitted (or answer 400 for a request that changed things).
+    # Validate every tunable before writing anything, so one bad number
+    # can't leave the three stores disagreeing, or a 400 come back after
+    # something already changed.
     submitted, errors = _parse_tunables(form)
     if errors:
         current = TwitchTunables.from_dict(await ctx.tunables_store.read())
@@ -149,13 +149,12 @@ async def handle_settings_post(request: web.Request) -> web.Response:
         # the way tunable bounds do, so nothing here can fail.
         return {**PCSpecs.from_dict(updated).to_dict(), **Peripherals.from_dict(updated).to_dict()}
 
-    # Absent-means-unchecked is right for a browser submitting this page's own
-    # form and catastrophic for anything else: origin_ok deliberately lets
-    # non-browser callers (curl, a Stream Deck script) through, and one of
-    # those POSTing just `queue_cap=100` would silently switch off every
-    # feature whose checkbox wasn't in its body. FORM_MARKER is a hidden field
-    # only this page's form carries, so checkbox semantics apply exactly where
-    # they're meant to and a partial POST updates only the toggles it names.
+    # Absent-means-unchecked is right for this page's own form, but
+    # catastrophic for a non-browser caller (curl, a Stream Deck script,
+    # allowed through by origin_ok) — POSTing just `queue_cap=100` would
+    # silently switch off every toggle it didn't mention. FORM_MARKER is a
+    # hidden field only this page's form carries, so a partial POST updates
+    # only the toggles it actually names.
     full_form = form.get(FORM_MARKER) is not None
 
     def _mutate_toggles(current: dict[str, Any]) -> dict[str, Any]:

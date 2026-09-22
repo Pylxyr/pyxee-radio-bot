@@ -19,12 +19,10 @@ TUNABLE_BOUNDS: dict[str, tuple[int, int]] = {
 }
 
 
-# Label + one-line help for each tunable, shown on the /settings form.
-# Here rather than hand-written into the /settings page's HTML so that adding a
-# tunable means touching exactly one file: TUNABLE_BOUNDS gets the range,
-# this gets the wording, and the form renders itself from both. The previous
-# arrangement had the inputs typed out in the page template, so a new key
-# silently never appeared on the page.
+# Label + one-line help for each tunable, shown on the /settings form —
+# kept here rather than hand-written into the page's HTML so adding a
+# tunable means touching one file: TUNABLE_BOUNDS gets the range, this
+# gets the wording, and the form renders itself from both.
 TUNABLE_LABELS: dict[str, tuple[str, str]] = {
     "max_pending_per_chatter": (
         "Max pending requests per chatter",

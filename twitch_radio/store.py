@@ -16,21 +16,17 @@ log = logging.getLogger(__name__)
 class JsonStore:
     """Tiny atomic JSON key-value file, guarded by an in-process asyncio.Lock.
 
-    Reads/writes are serialized by the lock (this data is only ever touched
-    from the chat bot's commands and the /settings HTTP handler, both on the
-    same event loop), and writes are write-temp-then-rename so a crash
-    mid-write can never leave a corrupt or half-written file behind.
+    Reads/writes are serialized by the lock, and writes are
+    write-temp-then-rename so a crash mid-write can't leave a corrupt or
+    half-written file behind.
 
-    Reads are served from an in-memory copy, revalidated against the file's
-    (mtime_ns, size) on every call. That matters because the hottest caller
-    is the per-chat-message filter check in chatbot.py: without this, every
-    single chat message cost a lock acquisition, a thread-pool dispatch, an
-    open(), and a json.load() to answer "are the filters on?", which is
-    almost always the same two booleans as the message before it. A stat()
-    is cheap enough to do inline on the event loop and — unlike a plain
-    time-based cache — keeps a hand-edited tunables.json/blocklist.json
-    taking effect immediately, which several other modules' error handling
-    explicitly assumes is possible.
+    Reads are served from an in-memory copy, revalidated against the
+    file's (mtime_ns, size) on every call — the hottest caller is the
+    per-chat-message filter check in chatbot.py, and without this every
+    message would cost a lock acquisition, a thread-pool dispatch and a
+    json.load() to re-answer "are the filters on?". A stat() is cheap
+    enough to do inline, and unlike a time-based cache it still picks up
+    a hand-edited tunables.json/blocklist.json immediately.
     """
 
     def __init__(self, path: Path) -> None:

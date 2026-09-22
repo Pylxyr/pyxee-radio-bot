@@ -2,13 +2,13 @@
 public chat overlay (see the admin server's /chat-overlay, /chat.json,
 /ws/chat) — the OBS-visible "show what chat's saying" widget.
 
-Deliberately not persisted anywhere: this is a live "what's happening
-right now" strip, not a chat log archive, so starting empty on every
-restart is correct, not a bug. The bot's own messages never reach this
-class at all — chatbot.py's _track_and_filter only calls append() after
-its own chatter.id == self._bot_id check has already returned, the same
-point every other per-chatter tracking in this file hooks in, so there's
-one exclusion point, not two places that both need to agree on it.
+Deliberately not persisted: this is a live "what's happening right now"
+strip, not a chat log archive, so starting empty on every restart is
+correct, not a bug. The bot's own messages never reach this class —
+chatbot.py's _track_and_filter only calls append() after its own
+chatter.id == self._bot_id check returns, the same point every other
+per-chatter tracking hooks in, so there's one exclusion point, not two
+that could disagree.
 """
 
 from __future__ import annotations
@@ -34,21 +34,19 @@ _MAX_FRAGMENTS = 500  # Twitch caps a message at 500 characters, so this never t
 
 
 def fragments_to_dicts(fragments: Iterable[Any]) -> list[dict[str, object]]:
-    """Turn a chat message's structured fragments (TwitchIO's ChatMessageFragment
-    list, read by attribute so this module needs no TwitchIO import) into plain
-    JSON-ready dicts the overlay can render:
+    """Turns a chat message's structured fragments (TwitchIO's
+    ChatMessageFragment list, read by attribute so this needs no TwitchIO
+    import) into plain JSON-ready dicts the overlay can render:
 
         {"type": "text", "text": "hello "}
         {"type": "emote", "id": "25", "name": "Kappa", "animated": False}
         {"type": "cheermote", "name": "Cheer100", "prefix": "Cheer", "bits": 100, "tier": 100}
 
-    Emotes — global and subscriber alike — reach the bot as fragments with an
-    ID, and the message's plain `text` only has their *names* ("Kappa"), which
-    is why the overlay used to show letters instead of pictures. Cheermotes are
-    passed along with their prefix/bits/tier so emotes.EmoteService can attach
-    artwork (until it does, the overlay shows the name). Everything else
-    (mentions, gifs, ordinary text) becomes text, and adjacent text runs are
-    merged.
+    Emotes reach the bot as fragments with an ID; the message's plain
+    `text` only has their names, which is why the overlay used to show
+    letters instead of pictures. Cheermotes carry prefix/bits/tier so
+    emotes.EmoteService can attach artwork. Everything else becomes text,
+    with adjacent text runs merged.
     """
     out: list[dict[str, object]] = []
     for frag in list(fragments)[:_MAX_FRAGMENTS]:
@@ -87,15 +85,13 @@ class ChatEntry:
 
 
 class ChatFeed:
-    """Bounded to the last N messages (default 10) *and* separately, no
-    message older than the configured age (default 10 minutes) — whichever
-    limit a given message hits first. Both are enforced on every append()
-    and every read, so a message doesn't linger past its 10 minutes just
-    because fewer than 10 have arrived since to push it out.
+    """Bounded to the last N messages (default 10) and separately to no
+    message older than the configured age (default 10 minutes) —
+    whichever limit hits first, enforced on every append() and read.
 
     max_messages/max_age_seconds are constructor parameters rather than
-    module constants so the limits can be changed (or shortened for
-    experiments) without editing this file; every real caller uses the defaults.
+    module constants so limits can change without editing this file;
+    every real caller uses the defaults.
     """
 
     def __init__(self, max_messages: int = _DEFAULT_MAX_MESSAGES, max_age_seconds: float = _DEFAULT_MAX_AGE_SECONDS) -> None:
@@ -138,11 +134,10 @@ class ChatFeed:
         timestamp — time.monotonic() has no meaning outside this process,
         so shipping it to a browser would be useless (or actively
         misleading once serialized as if it were a real clock). The
-        client ticks this forward itself between pushes the same way the
-        now-playing overlay already does for elapsed track time, and ages
-        a message out locally once it crosses the 10-minute mark, rather
+        client ticks this forward itself between pushes and ages a
+        message out locally once it crosses the 10-minute mark, rather
         than waiting on the server to notice and push again — see
-        _CHAT_OVERLAY_HTML's tick()."""
+        chat_overlay.html's effectiveMessages()."""
         self._prune()
         now = time.monotonic()
         return [

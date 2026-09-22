@@ -43,10 +43,9 @@ class SongRequestComponent(commands.Component):
         normalized_query = query.lower()
 
         # An exact repeat of a query this chatter already has resolving —
-        # most often the same command double-tapped a second or two apart,
-        # sent again before "Looking up..." even lands. Answering distinctly
-        # here (rather than repeating "Looking up...") both avoids Twitch's
-        # duplicate-message drop and skips a second, wholly redundant resolve.
+        # usually the same command double-tapped before "Looking up..."
+        # even lands. A distinct reply here avoids Twitch's duplicate-
+        # message drop and skips a redundant second resolve.
         if self.bot.inflight_query_by_chatter.get(chatter_key) == normalized_query:
             await self.bot.safe_reply(ctx, "Still looking that up — hang tight!")
             return
@@ -75,31 +74,26 @@ class SongRequestComponent(commands.Component):
         try:
             requester_id = int(ctx.chatter.id)
         except (TypeError, ValueError):
-            # Bail out rather than fall back to a fixed sentinel (e.g.
-            # 0) — that would let two different chatters hitting this
-            # branch collide under the same fake requester_id.
+            # Bail rather than fall back to a fixed sentinel — that would
+            # let two different chatters collide under the same fake id.
             await self.bot.safe_reply(ctx, "Couldn't identify you — try again.")
             return
 
         self.bot.last_request_at[chatter_key] = now
         self.bot.pending_by_chatter[chatter_key] = pending + 1
 
-        # Resolving is a real network round trip — anywhere from under a
-        # second to ~15-20s cold — so !sr replies right away instead of
-        # leaving chat wondering whether the bot even saw the command.
-        # _resolve_and_queue (a background task, not awaited here) sends the
-        # actual "Queued: ..." or an error once resolution finishes; it owns
-        # releasing the pending-count reservation made just above, on every
-        # exit path, the same way this method used to.
+        # Resolving is a real network round trip (under a second to ~15-20s
+        # cold), so !sr replies right away rather than leaving chat
+        # wondering. _resolve_and_queue (a background task) sends the real
+        # "Queued: ..." or an error once resolution finishes, and owns
+        # releasing the pending-count reservation on every exit path.
         #
-        # safe_reply, not ctx.reply, specifically here: this runs before
-        # the create_task() call right below it, so an uncaught delivery
-        # failure on THIS message would abort song_request() before the
-        # task is ever created — the pending-count reservation made above
-        # would leak, and the request would never resolve or queue at all.
-        # Echo at most a short prefix: the reply is only an acknowledgement, and
-        # repeating a chatter's full message back verbatim would let anyone
-        # make the bot post up to 500 characters of their choosing.
+        # safe_reply here specifically: this runs before create_task()
+        # below, so an uncaught delivery failure would abort song_request()
+        # before the task exists — leaking the reservation and losing the
+        # request entirely.
+        # Echo at most a short prefix — repeating the full message back
+        # would let anyone make the bot post up to 500 chars of their choosing.
         shown = query if len(query) <= _MAX_ECHO_CHARS else query[: _MAX_ECHO_CHARS - 1] + "\u2026"
         await self.bot.safe_reply(ctx, f"Looking up {shown!r}\u2026")
         self.bot.inflight_query_by_chatter[chatter_key] = normalized_query
@@ -115,19 +109,17 @@ class SongRequestComponent(commands.Component):
     async def _resolve_and_queue(
         self, ctx: commands.Context, query: str, chatter_key: str, requester_id: int, requester_name: str
     ) -> None:
-        """The slow half of !sr, split out of song_request() so a slow
-        resolve can't delay that command's own reply (see the comment
-        there). ctx.reply() has no dependency on the originating command's
-        coroutine still being alive — it's a plain API call keyed off
-        already-captured channel/message-id attributes — so replying from
-        here, well after song_request() has returned, is safe."""
+        """The slow half of !sr, split out so a slow resolve can't delay
+        song_request()'s own reply. ctx.reply() doesn't depend on the
+        originating coroutine still being alive — it's a plain API call
+        keyed off already-captured attributes — so replying here, well
+        after song_request() returned, is safe."""
         reserved = True
         try:
-            # Cheap pre-resolve check for a direct link to something already
-            # blocked — skips the network round trip for the common case of
-            # re-pasting a link a mod just blocked. Doesn't replace the
-            # post-resolve check below: a search query or an uploader-name
-            # block can't be caught until we know what it actually resolved to.
+            # Cheap pre-resolve check for a direct link to something
+            # already blocked — skips the round trip for re-pasting a link
+            # a mod just blocked. Doesn't replace the post-resolve check: a
+            # search query or uploader-name block needs the real result.
             if normalize_track_key(query) is not None:
                 blocklist_data = await self.bot.blocklist_store.read()
                 reason = blocklist_reason(query, "", blocklist_data)
@@ -252,12 +244,10 @@ class SongRequestComponent(commands.Component):
     @commands.command(name="pause")
     @commands.is_moderator()
     async def pause(self, ctx: commands.Context) -> None:
-        """Stops whatever's playing (or still resolving) right now and
-        holds the queue at silence — for an ad break, an announcement,
-        anything where the mod wants the music gone immediately rather
-        than waiting for the current track to end. The interrupted track
-        replays from the top on !resume; there's no seek support anywhere
-        in this pipeline, so "resume" can't mean "from where it left off"."""
+        """Stops whatever's playing (or resolving) and holds the queue at
+        silence — for an ad break or announcement where the mod wants the
+        music gone immediately, not once the current track ends. Replays
+        from the top on !resume; no seek support anywhere in this pipeline."""
         if self.bot.player.pause():
             await self.bot.safe_reply(ctx, "Paused. !resume to pick it back up.")
         else:
@@ -273,10 +263,10 @@ class SongRequestComponent(commands.Component):
 
     @commands.command(name="voteskip", aliases=["vs"])
     async def vote_skip(self, ctx: commands.Context) -> None:
-        """Anyone can vote to skip whatever's currently playing (or still
-        loading) — once enough unique chatters have voted (vote_skip_threshold,
-        adjustable via /settings or !setlimit), it's skipped automatically.
-        Votes are per-track and don't carry over to the next one."""
+        """Anyone can vote to skip what's playing (or loading) — once
+        enough unique chatters vote (vote_skip_threshold, via /settings or
+        !setlimit), it's skipped automatically. Votes don't carry over
+        between tracks."""
         if self.bot.player.active_requester_id is None:
             await self.bot.safe_reply(ctx, "Nothing's playing right now.")
             return
@@ -302,8 +292,7 @@ class SongRequestComponent(commands.Component):
     @commands.command(name="remove", aliases=["cancel", "unqueue"])
     async def remove(self, ctx: commands.Context) -> None:
         """Lets a chatter pull their own most-recently-queued request back
-        out — for requests still waiting in the queue, not the one currently
-        playing (that's what !skip is for)."""
+        out of the queue — not the one currently playing (!skip is for that)."""
         try:
             requester_id = int(ctx.chatter.id)
         except (TypeError, ValueError):

@@ -2,76 +2,59 @@
 engagement commands (split across twitch_radio/components/*) and hands
 resolved song requests to the radio player.
 
-Built against twitchio 3.x's EventSub-based Bot (verified against the
-installed twitchio==3.3.2 API directly — this is NOT the old IRC-token
+Built against twitchio 3.x's EventSub-based Bot (not the old IRC-token
 pattern from twitchio 2.x).
 
-Auth model: the simplest one Twitch's own chat bot guide supports
-("Installed Chatbot") — a single Twitch account (recommended: a dedicated
-account, made a moderator in your channel) with a User Access Token
-carrying `user:read:chat` + `user:write:chat`. Moderator status is what
-satisfies the ChatMessageSubscription requirement without a separate
-broadcaster-side `channel:bot` grant.
+Auth model: Twitch's "Installed Chatbot" pattern — one bot account (made a
+moderator in your channel) with a User Access Token carrying
+`user:read:chat` + `user:write:chat`. Moderator status satisfies the
+ChatMessageSubscription requirement without a separate broadcaster-side
+`channel:bot` grant.
 
 One-time OAuth setup is required before chat commands work — TwitchIO's
-built-in web server (twitchio.web.AiohttpAdapter, started automatically by
-commands.Bot) listens on http://localhost:4343 and persists whatever token
-you authorize through it (see load_tokens/save_tokens below for exactly
-where). Full walkthrough in README.md; short version:
+built-in web server listens on http://localhost:4343 and persists whatever
+token you authorize (see load_tokens/save_tokens). Full walkthrough in
+README.md; short version:
 
-  1. Start the bot once with valid TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET
-     / TWITCH_BOT_ID / TWITCH_OWNER_ID set.
-  2. On a remote host, tunnel the adapter's port first:
+  1. Start the bot once with TWITCH_CLIENT_ID/SECRET/BOT_ID/OWNER_ID set.
+  2. On a remote host, tunnel the port first:
      `ssh -L 4343:localhost:4343 <user>@<host>`
   3. In a browser, logged in as the BOT's own account:
      http://localhost:4343/oauth?scopes=user:read:chat+user:write:chat+user:bot+moderator:manage:chat_messages+moderator:read:followers+moderator:manage:shoutouts&force_verify=true
   4. In a SEPARATE browser session, logged in as the BROADCASTER's account:
      http://localhost:4343/oauth?scopes=channel:bot+channel:read:subscriptions+bits:read+clips:edit+channel:manage:polls&force_verify=true
 
-  Reusing the same already-logged-in session for both steps 3 and 4 is the
-  most common way this goes wrong — Twitch just authorizes whichever
-  account is currently logged in, with no error either way. See
-  `_log_token_diagnostics` below, which checks for exactly that at startup.
+  Reusing the same logged-in session for steps 3 and 4 is the most common
+  way this goes wrong — Twitch authorizes whichever account is currently
+  logged in, with no error either way. See `_log_token_diagnostics` below.
 
   Tokens save to TWITCH_TOKEN_FILE (default: data/twitch_tokens.json) and
-  reload automatically on every future start.
+  reload automatically on future starts.
 
-event_message()'s command-dispatch chain, and the ChatMessage/Chatter
-attributes the engagement-tracking + optional moderation filter below
-depend on (`.chatter`, `.text`, `.moderator`, `.broadcaster`), are now
-verified directly against the installed twitchio==3.3.2 source (not just
-inferred) — including the specific fix that made this correct: the base
-class filters the bot's own messages by `chatter.id == self.bot_id`, not
-by any `.echo`-style attribute (ChatMessage has no such attribute), so
-this file's own filtering uses the same check.
+event_message() filters the bot's own messages via `chatter.id ==
+self.bot_id` (ChatMessage has no `.echo`-style attribute) — the
+engagement/moderation logic below assumes that filtering already happened.
 
-Every feature below this point is gated by its own toggle (default off —
-see toggles.py) even though steps 3 and 4 above already request every
-scope any of them need; granting the scope up front just means turning a
-toggle on later never requires touching OAuth again. Each one also
-degrades independently and gracefully if its scope turns out to be
-missing anyway (someone trimmed a scope out of those URLs, a token was
-re-authorized with a narrower set, etc.): a sticky flag logs the
-permission failure once and stops retrying that specific action for the
-rest of the run, rather than erroring every time or spamming the log.
+Every feature below is gated by its own toggle (default off — see
+toggles.py), even though the scopes above already cover all of them, so
+turning a toggle on later never needs touching OAuth again. Each also
+degrades independently if its scope is missing: a sticky flag logs the
+failure once and stops retrying, rather than erroring or spamming the log.
 
-  moderator:manage:chat_messages (bot)   -> filter_delete_enabled actually
-                                             deleting a flagged message
-                                             (see _run_filter_delete below)
-  moderator:read:followers (bot)         -> !followage, follow alerts
-  moderator:manage:shoutouts (bot)       -> !so, auto-shoutout on raid
+  moderator:manage:chat_messages (bot)     -> filter_delete_enabled actually
+                                               deleting a flagged message
+  moderator:read:followers (bot)           -> !followage, follow alerts
+  moderator:manage:shoutouts (bot)         -> !so, auto-shoutout on raid
   channel:read:subscriptions (broadcaster) -> sub alerts
-  bits:read (broadcaster)                -> cheer alerts
-  clips:edit (broadcaster)               -> !clip
-  channel:manage:polls (broadcaster)     -> !poll
+  bits:read (broadcaster)                  -> cheer alerts
+  clips:edit (broadcaster)                 -> !clip
+  channel:manage:polls (broadcaster)       -> !poll
 
-Follow/subscription/cheer/raid alerts and auto-shoutout-on-raid are all
-gated by one toggle, alerts_enabled (off by default) — see
-components/alerts.py. Raid alerts and detection need no extra scope at
-all (channel.raid is public data); shoutout still needs
-moderator:manage:shoutouts even when the raid itself was detected for
-free, so a raid announcement can appear without the follow-up shoutout if
-only that one scope is missing.
+Follow/sub/cheer/raid alerts and auto-shoutout-on-raid are all gated by one
+toggle, alerts_enabled (off by default) — see components/alerts.py. Raid
+detection needs no extra scope (channel.raid is public); the shoutout
+still needs moderator:manage:shoutouts, so a raid can announce without a
+shoutout if only that one scope is missing.
 """
 
 from __future__ import annotations
@@ -122,19 +105,12 @@ log = logging.getLogger(__name__)
 # !songrequest.
 _USAGE = {**_SONG_REQUEST_USAGE, **_MODERATION_USAGE}
 
-# Twitch silently drops a chat message that's byte-identical to one this
-# account sent recently — but "recently" turned out, against a live
-# deployment, to be a genuine server-side rolling window rather than just
-# "the single immediately-previous message": a distinct message sent in
-# between didn't save a same-text repeat 17s later, and a freshly
-# restarted process (with no memory of anything it had sent) still had
-# its first attempt at a given text dropped, because Twitch itself
-# remembered that exact text from just before the restart. That rules out
-# any client-side "have I sent this recently" tracking as reliably
-# predictive — so instead, every reply through safe_reply below gets a
-# small rotating cosmetic suffix unconditionally, guaranteeing it's never
-# byte-identical to whatever this bot said last time around, without
-# needing to model Twitch's own dedup window at all.
+# Twitch silently drops a chat message byte-identical to one this account
+# sent recently — a real server-side rolling window, not just "the last
+# message" (seen dropping a repeat 17s later, and even across a process
+# restart with no local memory of what it sent). Too unpredictable to
+# track client-side, so every safe_reply instead gets a small rotating
+# cosmetic suffix, guaranteeing it's never byte-identical to the last one.
 _DEDUP_SUFFIXES = (" \U0001f3b5", " \U0001f3b6", " \U0001f3a7", " \U0001f50a")
 
 # How long a chatter needs to have gone quiet before they stop counting as
@@ -149,12 +125,10 @@ _LINK_RE = re.compile(r"(https?://|www\.)\S+", re.IGNORECASE)
 _CUSTOM_COMMAND_COOLDOWN_SECONDS = 3.0
 
 # Twitch's hard limit on a single chat message. PartialUser.send_message
-# raises a plain ValueError above it (twitchio/user.py, verified against the
-# installed twitchio==3.3.2) — and ValueError is NOT a TwitchioException, so
-# it sails straight past the delivery-failure handling in safe_reply below
-# unless it's caught explicitly. Reachable without trying: three long
-# YouTube titles in !queue, five long display names in !leaderboard, or a
-# custom command whose response !addcom never length-checked.
+# raises a plain ValueError above it — not a TwitchioException, so it sails
+# past safe_reply's delivery-failure handling unless caught explicitly.
+# Reachable without trying: long titles in !queue, long names in
+# !leaderboard, or an unchecked !addcom response.
 _MAX_CHAT_MESSAGE_LENGTH = 500
 
 # How often the passive-points loop re-checks whether the channel is
@@ -230,19 +204,16 @@ class TwitchChatBot(commands.Bot):
         # would add complexity for no real benefit.
         self.last_request_at: dict[str, float] = {}
         self.pending_by_chatter: Counter[str] = Counter()
-        # Tracks each chatter's currently-resolving !sr query (case-folded)
-        # so an identical repeat while it's still in flight gets a distinct
-        # reply instead of triggering a second full resolve — Twitch's
-        # exact-duplicate-message rule silently drops the second identical
-        # "Looking up '...'…" anyway (see safe_reply), so without this a
-        # double-tapped !sr looks like the bot ignored it, while the
-        # resolver quietly redoes the whole yt-dlp + JS-challenge round
-        # trip for nothing. Cleared in _resolve_and_queue's finally.
+        # Tracks each chatter's in-flight !sr query (case-folded) so a
+        # repeat while it's still resolving gets a distinct reply instead of
+        # a second full resolve — without this, Twitch's dedup rule would
+        # silently drop the identical "Looking up '...'…" and a double-tap
+        # would look ignored while quietly redoing the whole round trip.
+        # Cleared in _resolve_and_queue's finally.
         self.inflight_query_by_chatter: dict[str, str] = {}
-        # Strong references to in-flight _resolve_and_queue() tasks — without
-        # this, asyncio is free to garbage-collect a fire-and-forget task
-        # mid-flight (a well-known footgun; see the asyncio docs on
-        # create_task). Entries remove themselves via add_done_callback.
+        # Strong references to in-flight _resolve_and_queue() tasks —
+        # without this, asyncio can garbage-collect a fire-and-forget task
+        # mid-flight. Entries remove themselves via add_done_callback.
         self.background_tasks: set[asyncio.Task[None]] = set()
         # Round-robins through _DEDUP_SUFFIXES on every safe_reply call —
         # shared across every component (not one counter each) so replies
@@ -272,6 +243,18 @@ class TwitchChatBot(commands.Bot):
         # scope granted after startup) only retries the ones that haven't.
         self._alert_subscriptions_done: dict[str, bool] = {}
 
+    @property
+    def owner_id_required(self) -> str:
+        # The base class's own `owner_id` property returns `str | None`;
+        # this subclass always constructs with one, so it's never actually
+        # None — narrowed once here (public, since components need it too
+        # — see stream_info.py's _broadcaster()) instead of a repeated
+        # assert at every call site. (`bot_id` needs no equivalent: the
+        # base class's own `bot_id` property already asserts and returns
+        # `str`.)
+        assert self.owner_id is not None
+        return self.owner_id
+
     async def load_tokens(self, path: str | None = None, /) -> None:
         # Redirects TwitchIO's default token file into DATA_DIR instead.
         self._token_storage_path.parent.mkdir(parents=True, exist_ok=True)
@@ -279,43 +262,36 @@ class TwitchChatBot(commands.Bot):
 
     async def save_tokens(self, path: str | None = None, /) -> None:
         """Writes tokens to disk, locks the file down, and retries the chat
-        subscription (a no-op once already subscribed). twitchio's own
-        Client only calls this method on a *graceful* close — never
-        automatically after OAuth completes or after a background token
-        refresh — so add_token() and event_token_refreshed() below both
-        call it explicitly. That's what actually makes completing OAuth
-        (or a routine token refresh) while already running take effect
-        immediately, instead of only ever persisting at the next restart."""
+        subscription (a no-op once already subscribed). twitchio's Client
+        only calls this on a graceful close — add_token() and
+        event_token_refreshed() below call it explicitly too, so completing
+        OAuth or a routine refresh takes effect immediately instead of only
+        persisting at the next restart."""
         self._token_storage_path.parent.mkdir(parents=True, exist_ok=True)
         target = path or str(self._token_storage_path)
         await super().save_tokens(target)
-        # twitchio's own save() writes with no explicit mode, so this file
-        # (live OAuth tokens for both accounts) inherits the process umask —
-        # commonly world-readable. Locked down the same way setup.sh already
-        # locks down .env. Re-applied after every save since a fresh write
-        # can reset permissions.
+        # twitchio's save() writes with no explicit mode, so this (live
+        # OAuth tokens) inherits the process umask — often world-readable.
+        # Locked down the same way setup.sh locks .env; reapplied every
+        # save since a fresh write resets permissions.
         with contextlib.suppress(OSError):
             Path(target).chmod(0o600)
         await self._try_subscribe_chat()
         await self._try_subscribe_alerts()
 
     async def add_token(self, token: str, refresh: str) -> ValidateTokenPayload:
-        """twitchio calls this automatically the instant an OAuth
-        authorization completes (via its own event_oauth_authorized), well
-        before setup_hook() or any later save_tokens() call — verified
-        directly against twitchio==3.3.2's Client.close(), which is the
-        *only* place the base class calls save_tokens() on its own."""
+        """twitchio calls this the instant an OAuth authorization completes,
+        well before setup_hook() or any later save_tokens() call — the base
+        class otherwise only calls save_tokens() from Client.close()."""
         response = await super().add_token(token, refresh)
         await self.save_tokens()
         return response
 
     async def event_token_refreshed(self, payload: TokenRefreshedPayload) -> None:
         """twitchio dispatches this after silently refreshing a
-        soon-to-expire token in the background — with no listener, the
-        refreshed pair only lives in memory until save_tokens() next runs
-        (graceful shutdown), so an ungraceful stop (crash, power loss,
-        `kill -9`) in between loads a stale, already-rotated refresh token
-        on the next start and forces re-authorization."""
+        soon-to-expire token — without this, the refreshed pair only lives
+        in memory until the next graceful close, so a crash in between
+        loads a stale, already-rotated token and forces re-authorization."""
         await self.save_tokens()
 
     def _oauth_complete(self) -> bool:
@@ -359,13 +335,11 @@ class TwitchChatBot(commands.Bot):
 
     async def _try_subscribe_alerts(self) -> None:
         """Follow/sub/cheer/raid EventSub subscriptions — independent of
-        each other and of alerts_enabled (subscribing is side-effect-free;
-        the toggle only gates whether an event that arrives gets announced
-        — see AlertsComponent), and independent of each other's success:
-        raid needs no extra scope at all, so it should keep working even
-        if follow/sub/cheer fail for lack of one. Re-run from save_tokens()
-        so a scope granted after the bot's already running (redoing the
-        broadcaster OAuth step, say) is picked up without a restart."""
+        alerts_enabled (subscribing is side-effect-free; the toggle only
+        gates whether an arriving event gets announced) and of each other
+        (raid needs no extra scope, so it keeps working even if the rest
+        fail). Re-run from save_tokens() so a scope granted after startup
+        is picked up without a restart."""
         attempts = (
             (
                 "follow",
@@ -383,29 +357,21 @@ class TwitchChatBot(commands.Bot):
                 self._alert_subscriptions_done[name] = True
                 log.info("Subscribed to %s alerts.", name)
             except Exception as e:
-                # Routine (not warning/error) when the relevant extra OAuth
-                # scope hasn't been granted — see the module docstring —
-                # since most streamers running this bot never touch alerts
-                # at all, and startup noise for a scope nobody asked for
+                # Routine, not a warning — most streamers never touch
+                # alerts at all, so noise for a scope nobody asked for
                 # would just be confusing.
                 log.info("Skipping %s alerts for now (%s) — see module docstring for the optional scope.", name, e)
 
     async def try_shoutout(self, to_user_id: str, to_display_name: str) -> bool:
         """Best-effort — shared by AlertsComponent's auto-raid-shoutout and
-        its manual !so command. Needs moderator:manage:shoutouts on the
-        bot's token (see module docstring); a permission failure is logged
-        once and remembered so a train of raids doesn't re-log the same
-        missing-scope warning for every single raider."""
+        the manual !so command. Needs moderator:manage:shoutouts; a
+        permission failure is logged once and remembered so a train of
+        raids doesn't repeat the same warning for every raider."""
         if self._shoutout_scope_missing:
             return False
-        # commands.Bot types _owner_id/_bot_id as `str | None` since the base
-        # class allows constructing without them — this subclass requires
-        # both, so they're never actually None here; just narrowing for mypy.
-        assert self._owner_id is not None
-        assert self._bot_id is not None
         try:
-            broadcaster = self.create_partialuser(user_id=self._owner_id)
-            await broadcaster.send_shoutout(to_broadcaster=to_user_id, moderator=self._bot_id)
+            broadcaster = self.create_partialuser(user_id=self.owner_id_required)
+            await broadcaster.send_shoutout(to_broadcaster=to_user_id, moderator=self.bot_id)
             return True
         except HTTPException as e:
             if e.status in (401, 403):
@@ -417,9 +383,9 @@ class TwitchChatBot(commands.Bot):
                     e.status, e,
                 )
             else:
-                # Most likely Twitch's own shoutout cooldown (once/2min
-                # channel-wide, once/60min per target) — routine, not a
-                # scope problem, so no sticky flag; the next raid tries again.
+                # Likely Twitch's own shoutout cooldown (2min channel-wide,
+                # 60min per target) — routine, not a scope issue, so no
+                # sticky flag; the next raid tries again.
                 log.info("Shoutout to %s not sent (%s) — likely Twitch's own cooldown.", to_display_name, e)
             return False
         except Exception:
@@ -492,43 +458,30 @@ class TwitchChatBot(commands.Bot):
         to tell chat about a track it had to drop, and by the moderation
         filter below (no command Context to reply() from there). Not tied
         to a Context, so this goes through PartialUser.send_message directly."""
-        # commands.Bot types _owner_id/_bot_id as `str | None` since the base
-        # class allows constructing without them — this subclass requires
-        # both, so they're never actually None here; just narrowing for mypy.
-        assert self._owner_id is not None
-        assert self._bot_id is not None
-        channel = self.create_partialuser(user_id=self._owner_id)
+        channel = self.create_partialuser(user_id=self.owner_id_required)
         text = self._decorate(message)
         try:
-            await channel.send_message(sender=self._bot_id, message=text)
+            await channel.send_message(sender=self.bot_id, message=text)
         except (TwitchioException, ValueError) as e:
-            # Same rationale as safe_reply: a delivery failure here is
-            # Twitch declining to show a message, not a bug in the caller,
-            # and every caller (the player's track-failure notifier, the
-            # chat filter, the alerts component) treats announcing as
-            # best-effort already.
+            # Same rationale as safe_reply: a delivery failure is Twitch
+            # declining to show a message, not a caller bug — every caller
+            # already treats announcing as best-effort.
             log.info("Announcement not delivered (%s): %r", type(e).__name__, text)
 
     async def safe_reply(self, ctx: commands.Context, message: str) -> None:
-        """ctx.reply() that swallows Twitch's own message-delivery failures
-        — a 429 (chat rate limit) or the exact-duplicate-message rule,
-        both TwitchioException — instead of letting them propagate.
+        """ctx.reply() that swallows Twitch's delivery failures (rate limit,
+        exact-duplicate-message rule — both TwitchioException) instead of
+        letting them propagate.
 
-        Matters most for !sr's very first reply: it's called before
+        Matters most for !sr's first reply: it runs before
         _resolve_and_queue's own try/except exists, so an uncaught failure
-        there aborts the command on the spot and the background task right
-        after it never runs — the whole request silently vanishes, no
-        queue, no error, nothing, purely because Twitch declined to
-        deliver an acknowledgement message. Two different chatters
-        requesting the same currently-playing song back to back is a
-        normal way to hit this, not just rapid self-testing.
+        there silently kills the whole request — no queue, no error,
+        nothing. Two chatters requesting the same playing song back to
+        back hits this normally, not just rapid self-testing.
 
-        Every message gets a small rotating suffix (see _DEDUP_SUFFIXES
-        above) before delivery is even attempted, unconditionally — not
-        just when a repeat looks likely — since Twitch's own dedup state
-        isn't something this process can reliably reconstruct (its window
-        outlasts a single "previous message" comparison, and survives
-        this bot restarting).
+        Every message gets a rotating suffix (_DEDUP_SUFFIXES) unconditionally
+        before delivery — Twitch's own dedup window isn't something this
+        process can reliably reconstruct.
         """
         text = self._decorate(message)
         try:
@@ -538,15 +491,13 @@ class TwitchChatBot(commands.Bot):
 
     def _decorate(self, message: str) -> str:
         """Adds the rotating anti-dedup suffix and enforces Twitch's
-        500-character limit. Shared by safe_reply() and announce() so both
-        outbound paths get identical treatment — the filter warnings sent
-        through announce() are if anything *more* exposed to the dedup rule
-        than command replies, since a repeat offender triggers a
-        byte-identical warning every time.
+        500-char limit. Shared by safe_reply()/announce() — announce()'s
+        filter warnings are if anything more exposed to the dedup rule,
+        since a repeat offender triggers the same warning every time.
 
-        Truncation is preferable to the alternative: over the limit,
-        send_message raises and the message simply never appears, which
-        looks to chat exactly like the bot ignoring the command.
+        Truncating beats the alternative: over the limit, send_message
+        raises and the message never appears, which looks exactly like
+        the bot ignoring the command.
         """
         suffix = _DEDUP_SUFFIXES[self._reply_counter % len(_DEDUP_SUFFIXES)]
         self._reply_counter += 1
@@ -556,11 +507,9 @@ class TwitchChatBot(commands.Bot):
         return f"{message}{suffix}"
 
     async def event_message(self, message: ChatMessage) -> None:
-        # super() call happens first and unconditionally. Verified directly
-        # against twitchio==3.3.2: Bot.event_message is what dispatches
-        # commands (via process_commands) — an override that skipped it
-        # would silently break every command in the bot, so nothing below
-        # runs until that's already happened.
+        # super() first and unconditionally — Bot.event_message is what
+        # dispatches commands, so skipping it would silently break every
+        # command in the bot.
         await super().event_message(message)
         try:
             await self._track_and_filter(message)
@@ -568,12 +517,9 @@ class TwitchChatBot(commands.Bot):
             log.debug("event_message tracking/filter hook failed (non-fatal).", exc_info=True)
 
     async def _track_and_filter(self, message: ChatMessage) -> None:
-        # Twitch's EventSub delivers the bot's own messages back to it like
-        # any other chat message — there's no `.echo`-style flag on
-        # ChatMessage (confirmed against the installed package); the base
-        # class's own event_message filters these for command-dispatch
-        # purposes the same way, via chatter.id == bot_id, not some
-        # separate "is this mine" attribute.
+        # EventSub delivers the bot's own messages back like any other —
+        # no `.echo` flag on ChatMessage — so filter the same way the base
+        # class does for command dispatch: chatter.id == bot_id.
         chatter = message.chatter
         chatter_id = chatter.id
         if chatter_id == self._bot_id:
@@ -582,11 +528,10 @@ class TwitchChatBot(commands.Bot):
         self.last_seen_name[chatter_id] = chatter.display_name or chatter_id
         text = message.text or ""
 
-        # Every non-bot message reaches the chat overlay, mods and the
-        # broadcaster included — only the exemption from the link/caps
-        # filters below is mod-only, not exemption from being shown on
-        # stream. This has to happen before the moderator early-return
-        # right below, or a mod's own messages would never appear there.
+        # Every non-bot message reaches the overlay, mods/broadcaster
+        # included — only the link/caps filter exemption below is mod-only.
+        # Must happen before the moderator early-return or a mod's own
+        # messages would never appear on stream.
         if text:
             try:
                 fragments = self.emotes.decorate(fragments_to_dicts(getattr(message, "fragments", ())))
@@ -614,20 +559,14 @@ class TwitchChatBot(commands.Bot):
             await self._run_filter_delete(message)
 
     async def _run_filter_delete(self, message: ChatMessage) -> None:
-        """Deletes a message the filter above just flagged — separate from
-        the warn-only path since it needs a scope (moderator:manage:
-        chat_messages) the default OAuth setup doesn't request; see the
-        module docstring. Fails silently (once loudly, in the log) rather
-        than retrying every flagged message forever once it's clear the
-        scope isn't there."""
+        """Deletes a message the filter above flagged — separate from the
+        warn-only path since it needs moderator:manage:chat_messages, a
+        scope the default OAuth setup doesn't request. Logs once on a
+        missing scope, then stays warn-only rather than retrying forever."""
         if self._delete_scope_missing:
             return
-        # commands.Bot types _bot_id as `str | None` since the base class
-        # allows constructing without one — this subclass requires it, so
-        # it's never actually None here; just narrowing for mypy.
-        assert self._bot_id is not None
         try:
-            await message.broadcaster.delete_chat_messages(moderator=self._bot_id, message_id=message.id)
+            await message.broadcaster.delete_chat_messages(moderator=self.bot_id, message_id=message.id)
         except HTTPException as e:
             if e.status in (401, 403):
                 self._delete_scope_missing = True
@@ -644,11 +583,8 @@ class TwitchChatBot(commands.Bot):
 
     async def _try_custom_command(self, ctx: commands.Context, name: str) -> bool:
         """Dispatches a mod-defined !addcom response — hooked from
-        event_command_error's CommandNotFound branch below rather than a
-        second command-parsing layer, reusing ctx.content (already
-        referenced in the original event_command_error catch-all, so this
-        attribute's presence is proven, unlike event_message's guesses
-        above)."""
+        event_command_error's CommandNotFound branch rather than a second
+        parsing layer, reusing ctx.content (already proven present there)."""
         remaining = self.custom_command_cooldowns.remaining(name, _CUSTOM_COMMAND_COOLDOWN_SECONDS)
         if remaining > 0:
             return True  # swallow silently — don't spam chat about a cooldown on a custom command
@@ -658,10 +594,9 @@ class TwitchChatBot(commands.Bot):
         self.custom_command_cooldowns.mark(name)
         display_name = ctx.chatter.display_name or ctx.chatter.name or "there"
         text = response.replace("{user}", display_name)
-        # safe_reply, not ctx.reply: !addcom never length-checked the
-        # response, so a long one would raise ValueError out of
-        # send_message; and a custom command fired twice in a row is a
-        # byte-identical message, i.e. precisely Twitch's dedup case.
+        # safe_reply, not ctx.reply: !addcom never length-checks the
+        # response (could raise ValueError), and firing the same custom
+        # command twice in a row is exactly Twitch's dedup case.
         await self.safe_reply(ctx, text)
         return True
 
@@ -681,9 +616,8 @@ class TwitchChatBot(commands.Bot):
         now = time.monotonic()
         if self._live_cache is not None and now - self._live_cache[1] < _LIVE_CHECK_TTL_SECONDS:
             return self._live_cache[0]
-        assert self._owner_id is not None
         try:
-            stream = await self.create_partialuser(user_id=self._owner_id).fetch_stream()
+            stream = await self.create_partialuser(user_id=self.owner_id_required).fetch_stream()
             live = stream is not None
         except Exception:
             log.debug("Live check failed (non-fatal) — assuming live.", exc_info=True)
@@ -704,10 +638,9 @@ class TwitchChatBot(commands.Bot):
         active = [uid for uid, ts in self.last_seen.items() if now - ts <= _ACTIVE_WINDOW_SECONDS]
         if not active:
             return
-        # README has always described these as earned "while the stream's
-        # live"; nothing actually enforced that, so points and watch-time
-        # accrued from any chat activity at any hour, which makes
-        # !leaderboard a measure of who idles in an offline channel.
+        # README describes these as earned "while live"; nothing enforced
+        # that before, so !leaderboard could just measure who idles in an
+        # offline channel.
         if not await self._channel_is_live():
             return
         entries = [
@@ -720,11 +653,9 @@ class TwitchChatBot(commands.Bot):
         exc = payload.exception
         ctx = payload.context
         if isinstance(exc, commands.CommandNotFound):
-            # Fires for every chat message starting with our prefix that
-            # isn't one of ours — with another "!"-prefixed bot in the same
-            # channel (Nightbot, StreamElements, Moobot), that's most of
-            # them, so a custom-command lookup happens before giving up
-            # rather than logging every miss.
+            # Fires for every prefixed message that isn't ours — with
+            # another bot sharing "!" (Nightbot, StreamElements), that's
+            # most of them, so try a custom command before giving up.
             content = getattr(ctx, "content", "") or ""
             if content.startswith(self.prefix):
                 name = content[len(self.prefix) :].split(maxsplit=1)[0].lower()
@@ -746,17 +677,15 @@ class TwitchChatBot(commands.Bot):
         log.error("Command error in %r: %r", getattr(ctx, "content", "<unknown>"), exc, exc_info=exc)
 
     async def close(self, **options: Any) -> None:
-        """Deliberately does NOT close self.db. The admin server outlives
-        this object during shutdown (bot.py tears it down in the enclosing
-        finally), and a /settings request landing in that window used to hit
-        RuntimeError("Database.connect() was never called") from the
-        already-closed connection. The database is created in bot.py and is
-        closed there too, after the HTTP surface is actually down.
+        """Deliberately doesn't close self.db — the admin server outlives
+        this object during shutdown, and a /settings request landing in
+        that window used to hit "Database.connect() was never called" on
+        the already-closed connection. bot.py creates and closes the
+        database itself, after the HTTP surface is down.
 
-        `**options` (e.g. `save_tokens`) is passed straight through to
-        commands.Bot.close/Client.close — only this method's own signature
-        is widened here to match the base class; nothing here consumes any
-        of it itself."""
+        `**options` (e.g. `save_tokens`) passes straight through to
+        commands.Bot.close/Client.close; this signature is only widened to
+        match the base class."""
         if self._points_task is not None:
             self._points_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

@@ -27,23 +27,16 @@ CREATE TABLE IF NOT EXISTS custom_commands (
     created_by TEXT NOT NULL,
     created_at REAL NOT NULL
 );
-CREATE TABLE IF NOT EXISTS quotes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    text TEXT NOT NULL,
-    added_by TEXT NOT NULL,
-    added_at REAL NOT NULL
-);
 """
 
 
 class Database:
-    """Async wrapper over sqlite3 for per-viewer/community data — the stuff
-    JsonStore's whole-file-rewrite model is the wrong shape for (it scales
-    with viewer count, not with a handful of global settings). One
-    `check_same_thread=False` connection, WAL mode (safe concurrent
-    read/write with far less fsync overhead than the default rollback
-    journal — matches this project's resource-conscious deploy targets),
-    and an asyncio.Lock serializing access, same philosophy as JsonStore.
+    """Async wrapper over sqlite3 for per-viewer/community data — the
+    shape JsonStore's whole-file-rewrite model doesn't fit (this scales
+    with viewer count, not a handful of global settings). One
+    `check_same_thread=False` connection, WAL mode (concurrent read/write
+    with far less fsync overhead than the default journal), and an
+    asyncio.Lock serializing access — same philosophy as JsonStore.
     """
 
     def __init__(self, path: Path) -> None:
@@ -172,42 +165,3 @@ class Database:
 
     async def list_commands(self) -> list[str]:
         return await self._run(self._list_commands_sync)
-
-    # -- quotes -------------------------------------------------------------
-
-    def _add_quote_sync(self, conn: sqlite3.Connection, text: str, added_by: str) -> int:
-        cur = conn.execute(
-            "INSERT INTO quotes (text, added_by, added_at) VALUES (?, ?, ?)", (text, added_by, time.time())
-        )
-        conn.commit()
-        if cur.lastrowid is None:
-            raise RuntimeError("INSERT into quotes did not produce a rowid")
-        return cur.lastrowid
-
-    async def add_quote(self, text: str, added_by: str) -> int:
-        return await self._run(self._add_quote_sync, text, added_by)
-
-    def _get_quote_sync(self, conn: sqlite3.Connection, quote_id: int | None) -> tuple[int, str] | None:
-        if quote_id is None:
-            row = conn.execute("SELECT id, text FROM quotes ORDER BY RANDOM() LIMIT 1").fetchone()
-        else:
-            row = conn.execute("SELECT id, text FROM quotes WHERE id = ?", (quote_id,)).fetchone()
-        return (row[0], row[1]) if row is not None else None
-
-    async def get_quote(self, quote_id: int | None = None) -> tuple[int, str] | None:
-        return await self._run(self._get_quote_sync, quote_id)
-
-    def _delete_quote_sync(self, conn: sqlite3.Connection, quote_id: int) -> bool:
-        cur = conn.execute("DELETE FROM quotes WHERE id = ?", (quote_id,))
-        conn.commit()
-        return cur.rowcount > 0
-
-    async def delete_quote(self, quote_id: int) -> bool:
-        return await self._run(self._delete_quote_sync, quote_id)
-
-    def _count_quotes_sync(self, conn: sqlite3.Connection) -> int:
-        row = conn.execute("SELECT COUNT(*) FROM quotes").fetchone()
-        return int(row[0]) if row else 0
-
-    async def count_quotes(self) -> int:
-        return await self._run(self._count_quotes_sync)

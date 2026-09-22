@@ -25,97 +25,56 @@ log = logging.getLogger(__name__)
 
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
-# Security posture: only YouTube and SoundCloud are accepted, not "anything
-# yt-dlp supports". Every extractor is more attack surface — arbitrary
-# sites can serve crafted metadata (title, uploader, thumbnail) that flows
-# into the overlay page and chat replies. Enforced twice: _ALLOWED_URL_HOSTS
-# below rejects a disallowed URL before any network call; the
-# `allowed_extractors` yt-dlp option in _build_options() is defense-in-depth
-# in case a redirect or embed resolves an allowed-looking URL through
-# something else internally (e.g. the generic extractor).
+# Only YouTube/SoundCloud are allowed — every other extractor is more
+# attack surface (arbitrary sites feeding crafted metadata into chat/
+# overlay). Enforced twice: the host check below, plus `allowed_extractors`
+# in _build_options() in case a redirect resolves through something else.
 _ALLOWED_URL_HOSTS = {
     "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be",
     "soundcloud.com", "www.soundcloud.com", "m.soundcloud.com", "on.soundcloud.com",
 }
-# Matched with re.fullmatch against yt-dlp's lowercased IE_NAME — covers
-# every youtube:*/soundcloud:* variant. Deliberately excludes "generic",
-# yt-dlp's scrape-any-webpage fallback, which this restriction exists to
-# keep out. Checked against yt-dlp==2026.08.19.
+# re.fullmatch against yt-dlp's lowercased IE_NAME; covers every
+# youtube:*/soundcloud:* variant while excluding "generic", the
+# scrape-any-webpage fallback this restriction exists to keep out.
 _ALLOWED_EXTRACTORS = ["youtube(:.*)?", "soundcloud(:.*)?"]
 
-# yt-dlp's own no-cookies default is ('visionos', 'web') (yt_dlp.extractor
-# .youtube._video.YoutubeIE._DEFAULT_CLIENTS, checked against
-# yt-dlp==2026.08.19) — and _extract_player_responses() in that same file
-# processes every requested client unconditionally, with no short-circuit
-# once one succeeds. So the default genuinely does two full clients' worth
-# of network+processing work on *every* resolve, not just a cold one.
-# 'visionos' alone is yt-dlp's own designated JS-less client (see
-# _DEFAULT_JSLESS_CLIENTS in the same file) — it skips the ~6s Deno
-# signature-challenge solve entirely. Used here as a fast first attempt,
-# with an automatic fallback to the full default below if it comes back
-# empty, so the worst case is "no slower than before", not "less reliable".
-# Only applies when nothing else has already made the client choice for us
-# — i.e. no cookies configured and no explicit YTDLP_PLAYER_CLIENT (see
-# _fast_client_enabled below; config.py already forces cookie deployments
-# onto a fixed, cookie-compatible client list before this ever sees them).
+# yt-dlp's no-cookies default tries two clients ('visionos', 'web') with no
+# short-circuit, so every resolve pays for both. 'visionos' is yt-dlp's own
+# JS-less client — skips the ~6s Deno signature solve — so it's used alone
+# as a fast first attempt, falling back to the full default list if it
+# comes back empty. Only applies when nothing else already pinned the
+# client list (no cookies, no YTDLP_PLAYER_CLIENT — see _fast_client_enabled;
+# config.py forces cookie deployments onto a fixed list before this runs).
 _FAST_PLAYER_CLIENT: tuple[str, ...] = ("visionos",)
 
-# The signature *cipher* is cacheable (shared across videos on the same
-# YouTube player version), but the "n" throttling parameter is generated
-# per-video by design specifically so it *can't* be reused — confirmed in
-# _video.py's solve_js_challenges(): unlike the sig-challenge cache check,
-# n_challenges are solved unconditionally on every resolve. So even with a
-# warm cache, some JS execution is unavoidable per resolve — the lever left
-# is how fast that one execution is.
+# The signature *cipher* is cacheable, but the "n" throttling param is
+# solved fresh on every resolve by design — so a fast JS runtime matters
+# every time, cache or not. quickjs beats yt-dlp's default (deno) here:
+# deno spawns a fresh process with full V8 + JIT startup on every call,
+# and nothing here runs long enough for that JIT to pay for itself.
 #
-# yt-dlp's own JS-challenge params key is "js_runtimes", a dict of
-# {runtime_name: {config}}, defaulting to {"deno": {}} when unset —
-# confirmed directly against the installed yt_dlp.YoutubeDL: passing only
-# {"quickjs": {}} genuinely excludes deno from the candidate pool (deno's
-# own preference score is hardcoded higher than quickjs's, so simply
-# *adding* quickjs alongside deno would never actually get it tried first —
-# confirmed in extractor/youtube/jsc/_builtin/{deno,quickjs}.py's
-# @register_preference values, 1000 vs 850). Deno spawns a fresh OS process
-# with a full V8 startup and (per yt-dlp's own hardcoded flags) a full JS
-# reparse on every single invocation; QuickJS has no JIT to warm up, so its
-# process-spawn cost is far lower — a real win specifically because nothing
-# here runs long enough for Deno's JIT to ever pay for itself.
+# Risk: if quickjs can't solve a challenge, yt-dlp warns and silently
+# continues with whatever formats don't need it, rather than raising.
+# _has_playable_url() below only catches a *missing* stream_url, not a
+# worse-but-present one.
 #
-# Real risk, confirmed in the same solve_js_challenges(): if the only
-# enabled runtime can't solve a challenge, yt-dlp does NOT raise — it warns
-# ("some formats may be missing") and continues with whatever formats don't
-# need it. So an unavailable/broken quickjs can silently degrade instead of
-# cleanly failing. _has_playable_url() below is the actual safety net (no
-# usable stream_url -> treated as a fast-path miss, falls back to deno) —
-# but it can't catch a *worse-but-still-present* format, only a missing one.
-# Only applies when the user hasn't already pinned a specific runtime
-# themselves (YTDLP_JS_RUNTIME_PATH) — see _fast_runtime_enabled below.
-#
-# IMPORTANT — this only ever gets *used* when _FAST_PLAYER_CLIENT is also in
-# play (see _fast_path_enabled in __init__): a runtime swap alone doesn't
-# change which network requests get made, only which engine solves the
-# challenge in them. If player_client is already pinned to the same list on
-# both attempts (typically because YTDLP_COOKIES_FILE forces one — see
-# config.py), "fast" and "fallback" issue *identical* requests, so a failed/
-# timed-out fast attempt has already paid the fallback's full network cost
-# before the fallback even starts, taking ~2x as long as just doing the one
-# real attempt. Confirmed against a live deployment's logs: quickjs's own
-# solve time (~13-15s) rode right at _FAST_EXTRACT_TIMEOUT_SECONDS on this
-# particular host, so the fast attempt timed out on effectively every
-# resolve, turning a ~15-18s fallback into a ~30s round trip every time.
+# Only useful together with _FAST_PLAYER_CLIENT (see _fast_path_enabled):
+# swapping just the runtime doesn't change which requests get made, so if
+# player_client is already pinned (e.g. via YTDLP_COOKIES_FILE), fast and
+# fallback issue identical requests — a failed fast attempt then pays the
+# full network cost twice. Seen in production: quickjs's own solve time
+# rode right at _FAST_EXTRACT_TIMEOUT_SECONDS, turning an ~15-18s fallback
+# into ~30s on every resolve.
 _FAST_JS_RUNTIMES: dict[str, dict[str, str]] = {"quickjs": {}}
 
 _FAST_EXTRACT_TIMEOUT_SECONDS = 15.0
 _RADIO_MIX_TIMEOUT_SECONDS = 15.0
 
-# How long a freshly spawned extraction worker gets to import yt_dlp and
-# announce itself. The import alone is most of a second on a small VPS and can
-# be several on a loaded one, so this is deliberately generous — it only ever
-# costs anything when something is genuinely wrong.
+# Generous: yt_dlp's import alone can take seconds on a loaded VPS, and this
+# only costs anything when something's genuinely wrong.
 _WORKER_START_TIMEOUT_SECONDS = 60.0
-# Grace period between SIGTERM and SIGKILL when recycling a worker. A wedged
-# worker is wedged inside yt-dlp or a JS runtime and will not be returning,
-# so this stays short.
+# Short: a wedged worker is stuck inside yt-dlp/a JS runtime and isn't coming
+# back, so there's nothing to wait for.
 _WORKER_TERM_GRACE_SECONDS = 3.0
 
 
@@ -161,30 +120,26 @@ class ExtractionBackend:
 
 
 class ThreadBackend(ExtractionBackend):
-    """The original in-process model: yt-dlp runs on a ThreadPoolExecutor,
-    with a YoutubeDL instance reused per (thread, options) so the solved
-    YouTube signature challenge survives between calls.
+    """Original in-process model: yt-dlp on a ThreadPoolExecutor, with a
+    YoutubeDL instance reused per (thread, options) so the solved signature
+    challenge survives between calls.
 
-    Retained as an escape hatch rather than deleted, because it has no
-    dependency on being able to spawn child processes — which is the sort of
-    thing a hardened container or an unusual sandbox can take away.
-    Its known limitation is unchanged and is why ProcessBackend exists: a
-    timed-out wait_for() cancels only the *wait*, never the thread, so a
-    wedged extraction occupies a worker for as long as it feels like.
+    Kept as an escape hatch for sandboxes that can't spawn child processes.
+    Known limitation (why ProcessBackend exists): a timed-out wait_for()
+    cancels only the wait, not the thread, so a wedged extraction occupies
+    a worker indefinitely.
     """
 
     def __init__(self, concurrency: int) -> None:
         self._semaphore = asyncio.Semaphore(concurrency)
-        # A couple of threads wider than the semaphore: see the class
-        # docstring — the extra headroom buys margin before repeated hangs
-        # starve every future request.
+        # Wider than the semaphore so repeated hangs (see class docstring)
+        # don't immediately starve every future request.
         self._executor = ThreadPoolExecutor(max_workers=concurrency + 2, thread_name_prefix="ytdlp")
         self._tlocal = threading.local()
 
     def _extract_sync(self, query: str, options: dict[str, Any]) -> dict[str, Any]:
-        # Keyed by the options themselves rather than a fast/slow flag, so
-        # the radio-mix lookup's third options shape gets its own instance
-        # too instead of thrashing one of the other two.
+        # Keyed by the options themselves (not a fast/slow flag) so the
+        # radio-mix lookup's third options shape gets its own instance too.
         instances: dict[str, Any] | None = getattr(self._tlocal, "instances", None)
         if instances is None:
             instances = {}
@@ -230,11 +185,10 @@ class _WorkerCrashed(Exception):
 class _ExtractionWorker:
     """One `python -m twitch_radio.extractor_worker` child process.
 
-    Handles exactly one request at a time; ProcessBackend's idle pool is
-    what guarantees exclusive access, which is what lets request() read the
-    reply inline instead of demultiplexing by id. The id is still checked —
-    a mismatch means the framing has desynchronised and the process is no
-    longer trustworthy.
+    Handles one request at a time — ProcessBackend's idle pool guarantees
+    exclusive access, so request() can read the reply inline instead of
+    demultiplexing by id. The id is still checked: a mismatch means the
+    framing desynced and the process can't be trusted anymore.
     """
 
     def __init__(self, index: int) -> None:
@@ -249,13 +203,11 @@ class _ExtractionWorker:
 
     async def start(self) -> None:
         env = dict(os.environ)
-        # The worker frames its protocol as UTF-8 JSON lines and must not
-        # buffer them; inheriting a C locale or Python's default block
-        # buffering on a pipe would deadlock the very first request.
+        # UTF-8 JSON lines, unbuffered — inheriting block buffering on a
+        # pipe would deadlock the very first request.
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"
-        # Guarantees `-m twitch_radio.extractor_worker` resolves regardless
-        # of what the service's working directory happens to be.
+        # Makes `-m twitch_radio.extractor_worker` resolve regardless of cwd.
         existing_path = env.get("PYTHONPATH")
         env["PYTHONPATH"] = f"{BASE_DIR}{os.pathsep}{existing_path}" if existing_path else str(BASE_DIR)
         self._proc = await asyncio.create_subprocess_exec(
@@ -265,11 +217,9 @@ class _ExtractionWorker:
             stderr=asyncio.subprocess.PIPE,
             cwd=str(BASE_DIR),
             env=env,
-            # Default StreamReader limit is 64 KiB per line. Projected
-            # responses are far smaller, but a radio mix of long titles plus
-            # signed CDN URLs is not nothing, and overflowing the limit
-            # would surface as a confusing LimitOverrunError rather than a
-            # clean failure.
+            # Default StreamReader limit is 64 KiB/line; a radio mix of long
+            # titles + signed CDN URLs can exceed that and would otherwise
+            # surface as a confusing LimitOverrunError.
             limit=1024 * 1024,
         )
         self._stderr_task = asyncio.create_task(
@@ -337,10 +287,9 @@ class _ExtractionWorker:
         raise DownloadError(error)
 
     async def kill(self) -> None:
-        """Terminate, then kill. This is the capability the thread backend
-        structurally cannot offer: a wedged extraction actually stops
-        consuming CPU and memory here instead of occupying a worker slot for
-        the rest of the process's life."""
+        """Terminate, then kill — the capability ThreadBackend structurally
+        can't offer: a wedged extraction actually stops consuming CPU/memory
+        instead of occupying a worker slot forever."""
         proc = self._proc
         self._proc = None
         if self._stderr_task is not None:
@@ -350,13 +299,10 @@ class _ExtractionWorker:
             self._stderr_task = None
         if proc is None:
             return
-        # Close stdin explicitly. Without this the subprocess transport is
-        # left holding an open pipe, and its __del__ tries to write_eof()
-        # during interpreter teardown — after asyncio.run() has closed the
-        # loop — which surfaces as a "RuntimeError: Event loop is closed"
-        # traceback on every clean shutdown. Closing it here also gives the
-        # worker's `for line in sys.stdin` loop a clean EOF to exit on, so
-        # an idle worker usually never needs the SIGTERM below at all.
+        # Closing stdin explicitly avoids a "RuntimeError: Event loop is
+        # closed" from the transport's __del__ during interpreter teardown,
+        # and gives the worker's stdin loop a clean EOF — often avoiding
+        # the SIGTERM below entirely.
         if proc.stdin is not None:
             with contextlib.suppress(Exception):
                 proc.stdin.close()
@@ -373,27 +319,22 @@ class _ExtractionWorker:
 
 
 class ProcessBackend(ExtractionBackend):
-    """A pool of long-lived extraction worker processes.
+    """A pool of long-lived extraction worker processes. Three wins over
+    ThreadBackend:
 
-    Three things this buys over ThreadBackend, in rough order of how much
-    they matter on the deployments this bot targets:
+    1. Extraction is GIL-bound Python (regex, multi-MB JSON parsing, format
+       sorting) — sharing an interpreter with RadioPlayer's real-time feed
+       loop is why resolves and stream stutter correlate. A separate
+       process fixes that.
+    2. Timeouts become real: wait_for on a thread only cancels the wait;
+       here it kills the process.
+    3. A runaway extraction is charged to its own process, so systemd's
+       MemoryMax bounds it without taking the bot down too.
 
-    1. The audio path stops sharing an interpreter with yt-dlp. Extraction
-       is overwhelmingly GIL-bound Python — regex over the player response,
-       JSON parsing of a multi-megabyte InnerTube blob, format sorting — and
-       only the JS-runtime subprocess wait releases the GIL. Running that on
-       the same interpreter as RadioPlayer's real-time feed loop is why
-       resolves and stream stutter correlate.
-    2. Timeouts become real. wait_for on a thread cancels the wait; here it
-       kills the process.
-    3. A runaway extraction is charged to its own process, so the systemd
-       unit's MemoryMax bounds it without taking the bot down with it.
-
-    The cost is losing the in-memory signature cache when a worker is
-    recycled — which is acceptable, because the expensive half (the
-    signature cipher) is persisted to disk under `cachedir` and shared
-    across processes anyway, and the "n" challenge was never cacheable to
-    begin with.
+    Cost: the in-memory signature cache is lost when a worker recycles —
+    acceptable since the expensive half (the cipher) is persisted to disk
+    under `cachedir` and shared across processes anyway; the "n" challenge
+    was never cacheable regardless.
     """
 
     def __init__(self, size: int) -> None:
@@ -504,84 +445,57 @@ class Resolver:
     feature in-process to protect from contention.
     """
 
-    # A stable, always-public, extremely unlikely-to-disappear video —
-    # YouTube's own first-ever upload. Content is irrelevant; this is never
-    # queued or played, only resolved and discarded, purely to warm up
-    # yt-dlp's on-disk JS-challenge cache and this process's worker threads
-    # before a real listener's first !sr. See warm_up() below.
+    # YouTube's first-ever upload — stable, always public, never actually
+    # queued/played. Only resolved and discarded to warm the JS-challenge
+    # cache before a real listener's first !sr. See warm_up().
     _WARMUP_QUERY = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        # Where extraction actually runs. "process" is the default and is
-        # the one that makes a timeout able to kill the work it timed out
-        # on; "thread" is the original in-process path, kept selectable via
-        # YTDLP_WORKER_MODE. Everything below this line is identical either
-        # way — see ExtractionBackend.
+        # "process" (default) lets a timeout actually kill the work; "thread"
+        # is the original in-process path, selectable via YTDLP_WORKER_MODE.
+        # Everything below is identical either way — see ExtractionBackend.
         self._backend: ExtractionBackend
         if settings.ytdlp_worker_mode == "thread":
             self._backend = ThreadBackend(settings.ytdlp_concurrency)
         else:
             self._backend = ProcessBackend(settings.ytdlp_concurrency)
-        # A !sr resolves once in chat (to confirm/queue it) and again in the
-        # player right before it plays — see resolve()'s docstring. Keyed by
-        # both the resolved webpage_url (shared by those two call sites) and,
-        # for non-URL queries, the case-folded search text itself.
+        # A !sr resolves once in chat (confirm/queue) and again in the
+        # player right before it plays (see resolve()). Keyed by the
+        # resolved webpage_url, plus the case-folded search text for
+        # non-URL queries.
         self._cache: dict[str, tuple[Track, float]] = {}
 
-        # Coalesces concurrent resolves of the *same* query (same chatter
-        # firing !sr twice before the first has even started, or two
-        # different chatters requesting the same song within moments of
-        # each other) into one real extraction. Without this, each caller
-        # arrives before the other has populated `_cache` above, sees no
-        # hit, and independently pays the full yt-dlp + JS-challenge round
-        # trip for what's about to be an identical result. Keyed the same
-        # way `_cache` is looked up in resolve() below. Entries remove
-        # themselves once the shared task finishes (success or failure).
+        # Coalesces concurrent resolves of the same query (double !sr, or
+        # two chatters requesting the same song moments apart) into one
+        # extraction — without this each caller misses the still-empty
+        # `_cache` and pays the full round trip independently. Keyed the
+        # same way `_cache` is; entries remove themselves once the shared
+        # task finishes.
         self._inflight: dict[str, asyncio.Task[Track | None]] = {}
 
-        # Nothing else has already pinned the client list for us — see the
-        # module comment above _FAST_PLAYER_CLIENT.
+        # See the module comment above _FAST_PLAYER_CLIENT.
         self._fast_client_enabled = not settings.ytdlp_player_client
-        # Nothing else has already pinned a specific runtime binary for us
-        # — see the module comment above _FAST_JS_RUNTIMES.
+        # See the module comment above _FAST_JS_RUNTIMES.
         self._fast_runtime_enabled = not settings.ytdlp_js_runtime_path
-        # Deliberately NOT "self._fast_client_enabled or self._fast_runtime_enabled".
-        # The fast attempt is only cheaper than the fallback when it does
-        # structurally less work — i.e. when _fast_client_enabled lets it use
-        # _FAST_PLAYER_CLIENT (visionos), which skips the JS challenge
-        # entirely. A *runtime-only* difference (_fast_runtime_enabled alone,
-        # with _fast_client_enabled False) still issues the exact same
-        # requests as the fallback, since the player_client list — usually
-        # forced by YTDLP_COOKIES_FILE, see config.py — is unchanged between
-        # the two attempts. Running that "fast" attempt first buys nothing
-        # even when it succeeds (no work was skipped) and, on a failure or a
-        # timeout — the normal case whenever quickjs isn't meaningfully
-        # faster than deno on the host, as one deployment's logs showed —
-        # it means paying the fallback's full network + JS-challenge cost
-        # twice in a row instead of once. So only a genuine client swap
-        # enables the two-attempt dance. When only _fast_runtime_enabled is
-        # set, the single fallback attempt below still runs — just once,
-        # with yt-dlp's own default runtime (deno) rather than a forced
-        # quickjs — since we have no evidence on this deployment that
-        # quickjs actually resolves faster than deno once the redundant
-        # attempt is removed (its own solve time rode right at the fast-path
-        # timeout, same ballpark as deno's). If you want to try quickjs as
-        # the *one* runtime for every resolve on a cookie-enabled deployment,
-        # set YTDLP_JS_RUNTIME_NAME=quickjs and YTDLP_JS_RUNTIME_PATH=<path
-        # to qjs> explicitly (see config.py) — that's an existing knob, not
-        # something this fast-path logic should guess at.
+        # Deliberately not "client_enabled or runtime_enabled": the fast
+        # attempt only pays off when it skips the JS challenge entirely
+        # (_FAST_PLAYER_CLIENT). A runtime-only difference still issues the
+        # same requests as the fallback (player_client is unchanged), so it
+        # buys nothing on success and doubles the network + JS-challenge
+        # cost on a failed/timed-out attempt — which one deployment's logs
+        # showed is the normal case for quickjs vs deno on that host. To
+        # force quickjs as the sole runtime instead, set
+        # YTDLP_JS_RUNTIME_NAME/PATH explicitly (config.py) rather than
+        # relying on this fast-path logic.
         self._fast_path_enabled = self._fast_client_enabled
 
         self._ytdl_options: dict[str, Any] | None = None
         self._fast_ytdl_options: dict[str, Any] | None = None
-        # A *reused* YoutubeDL instance per (worker, options) rather than a
-        # fresh one per call — YouTube's per-player-version JS signature
-        # challenge is solved once and cached on the extractor instance
-        # itself. A fresh YoutubeDL() every call throws that away, so the
-        # ~6s Deno JS-challenge solve would rerun from scratch on every !sr,
-        # even for a song played minutes earlier. Both backends do this;
-        # they differ only in what a "worker" is (a thread vs a process).
+        # Both backends reuse one YoutubeDL instance per (worker, options)
+        # rather than a fresh one per call, so the solved JS signature
+        # challenge (~6s on Deno) is cached on the extractor instance and
+        # doesn't rerun on every !sr. They differ only in what a "worker" is.
 
     async def aclose(self) -> None:
         """Async because ProcessBackend has child processes to reap. Called
@@ -589,21 +503,17 @@ class Resolver:
         await self._backend.aclose()
 
     async def warm_up(self) -> None:
-        """Best-effort: resolves a throwaway video on every worker thread
-        this Resolver will normally use, so the first *real* !sr after a
-        restart doesn't pay the full cold-start cost (JS runtime startup,
-        first signature-challenge solve) by itself. Meant to be started as
-        a background task right after construction — never awaited inline
-        before the bot comes up, and never lets a failure (e.g. no network
-        yet) propagate; a real request falls back to paying the cold-start
-        cost itself, exactly as if this didn't run at all.
+        """Best-effort: resolves a throwaway video on every worker so the
+        first real !sr after a restart doesn't pay the full cold-start cost
+        alone. Meant to run as a background task right after construction,
+        never awaited inline — a failure here just means a real request
+        pays the cold-start cost itself, same as if this never ran.
         """
         start = time.monotonic()
-        # Starting the backend is part of warming up: for ProcessBackend
-        # that means spawning the pool and paying the yt_dlp import cost in
-        # every child now, rather than on the first real !sr. A failure to
-        # start the process pool at all falls back to the in-process path
-        # instead of leaving song requests broken.
+        # Starting the backend is part of warming up: for ProcessBackend,
+        # spawning the pool now pays the yt_dlp import cost per child ahead
+        # of the first real !sr. If the pool can't start at all, fall back
+        # to the in-process path rather than leave song requests broken.
         if isinstance(self._backend, ProcessBackend):
             try:
                 await self._backend.start()
@@ -619,12 +529,10 @@ class Resolver:
                 self._backend = ThreadBackend(self._settings.ytdlp_concurrency)
 
         try:
-            # fast=False deliberately, even when the fast path is enabled.
-            # The whole point of warming up is to populate the on-disk
-            # signature-challenge cache (see _build_options's `cachedir`
-            # note), and _FAST_PLAYER_CLIENT is yt-dlp's JS-less client —
-            # it skips the challenge entirely, so warming through it would
-            # leave the expensive thing exactly as cold as it started.
+            # fast=False even when the fast path is enabled — warming up
+            # exists to populate the on-disk signature-challenge cache, and
+            # the fast client skips that challenge entirely, which would
+            # leave the expensive part exactly as cold as it started.
             await self._backend.warm(
                 self._WARMUP_QUERY,
                 self._get_ytdl_options(fast=False),
@@ -653,22 +561,15 @@ class Resolver:
             "socket_timeout": 15,
             "extract_flat": False,
             "allowed_extractors": _ALLOWED_EXTRACTORS,
-            # yt-dlp's default cache dir (~/.cache/yt-dlp) is unwritable
-            # under the systemd unit's ProtectHome=read-only, so nothing
-            # would survive a restart. Lives under DATA_DIR, already
-            # covered by the unit's ReadWritePaths.
+            # yt-dlp's default cache dir is unwritable under the systemd
+            # unit's ProtectHome=read-only; DATA_DIR is covered by
+            # ReadWritePaths instead.
             #
-            # The params key is "cachedir" (no underscore) — verified
-            # directly against yt_dlp.cache.Cache._get_root_dir(), which
-            # reads exactly that key and falls back to $XDG_CACHE_HOME or
-            # ~/.cache otherwise. A previous version of this code passed
-            # "cache_dir" here, which yt-dlp silently never looks at: every
-            # write went to the (read-only, under systemd) default location
-            # instead, failed, and was never persisted — so the ~7s Deno
-            # JS-signature-challenge solve reran from scratch on every
-            # single resolve rather than roughly once per YouTube player
-            # rotation. This was very likely the dominant cause of "!sr is
-            # slow" under the systemd deployment this README documents.
+            # Key is "cachedir", no underscore (yt_dlp.cache.Cache
+            # ._get_root_dir()) — an earlier "cache_dir" typo here silently
+            # went nowhere, so the ~7s JS-challenge solve reran on every
+            # resolve instead of once per player rotation. Very likely the
+            # dominant cause of "!sr is slow" under this deployment.
             "cachedir": str(DATA_DIR / "yt-dlp-cache"),
         }
         extractor_args: dict[str, dict[str, list[str]]] = {}
@@ -746,24 +647,17 @@ class Resolver:
         return info
 
     async def resolve_radio_mix(self, mix_url: str) -> list[dict[str, Any]]:
-        """Flat-extracts a YouTube 'watch?v=X&list=RDX' Mix/Radio playlist —
-        YouTube's own auto-generated "more like this" queue, reused here
-        instead of building a recommendation engine from scratch. extract_flat
-        skips per-entry format resolution, so unlike a real resolve this
-        needs no JS-runtime call at all — cheaper than even the fast path
-        above. Returns [] on any failure (no mix available, network error);
-        callers treat that as "no suggestion" and fall back to silence,
-        same best-effort philosophy as warm_up()/prefetch.
+        """Flat-extracts a YouTube 'watch?v=X&list=RDX' Mix — YouTube's own
+        "more like this" queue, reused instead of building a recommendation
+        engine. extract_flat skips per-entry format resolution, so this
+        needs no JS-runtime call at all. Returns [] on any failure; callers
+        treat that as "no suggestion" and fall back to silence.
         """
-        # noplaylist=True from _build_options() is correct for a normal
-        # !sr resolve (a video URL that happens to sit in some playlist
-        # should still resolve to just that one video) — but it's fatal
-        # here: it makes yt-dlp ignore the &list=RD<id> part of mix_url
-        # entirely and resolve only the single seed video, so "entries"
-        # never comes back and this silently always returned [] before
-        # this override existed. That was the actual bug behind "radio
-        # autoplay doesn't do anything" — not a network/auth issue, a
-        # single inherited flag.
+        # noplaylist=True from _build_options() is right for a normal !sr
+        # (a URL in some playlist should still resolve to just that video)
+        # but fatal here: it makes yt-dlp ignore &list=RD<id> and resolve
+        # only the seed video, so "entries" never comes back. This was the
+        # actual bug behind "radio autoplay doesn't do anything".
         options = {
             **self._build_options(),
             "extract_flat": "in_playlist",
@@ -773,12 +667,9 @@ class Resolver:
         try:
             info = await self._backend.extract(mix_url, options, _RADIO_MIX_TIMEOUT_SECONDS)
         except Exception:
-            # Broad on purpose, matching the docstring above ("[] on
-            # any failure") — narrowly catching just TimeoutError/
-            # DownloadError missed real cases (e.g. ExtractorError for
-            # "no mix available"), which would otherwise propagate
-            # out of a background radio-fill task and just look like
-            # autoplay silently doing nothing, with no logged reason.
+            # Broad on purpose (matches the docstring's "[] on any
+            # failure") — narrowing to TimeoutError/DownloadError missed
+            # real cases like ExtractorError for "no mix available".
             log.debug("Radio mix extraction failed for %s (non-fatal).", mix_url, exc_info=True)
             return []
         entries = info.get("entries") if isinstance(info, dict) else None
@@ -799,39 +690,30 @@ class Resolver:
     async def resolve(self, query: str, requester_id: int) -> Track | None:
         """Resolves one query to one Track, or None if nothing playable was
         found. Never raises for "not found" — only for actual failures
-        (timeout, network error), which the caller is expected to catch.
+        (timeout, network error), which the caller must catch.
 
-        Cached briefly (YTDLP_CACHE_TTL_SECONDS), keyed on both the
-        resolved webpage_url (so the player's re-resolve right before
-        playback, and the prefetch of the next track, reuse this result
-        instead of a second full extraction) and, for non-URL queries, the
-        case-folded search text itself (so a second !sr for the same song
-        by name — from the same or a different chatter — within the TTL
-        also skips the full resolve). A cache hit still returns a fresh
-        Track with the requested requester_id; treat a cached result as
-        informational, not gospel, for anything genuinely safety-relevant
-        (e.g. is_live).
+        Cached briefly (YTDLP_CACHE_TTL_SECONDS), keyed on the resolved
+        webpage_url (so the player's pre-playback re-resolve and prefetch
+        reuse this) and, for non-URL queries, the case-folded search text
+        (so a repeat !sr by name skips the full resolve too). A cache hit
+        still gets a fresh requester_id; treat it as informational, not
+        gospel, for anything safety-relevant (e.g. is_live).
         """
         now = time.monotonic()
         raw = query.strip()
         if _URL_RE.match(raw) and not _is_allowed_url(raw):
             raise UnsupportedSourceError("Only YouTube and SoundCloud links are supported.")
 
-        # Search text gets its own, case-folded cache key, separate from the
-        # webpage_url key below. A YouTube video ID is case-sensitive, so
-        # URLs are never folded — only non-URL search text is. Without this,
-        # two different chatters (or the same one) requesting the same song
-        # by name within YTDLP_CACHE_TTL_SECONDS each pay the full
-        # resolve+JS-challenge cost, even though the first request just
-        # resolved that exact text seconds earlier — a real cost on a
-        # request-heavy stream (hype trains, a popular song requested
-        # repeatedly), not just a hypothetical one.
+        # Search text gets its own case-folded key, separate from
+        # webpage_url — URLs are case-sensitive (video IDs), so only
+        # non-URL search text is folded. Without this, repeat requests for
+        # the same song by name each pay the full resolve+JS-challenge cost
+        # instead of reusing the just-resolved result.
         is_url = bool(_URL_RE.match(raw))
         search_key = raw.lower() if not is_url else None
-        # Same value resolve() would cache the eventual result under for a
-        # non-URL query (search_key); for a URL query, the URL itself —
-        # there's no separate case-folded form to key on, but two callers
-        # passing the exact same URL string still coalesce correctly.
+        # Same key the result gets cached under below (search_key for a
+        # non-URL query, the raw URL otherwise) — so two callers with the
+        # exact same query still coalesce.
         dedup_key = search_key if search_key is not None else raw
 
         ttl = self._settings.ytdlp_cache_ttl_seconds
@@ -843,19 +725,13 @@ class Resolver:
                 if now - cached_at < ttl:
                     return dataclasses.replace(track, requester_id=requester_id)
 
-        # asyncio.shield, not a bare await, on BOTH paths below. Awaiting a
-        # Task directly propagates the *awaiter's* cancellation into the Task
-        # itself — so one caller going away would cancel the shared
-        # extraction out from under every other caller waiting on it. That is
-        # not hypothetical here: RadioPlayer._play_one cancels its prefetch
-        # task at the end of every single track (see its finally block), and
-        # that prefetch routinely shares a dedup_key with a chatter's live
-        # !sr for the same URL. Without shield, the chatter's resolve dies
-        # with CancelledError — which _resolve_and_queue's `except Exception`
-        # deliberately doesn't catch — so the request vanishes with no queue
-        # entry and no error reply at all. shield cancels only this waiter
-        # and leaves the shared work running, which is what we want anyway:
-        # its result still lands in _cache for whoever is left.
+        # asyncio.shield on both paths below, not a bare await — awaiting a
+        # Task directly propagates the *awaiter's* cancellation into the
+        # Task itself. Concretely: RadioPlayer cancels its prefetch task
+        # after every track, and that prefetch often shares a dedup_key
+        # with a chatter's live !sr — without shield, the chatter's resolve
+        # would die with CancelledError and vanish silently. shield cancels
+        # only this waiter; the shared work keeps running for whoever's left.
         existing = self._inflight.get(dedup_key)
         if existing is not None:
             shared_track = await asyncio.shield(existing)
@@ -869,17 +745,13 @@ class Resolver:
         self._inflight[dedup_key] = task
 
         def _evict(finished: "asyncio.Task[Track | None]", key: str = dedup_key) -> None:
-            # Backstop for the shielded case above: if every waiter walked
-            # away before the shared task finished, nothing else is left to
-            # remove it from _inflight, and a stale done-task entry would
-            # make later callers await an already-completed (possibly
-            # failed) result forever after.
+            # Backstop for the shield above: if every waiter walks away
+            # before the shared task finishes, nothing else removes it from
+            # _inflight, leaving a stale done-task entry for later callers.
             if self._inflight.get(key) is finished:
                 del self._inflight[key]
-            # Retrieve any exception so asyncio doesn't log "Task exception
-            # was never retrieved" for a shared resolve whose only waiter
-            # was cancelled before it failed. Every live waiter still sees
-            # the real exception through its own await.
+            # Retrieve the exception so asyncio doesn't log "Task exception
+            # was never retrieved" when the only waiter was cancelled first.
             if not finished.cancelled() and finished.exception() is not None:
                 log.debug("Shared resolve for %r failed with no waiter left.", key)
 
@@ -887,16 +759,13 @@ class Resolver:
         try:
             resolved_track = await asyncio.shield(task)
         finally:
-            # Only clear our own entry, and only once it's actually
-            # finished — a concurrent resolve() call for a *different* query
-            # could have already claimed dedup_key again by the time we get
-            # here in a pathological ordering, and we must not evict someone
-            # else's still-running task. The done() check is what the shield
-            # above makes necessary: this finally can now run while `task` is
-            # still in flight (this waiter was cancelled, the shared work
-            # wasn't), and evicting it there would send the very next caller
-            # off to start a duplicate extraction of something already
-            # running. It cleans itself up via the callback below instead.
+            # Only clear our own entry, and only once finished — a
+            # concurrent resolve() for a different query could have already
+            # reclaimed dedup_key, and shield means this can run while
+            # `task` is still in flight (this waiter cancelled, the shared
+            # work didn't) — evicting then would send the next caller to
+            # start a duplicate extraction. The done-callback above handles
+            # that case instead.
             if self._inflight.get(dedup_key) is task and task.done():
                 del self._inflight[dedup_key]
         return (
@@ -906,11 +775,10 @@ class Resolver:
         )
 
     async def _do_resolve(self, query: str, dedup_key: str, started_at: float) -> Track | None:
-        """The actual extraction + Track-building work, run at most once per
-        dedup_key at a time — every concurrent resolve() call for the same
-        query awaits this single task rather than re-running it. requester_id
-        is deliberately NOT baked in here; resolve() applies it per-caller via
-        dataclasses.replace() on the shared result.
+        """Extraction + Track-building, run at most once per dedup_key —
+        concurrent resolve() calls for the same query all await this one
+        task. requester_id isn't baked in here; resolve() applies it
+        per-caller via dataclasses.replace() on the shared result.
         """
         try:
             info = await self._extract_info(self._query_for(query))
@@ -919,11 +787,9 @@ class Resolver:
             raise
         counters.record("resolve_success")
 
-        # A bare "ytsearchN:" query wraps its one hit in an "entries" list;
-        # a direct URL resolves straight to the item itself. entries == []
-        # (present but empty) is a genuine zero-results search and must NOT
-        # fall back to using info as the item — check "is None" specifically
-        # since both are otherwise falsy.
+        # A search query wraps its hit in "entries"; a URL resolves straight
+        # to the item. entries == [] is a genuine zero-results search, so
+        # check "is None" specifically rather than falsy — both read falsy.
         entries = info.get("entries") if isinstance(info, dict) else None
         item = next((e for e in entries if e), None) if entries is not None else info
         if not item:
@@ -935,10 +801,9 @@ class Resolver:
             if _URL_RE.match(query.strip()):
                 webpage_url = query
             else:
-                # No stable URL to persist. Falling back to the raw search
-                # text would silently turn into a *fresh* search on the next
-                # re-resolve — the song that plays could differ from what
-                # was confirmed to the requester in chat.
+                # No stable URL to persist — falling back to raw search text
+                # would silently re-search on the next resolve, possibly
+                # playing something different from what chat confirmed.
                 log.warning(
                     "yt-dlp returned no webpage_url for %r and the query wasn't a URL either "
                     "— refusing to queue it rather than risk a different track playing later.",

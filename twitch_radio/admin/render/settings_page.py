@@ -175,15 +175,15 @@ def render_settings_page(
         leaderboard = f'<ol class="leaderboard">{leaderboard}</ol>'
     else:
         leaderboard = '<p class="empty">No points earned yet.</p>'
-    custom_commands = community["custom_commands"]
-    custom_commands_html = (
-        '<p class="help">' + ", ".join(f"<code>!{escape(n)}</code>" for n in custom_commands) + "</p>"
-        if custom_commands
-        else ""
-    )
     # Same prefix already shown in the endpoints table as "Chat command prefix",
     # reused so the reference shows real, copy-pasteable command text.
     prefix = broadcast_info.get("Chat command prefix", "!")
+    custom_commands = community["custom_commands"]
+    custom_commands_html = (
+        '<p class="help">' + ", ".join(f"<code>{prefix}{escape(n)}</code>" for n in custom_commands) + "</p>"
+        if custom_commands
+        else ""
+    )
     logo = '<img class="mark" src="/logo.png" alt="" onerror="this.remove()">' if has_logo else ""
     return template("settings.html").substitute(
         css=static_text("settings.css"),

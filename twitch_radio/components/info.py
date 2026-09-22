@@ -39,12 +39,11 @@ class InfoComponent(commands.Component):
     @commands.command(name="commands", aliases=["help"])
     async def commands_list(self, ctx: commands.Context) -> None:
         """Links to the public /commands page when TWITCH_PUBLIC_BASE_URL is
-        configured — a proper categorized, searchable reference every
-        chatter can open, not just mods with the /settings password.
-        Falls back to the terse in-chat listing otherwise, built from the
-        same commands_reference.COMMANDS so a command that isn't meant to
-        show up here at all (public=False, e.g. !block/!unblock/!blocklist)
-        just needs that one flag set in one place."""
+        set — a categorized, searchable reference any chatter can open, not
+        just mods with the /settings password. Otherwise falls back to a
+        terse in-chat listing built from the same commands_reference.COMMANDS,
+        so a command that shouldn't show here (public=False) just needs
+        that one flag set in one place."""
         if self.bot.public_commands_url:
             await self.bot.safe_reply(
                 ctx, f"Full list of commands, what they do, and how to use them: {self.bot.public_commands_url}"

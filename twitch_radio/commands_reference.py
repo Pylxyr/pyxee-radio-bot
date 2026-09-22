@@ -1,38 +1,21 @@
 """Single source of truth for every chat command's name, access level,
-usage and description.
+usage and description — shared by !commands in chat (terse, public=True
+only), the /settings page (full table, public=False included), and the
+public /commands webpage (grouped into tabs by `category`). Same pattern
+as tunables.py's TUNABLE_BOUNDS/TUNABLE_LABELS and toggles.py's
+TOGGLE_KEYS: add a command here once, every consumer picks it up.
 
-Shared by two consumers that both need to describe the same commands and
-must never drift apart from each other or from what the components
-actually implement:
+`public=False` hides a command from chat's !commands listing while still
+documenting it on /settings — used for !block/!unblock/!blocklist, which
+work fine as commands, just aren't advertised to every viewer watching
+mods work in chat. `category` only affects the /commands page's tab
+layout, never visibility — every public=True command still shows there
+regardless of `group`.
 
-- components/info.py's `!commands` — a terse, space-constrained summary
-  in chat, filtered to `public=True` entries.
-- the admin server's /settings page (admin/render/settings_page.py) — a full reference table with usage
-  and description text, including the `public=False` entries that don't
-  appear in chat at all.
-
-This is the same pattern tunables.py's TUNABLE_BOUNDS/TUNABLE_LABELS and
-toggles.py's TOGGLE_KEYS already use: add a command here once, and both
-places pick it up automatically instead of two hand-typed listings that
-can silently fall out of sync.
-
-`public=False` hides a command from the terse !commands listing in chat
-while still fully documenting it on the /settings page — used for
-!block/!unblock/!blocklist, which stay real, working mod commands; they're
-just not advertised to every viewer watching mods work in chat.
-
-This module is documentation only. It has no bearing on what a command
-actually does, what arguments it requires, or the (often richer, dynamic)
-usage messages a command replies with on its own malformed-argument
-checks — those live where they always have, in each component. Changing
-an entry here changes what gets *displayed*, nothing more.
-
-A third consumer, added alongside a public /commands webpage: `category`
-groups commands into tabs there (Song Requests, Points, Stream Info,
-Moderator Tools). That page shows every `public=True` command regardless
-of `group` — a viewer who can't run !toggle themselves can still read
-that it exists — so `category` only affects layout, never visibility;
-`public`/`group` above are what still gate that.
+Documentation only: has no bearing on what a command actually does or the
+richer, dynamic usage messages it replies with on its own malformed-
+argument checks — those live in each component. Changing an entry here
+only changes what gets displayed.
 """
 
 from __future__ import annotations
@@ -42,17 +25,15 @@ from dataclasses import dataclass
 from twitch_radio.toggles import TOGGLE_KEYS
 from twitch_radio.tunables import TUNABLE_BOUNDS
 
-# "anyone" vs "moderators" buckets both the terse !commands grouping and
-# the /settings table's section headings. It's a coarser cut than the
-# free-text `who` field below — !skip, for instance, is group="anyone"
-# because a regular chatter can use it (on their own song), even though
-# `who` explains the actual restriction in full for the settings table.
+# "anyone" vs "moderators" buckets !commands and the /settings table's
+# section headings — coarser than the free-text `who` field below: !skip
+# is group="anyone" since a chatter can use it on their own song, even
+# though `who` spells out the real restriction for /settings.
 _GROUPS = ("anyone", "moderators")
 
-# Tab order on the public /commands page — CATEGORIES is the source of
-# truth for both which categories exist and the order they're shown in;
-# a command naming one not in this tuple would silently never render
-# there, so commands_reference.py's own self-test below catches that.
+# Tab order on the public /commands page, and the source of truth for
+# which categories exist — a command naming one not in this tuple would
+# silently never render there; the self-test below catches that.
 CATEGORIES: tuple[str, ...] = ("Song Requests", "Points & Leaderboard", "Stream Info", "Moderator Tools")
 
 

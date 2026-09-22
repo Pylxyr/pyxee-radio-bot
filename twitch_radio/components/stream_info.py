@@ -33,13 +33,9 @@ class StreamInfoComponent(commands.Component):
         self._clip_cooldown = CooldownTracker()
 
     def _broadcaster(self) -> PartialUser:
-        # Annotated properly now (PartialUser imported under TYPE_CHECKING,
-        # so it still costs nothing at runtime) — pyproject sets mypy's
-        # disallow_untyped_defs, and the old bare `def _broadcaster(self):`
-        # with a ruff-only noqa was the one place in the package that
-        # silently didn't satisfy it.
-        assert self.bot.owner_id is not None
-        return self.bot.create_partialuser(user_id=self.bot.owner_id)
+        # PartialUser imported under TYPE_CHECKING only, so this costs
+        # nothing at runtime.
+        return self.bot.create_partialuser(user_id=self.bot.owner_id_required)
 
     @commands.command(name="uptime")
     async def uptime_cmd(self, ctx: commands.Context) -> None:
@@ -126,9 +122,8 @@ class StreamInfoComponent(commands.Component):
             await self.bot.safe_reply(ctx, f"Just made one — try again in {remaining:.0f}s.")
             return
         self._clip_cooldown.mark(_CLIP_COOLDOWN_KEY)
-        assert self.bot.owner_id is not None
         try:
-            clip = await self._broadcaster().create_clip(token_for=self.bot.owner_id)
+            clip = await self._broadcaster().create_clip(token_for=self.bot.owner_id_required)
         except HTTPException as e:
             if e.status in (401, 403):
                 await self.bot.safe_reply(ctx, "Clips aren't set up for this channel yet.")

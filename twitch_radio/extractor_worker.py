@@ -11,14 +11,13 @@ time — the pool provides concurrency by running several of these).
     <- {"id": 7, "ok": false, "kind": "download", "error": "..."}
 
 Why a long-lived process rather than one per extraction: importing yt_dlp
-pulls in its entire extractor registry and costs the best part of a second,
-and YoutubeDL caches the solved YouTube signature challenge on the
-extractor instance, which a fresh process would throw away every time. So
-the process is reused, and `options` is hashed to key a YoutubeDL instance
-per distinct configuration (the fast/fallback attempts in extraction.py
-differ in player_client and js_runtimes, and the radio-mix lookup differs
-again) — the same trick the thread backend plays with threading.local,
-except a hung one here can actually be killed.
+costs the best part of a second, and YoutubeDL caches the solved signature
+challenge on the extractor instance, which a fresh process would throw
+away every time. So the process is reused, and `options` is hashed to key
+a YoutubeDL instance per distinct configuration (fast/fallback attempts
+differ in player_client/js_runtimes, the radio-mix lookup differs again)
+— the same trick ThreadBackend plays with threading.local, except a hung
+one here can actually be killed.
 
 Three things this file has to get right because the parent can't fix them:
 

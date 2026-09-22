@@ -109,10 +109,9 @@ def _check_cookies_path_writable(raw: str, path: Path) -> None:
 
 
 # yt-dlp player_client names and whether each accepts cookie auth (mirrors
-# yt_dlp.extractor.youtube._base.INNERTUBE_CLIENTS[*]["SUPPORTS_COOKIES"]).
-# Hardcoded since that's a private yt-dlp module; re-verify against the
-# pinned yt-dlp version in requirements.txt if this needs updating.
-# Checked against yt-dlp==2026.08.19.
+# a private yt-dlp module's INNERTUBE_CLIENTS table) — hardcoded since it's
+# private API; re-verify against the pinned yt-dlp version if this needs
+# updating.
 _VALID_PLAYER_CLIENTS = {
     "web": True, "web_safari": True, "web_embedded": True, "web_music": True,
     "web_creator": True, "android": False, "android_vr": False, "ios": False,
@@ -236,10 +235,9 @@ def load_settings() -> Settings:
 
     player_client_raw = os.getenv("YTDLP_PLAYER_CLIENT", "").strip()
     if not player_client_raw and cookies_path is not None:
-        # yt-dlp's own default client list when cookies are set (verified
-        # against yt-dlp==2026.08.19) is ('web_embedded', 'tv_downgraded',
-        # 'web') — tv_downgraded has a known open bug (yt-dlp#17389). Pin
-        # to the other two already-default clients to avoid it.
+        # yt-dlp's default client list with cookies set includes
+        # tv_downgraded, which has a known open bug (yt-dlp#17389) — pin
+        # to the other two already-default clients instead.
         player_client_raw = "web_embedded,web"
     ytdlp_player_client = tuple(c.strip() for c in player_client_raw.split(",") if c.strip())
     _check_player_clients(ytdlp_player_client, cookies_configured=cookies_path is not None)

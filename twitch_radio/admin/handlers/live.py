@@ -68,10 +68,11 @@ async def handle_chat(request: web.Request) -> web.Response:
 
 
 async def handle_healthz(request: web.Request) -> web.Response:
-    """Unauthenticated on purpose (same exposure as /nowplaying.json; nothing
-    here is sensitive) — for an uptime monitor, or just checking the bot is
-    healthy without opening /settings. Resolve counts are since-process-start
-    rolling windows (telemetry.py), not persisted."""
+    """Unauthenticated on purpose (same exposure as /nowplaying.json;
+    nothing here is sensitive) — for an uptime monitor, or a quick health
+    check without opening /settings. Resolve counts are an in-memory
+    rolling window (telemetry.py) that resets on restart, not a
+    persisted log."""
     ctx = get_ctx(request)
     return web.json_response(
         {
@@ -162,15 +163,13 @@ async def handle_logo(request: web.Request) -> web.Response:
 
 
 async def handle_commands_page(request: web.Request) -> web.Response:
-    """Public, read-only command reference, linked from chat's !commands once
-    TWITCH_PUBLIC_BASE_URL is set — so reachable by every viewer, not just
-    moderators. That is why it is held to a higher bar than the other public
-    routes: a per-IP rate limit (it is the one page advertised to the whole
-    channel), plus headers that matter for a page anyone might open — a CSP
-    with frame-ancestors 'none' and legacy X-Frame-Options against framing,
-    nosniff, and no-referrer. It reads no body, query parameter or cookie, and
-    the page itself is static output built once at startup, so beyond those
-    there is nothing here for an attacker to act on."""
+    """Public, read-only command reference, linked from chat's !commands
+    once TWITCH_PUBLIC_BASE_URL is set — reachable by every viewer, not
+    just moderators, so it's held to a higher bar than the other public
+    routes: a per-IP rate limit (the one page advertised to the whole
+    channel) plus anti-framing/no-referrer headers. It reads no body,
+    query param or cookie, and the page is static output built once at
+    startup — nothing here for an attacker to act on beyond that."""
     ctx = get_ctx(request)
     if not ctx.commands_limiter.allow(client_ip(request)):
         return web.Response(status=429, text="Too many requests — try again in a minute.")

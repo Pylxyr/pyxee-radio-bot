@@ -1,24 +1,24 @@
 <!doctype html>
 <html><head><meta charset="utf-8">
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   * { box-sizing: border-box; }
   html, body { margin: 0; background: transparent; }
   body {
-    font-family: "Sora", -apple-system, "Segoe UI", sans-serif;
+    font-family: "IBM Plex Sans", -apple-system, "Segoe UI", sans-serif;
     color: #F3F1EA;
     display: flex; align-items: flex-end; justify-content: flex-start;
     height: 100vh; padding: 20px;
   }
   .panel {
     width: 420px; padding: 14px 18px;
-    background: var(--panel-bg, rgba(15, 17, 23));
-    border-radius: 16px;
+    background: var(--panel-bg, rgba(15, 14, 20));
+    border-radius: 14px;
     backdrop-filter: blur(6px);
     box-shadow: 0 8px 24px rgba(0,0,0,0.35);
-    --accent-primary: #E8A33D;
-    --accent-secondary: #E85D75;
+    --accent-primary: #9146FF;
+    --accent-secondary: #FF9D42;
     transition: background 0.5s ease;
     overflow: hidden;
   }
@@ -67,6 +67,7 @@
   }
   .info { min-width: 0; flex: 1; }
   .title {
+    font-family: "Space Grotesk", -apple-system, "Segoe UI", sans-serif;
     font-weight: 700; font-size: 15px; white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis;
     transition: opacity 0.25s ease;
@@ -111,9 +112,9 @@ function fmt(s) {
   return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
 }
 
-const DEFAULT_PRIMARY = [232, 163, 61];    // #E8A33D
-const DEFAULT_SECONDARY = [232, 93, 117];  // #E85D75
-const PANEL_BASE = [15, 17, 23];           // matches .panel's default rgba(15,17,23,...) base
+const DEFAULT_PRIMARY = [145, 70, 255];    // #9146FF
+const DEFAULT_SECONDARY = [255, 157, 66];  // #FF9D42
+const PANEL_BASE = [15, 14, 20];           // matches .panel's default rgba(15,14,20,...) base
 
 function rgbStr(c) { return `rgb(${c[0]},${c[1]},${c[2]})`; }
 function rgbaStr(c, a) { return `rgba(${c[0]},${c[1]},${c[2]},${a})`; }
