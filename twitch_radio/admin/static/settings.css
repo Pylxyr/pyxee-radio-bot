@@ -58,12 +58,6 @@ h1 {
   background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
   display: inline-flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums;
 }
-.chip.state-playing { color: var(--ok); border-color: rgba(51, 214, 144, 0.35); }
-.chip.state-playing::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--ok); animation: pulse 1.6s ease-in-out infinite; }
-.chip.state-resolving { color: var(--accent); border-color: rgba(145, 70, 255, 0.4); }
-.chip.state-paused { color: var(--live); border-color: rgba(255, 157, 66, 0.4); }
-@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
-.chip-np { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-family: var(--font-body); }
 main { max-width: 900px; margin: 0 auto; padding: 14px 20px 96px; }
 .banner {
   padding: 12px 14px; border-radius: 8px; margin: 14px 0 20px;
@@ -166,33 +160,6 @@ table.info td { padding: 8px 4px; border-bottom: 1px solid var(--line); }
 table.info tr:last-child td { border-bottom: 0; }
 table.info td:first-child { color: var(--muted); width: 45%; }
 
-/* -- Now Playing (realtime, see settings.js) — the page's hero card ------ */
-.live-card {
-  position: relative; padding-left: 25px; overflow: hidden;
-  background: linear-gradient(155deg, rgba(145, 70, 255, 0.07), var(--panel) 55%);
-}
-.live-card::before {
-  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
-  background: linear-gradient(to bottom, var(--accent), var(--live));
-}
-.np-track { margin: 14px 0 4px; }
-.np-title { font-family: var(--font-display); font-size: 18px; font-weight: 600; letter-spacing: -0.01em; }
-.np-meta { margin: 4px 0 14px; font-size: 13px; color: var(--muted); }
-.np-bar {
-  height: 5px; border-radius: 3px; background: var(--panel-2);
-  border: 1px solid var(--line); overflow: hidden;
-}
-.np-fill {
-  height: 100%; background: linear-gradient(to right, var(--accent), var(--live));
-  border-radius: 3px; transition: width 0.25s linear;
-}
-.np-time {
-  display: flex; justify-content: space-between; margin-top: 7px;
-  font-family: var(--font-mono); font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums;
-}
-#np-body .leaderboard { margin-top: 4px; }
-#np-body .leaderboard .pts { font-weight: 400; font-size: 12px; color: var(--muted); }
-
 /* -- Commands reference --------------------------------------------------- */
 .cmd-list { display: flex; flex-direction: column; gap: 2px; margin-top: 14px; }
 .cmd-row { padding: 10px 4px; border-bottom: 1px solid var(--line); }
@@ -205,7 +172,6 @@ table.info td:first-child { color: var(--muted); width: 45%; }
   .masthead { padding-top: 24px; }
   .chips { width: 100%; }
   .card { padding: 18px 16px 20px; }
-  .live-card { padding-left: 21px; }
 }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }

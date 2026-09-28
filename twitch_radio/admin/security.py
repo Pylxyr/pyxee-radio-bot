@@ -1,17 +1,16 @@
 """Security helpers for the admin server that need nothing but the stdlib.
 
 Everything here is a plain function or class with no aiohttp dependency, so
-the rules that actually protect /settings and /thumb-proxy live in one small
-module that can be read (and reasoned about) on its own instead of being
-spread through the request handlers.
+the rules that actually protect /settings live in one small module that can
+be read (and reasoned about) on its own instead of being spread through the
+request handlers.
 """
 
 from __future__ import annotations
 
-import re
 import time
 from collections.abc import Callable
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlsplit
 
 # ---------------------------------------------------------------------------
 # Login redirects and CSRF
@@ -168,8 +167,8 @@ class AuthRateLimiter:
 class RequestRateLimiter:
     """Plain per-key throttle with no lockout escalation, for public routes
     where there's no secret to brute-force and the goal is just to stop one
-    client turning a cheap page into load on the process that also serves the
-    audio stream. allow() says yes or no for *this* request."""
+    client turning a cheap page into load on the rest of the process.
+    allow() says yes or no for *this* request."""
 
     def __init__(
         self,
@@ -186,63 +185,3 @@ class RequestRateLimiter:
             return False
         self._hits.add(key)
         return True
-
-
-# ---------------------------------------------------------------------------
-# /thumb-proxy URL validation
-# ---------------------------------------------------------------------------
-
-# Hostnames /thumb-proxy will fetch from: YouTube's thumbnail CDN (ytimg.com),
-# YouTube channel/avatar images (ggpht.com, googleusercontent.com — yt-dlp
-# occasionally surfaces these as a video's "thumbnail"), and SoundCloud's
-# artwork CDN (sndcdn.com). Suffix-matched: host == suffix or a subdomain of it.
-THUMB_HOST_SUFFIXES = ("ytimg.com", "ggpht.com", "googleusercontent.com", "sndcdn.com")
-
-_MAX_THUMB_URL_LENGTH = 2048
-_DNS_HOST = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+")
-
-
-def is_allowed_thumb_host(host: str) -> bool:
-    host = host.lower()
-    return any(host == suffix or host.endswith("." + suffix) for suffix in THUMB_HOST_SUFFIXES)
-
-
-def validate_thumb_url(url: str) -> str | None:
-    """Return `url` unchanged if it is safe to fetch, else None.
-
-    The allowlist is only meaningful if the host we *validate* is the host the
-    HTTP client *connects to*. Two different URL parsers (urllib here, yarl
-    inside aiohttp) can disagree about odd input — backslashes, userinfo
-    (`https://evil@ytimg.com`), embedded control characters — which is the
-    classic way to slip past a host check. So instead of trusting them to
-    agree, refuse anything unusual outright: printable ASCII only, no
-    backslash, no userinfo, only default web ports, and a plain DNS-style
-    hostname. What's left parses the same everywhere.
-    """
-    if not url or len(url) > _MAX_THUMB_URL_LENGTH:
-        return None
-    if any(ord(ch) <= 0x20 or ord(ch) >= 0x7F or ch == "\\" for ch in url):
-        return None
-    try:
-        parts = urlsplit(url)
-        port = parts.port
-    except ValueError:
-        return None
-    if parts.scheme not in ("http", "https") or "@" in parts.netloc:
-        return None
-    if port not in (None, 80, 443):
-        return None
-    host = parts.hostname or ""
-    if not _DNS_HOST.fullmatch(host) or not is_allowed_thumb_host(host):
-        return None
-    return url
-
-
-def resolve_thumb_redirect(current_url: str, location: str) -> str | None:
-    """Validate a redirect hop before following it (None = refuse). Redirects
-    are followed manually, one validated hop at a time, because an HTTP
-    client's automatic redirect-following would happily carry an allowlisted
-    host's response to any address — including this machine's own network."""
-    if not location or any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in location):
-        return None
-    return validate_thumb_url(urljoin(current_url, location))

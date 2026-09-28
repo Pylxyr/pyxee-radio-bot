@@ -26,7 +26,7 @@ class JsonStore:
     message would cost a lock acquisition, a thread-pool dispatch and a
     json.load() to re-answer "are the filters on?". A stat() is cheap
     enough to do inline, and unlike a time-based cache it still picks up
-    a hand-edited tunables.json/blocklist.json immediately.
+    a hand-edited tunables.json immediately.
     """
 
     def __init__(self, path: Path) -> None:
@@ -59,10 +59,9 @@ class JsonStore:
             key = self._stat_key()
             if self._cache is not None and key == self._cache_key:
                 # Shallow copy: callers treat the result as read-only and
-                # build new containers for any mutation (see blocklist.py's
-                # add_*/remove_* helpers), but handing out the cached dict
-                # itself would make an accidental in-place edit stick
-                # invisibly until the next file change.
+                # build new containers for any mutation, but handing out
+                # the cached dict itself would make an accidental in-place
+                # edit stick invisibly until the next file change.
                 return dict(self._cache)
             data = await asyncio.to_thread(self._read_sync)
             self._cache = data

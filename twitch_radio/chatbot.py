@@ -1,6 +1,5 @@
-"""Twitch chat bot — wires up song requests, moderation, info, and viewer
-engagement commands (split across twitch_radio/components/*) and hands
-resolved song requests to the radio player.
+"""Twitch chat bot — wires up moderation, info, and viewer engagement
+commands (split across twitch_radio/components/*).
 
 Built against twitchio 3.x's EventSub-based Bot (not the old IRC-token
 pattern from twitchio 2.x).
@@ -65,7 +64,6 @@ import json
 import logging
 import re
 import time
-from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -79,13 +77,10 @@ from twitch_radio.components.engagement import EngagementComponent
 from twitch_radio.components.info import InfoComponent
 from twitch_radio.components.moderation import ModerationComponent
 from twitch_radio.components.moderation import USAGE as _MODERATION_USAGE
-from twitch_radio.components.song_requests import SongRequestComponent
-from twitch_radio.components.song_requests import USAGE as _SONG_REQUEST_USAGE
 from twitch_radio.components.stream_info import StreamInfoComponent
 from twitch_radio.cooldown import CooldownTracker
 from twitch_radio.db import Database
 from twitch_radio.emotes import EmoteService
-from twitch_radio.player import RadioPlayer
 from twitch_radio.store import JsonStore
 from twitch_radio.toggles import FeatureToggles
 from twitch_radio.tunables import TwitchTunables
@@ -95,15 +90,11 @@ if TYPE_CHECKING:
     from twitchio.authentication import ValidateTokenPayload
     from twitchio.payloads import TokenRefreshedPayload
 
-    from twitch_radio.extraction import Resolver
-
 log = logging.getLogger(__name__)
 
 # Per-command usage strings for event_command_error's MissingRequiredArgument
-# handler below. Keyed by canonical command name, not alias — ctx.command.name
-# always resolves to the canonical name even when invoked via an alias like
-# !songrequest.
-_USAGE = {**_SONG_REQUEST_USAGE, **_MODERATION_USAGE}
+# handler below. Keyed by canonical command name, not alias.
+_USAGE = dict(_MODERATION_USAGE)
 
 # Twitch silently drops a chat message byte-identical to one this account
 # sent recently — a real server-side rolling window, not just "the last
@@ -153,10 +144,7 @@ class TwitchChatBot(commands.Bot):
         prefix: str,
         public_base_url: str | None,
         chat_feed: ChatFeed,
-        resolver: Resolver,
-        player: RadioPlayer,
         tunables_store: JsonStore,
-        blocklist_store: JsonStore,
         specs_store: JsonStore,
         toggles_store: JsonStore,
         db: Database,
@@ -170,8 +158,6 @@ class TwitchChatBot(commands.Bot):
             owner_id=owner_id,
             prefix=prefix,
         )
-        self.resolver = resolver.resolve
-        self.player = player
         self.chat_feed = chat_feed
         # 7TV/BTTV/FFZ emotes and cheermotes for the chat overlay; started in
         # setup_hook once Twitch API access exists (cheermotes need it).
@@ -182,7 +168,6 @@ class TwitchChatBot(commands.Bot):
         )
         self._emotes_task: asyncio.Task[None] | None = None
         self.tunables_store = tunables_store
-        self.blocklist_store = blocklist_store
         self.specs_store = specs_store
         self.toggles_store = toggles_store
         self.db = db
@@ -199,22 +184,6 @@ class TwitchChatBot(commands.Bot):
         # and event_token_refreshed() below for what actually triggers
         # save_tokens() live, not just at shutdown).
         self._chat_subscribed = False
-        # Per-chatter state — deliberately in-memory only: losing cooldown/
-        # pending tracking across a restart is harmless, and persisting it
-        # would add complexity for no real benefit.
-        self.last_request_at: dict[str, float] = {}
-        self.pending_by_chatter: Counter[str] = Counter()
-        # Tracks each chatter's in-flight !sr query (case-folded) so a
-        # repeat while it's still resolving gets a distinct reply instead of
-        # a second full resolve — without this, Twitch's dedup rule would
-        # silently drop the identical "Looking up '...'…" and a double-tap
-        # would look ignored while quietly redoing the whole round trip.
-        # Cleared in _resolve_and_queue's finally.
-        self.inflight_query_by_chatter: dict[str, str] = {}
-        # Strong references to in-flight _resolve_and_queue() tasks —
-        # without this, asyncio can garbage-collect a fire-and-forget task
-        # mid-flight. Entries remove themselves via add_done_callback.
-        self.background_tasks: set[asyncio.Task[None]] = set()
         # Round-robins through _DEDUP_SUFFIXES on every safe_reply call —
         # shared across every component (not one counter each) so replies
         # from different commands still can't collide on Twitch's dedup
@@ -403,7 +372,6 @@ class TwitchChatBot(commands.Bot):
         return users[0].id if users else None
 
     async def setup_hook(self) -> None:
-        await self.add_component(SongRequestComponent(self))
         await self.add_component(ModerationComponent(self))
         await self.add_component(InfoComponent(self))
         await self.add_component(EngagementComponent(self))
@@ -454,10 +422,10 @@ class TwitchChatBot(commands.Bot):
         log.info("Twitch chat bot ready (bot_id=%s).", self._bot_id)
 
     async def announce(self, message: str) -> None:
-        """Sends a message to the broadcaster's channel — used by RadioPlayer
-        to tell chat about a track it had to drop, and by the moderation
-        filter below (no command Context to reply() from there). Not tied
-        to a Context, so this goes through PartialUser.send_message directly."""
+        """Sends a message to the broadcaster's channel — used by the
+        moderation filter below (no command Context to reply() from there).
+        Not tied to a Context, so this goes through PartialUser.send_message
+        directly."""
         channel = self.create_partialuser(user_id=self.owner_id_required)
         text = self._decorate(message)
         try:
@@ -471,13 +439,9 @@ class TwitchChatBot(commands.Bot):
     async def safe_reply(self, ctx: commands.Context, message: str) -> None:
         """ctx.reply() that swallows Twitch's delivery failures (rate limit,
         exact-duplicate-message rule — both TwitchioException) instead of
-        letting them propagate.
-
-        Matters most for !sr's first reply: it runs before
-        _resolve_and_queue's own try/except exists, so an uncaught failure
-        there silently kills the whole request — no queue, no error,
-        nothing. Two chatters requesting the same playing song back to
-        back hits this normally, not just rapid self-testing.
+        letting them propagate. Two chatters triggering the same reply back
+        to back hits the duplicate-message rule normally, not just rapid
+        self-testing.
 
         Every message gets a rotating suffix (_DEDUP_SUFFIXES) unconditionally
         before delivery — Twitch's own dedup window isn't something this
@@ -668,11 +632,10 @@ class TwitchChatBot(commands.Bot):
             await self.safe_reply(ctx, "You don't have permission to use that command.")
             return
         if isinstance(exc, commands.MissingRequiredArgument):
-            # ctx.command.name is the canonical name even via an alias (e.g.
-            # !songrequest resolves to "sr").
-            name = ctx.command.name if ctx.command is not None else "sr"
-            usage = _USAGE.get(name, _USAGE["sr"])
-            await self.safe_reply(ctx, usage)
+            # ctx.command.name is the canonical name even via an alias.
+            name = ctx.command.name if ctx.command is not None else None
+            usage = _USAGE.get(name) if name else None
+            await self.safe_reply(ctx, usage or f"Missing an argument for !{name or 'that command'}.")
             return
         log.error("Command error in %r: %r", getattr(ctx, "content", "<unknown>"), exc, exc_info=exc)
 

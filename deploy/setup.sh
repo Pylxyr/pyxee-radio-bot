@@ -303,9 +303,9 @@ echo ""
 
 # SUDO_USER is only set when this was actually invoked via `sudo`. Run as a
 # root shell directly (common on minimal VPS/container images) and whoami
-# falls back to "root" silently — installing a systemd unit that runs
-# ffmpeg and the yt-dlp JS runtime, both consuming untrusted URLs from chat,
-# as User=root. Require an explicit opt-in for that instead of guessing.
+# falls back to "root" silently — installing a systemd unit that reads
+# untrusted chat messages as User=root. Require an explicit opt-in for that
+# instead of guessing.
 if [[ "${SERVICE_USER}" == "root" && -z "${SUDO_USER:-}" ]]; then
   if [[ "${ALLOW_ROOT:-}" != "1" ]]; then
     error "Running as root with no SUDO_USER — this would install the service as User=root."
@@ -317,71 +317,23 @@ if [[ "${SERVICE_USER}" == "root" && -z "${SUDO_USER:-}" ]]; then
   warn "Proceeding as root (ALLOW_ROOT=1) — the service will run as User=root."
 fi
 
-echo "[1/8] Installing system packages"
+echo "[1/7] Installing system packages"
 sudo apt update
-sudo apt install -y python3 python3-venv ffmpeg logrotate curl unzip openssl
+sudo apt install -y python3 python3-venv logrotate curl unzip openssl
 
-echo "[2/8] Installing a JS runtime for yt-dlp (Deno)"
-# yt-dlp needs an external JS runtime to solve YouTube's JS challenges as of
-# the version pinned in requirements.txt. Installed system-wide to
-# /usr/local/bin so it's on PATH for the systemd unit too (that unit sets an
-# explicit PATH that doesn't include a per-user ~/.deno/bin).
-if command -v deno >/dev/null 2>&1; then
-  info "Deno already installed ($(deno --version | head -n1)) — skipping."
-else
-  # install.sh takes zero flags — it's already fully non-interactive. Its
-  # only optional argument is a specific version tag; passing anything else
-  # gets treated as that tag and 404s.
-  if curl -fsSL https://deno.land/install.sh | sudo DENO_INSTALL=/usr/local sh >/dev/null 2>&1; then
-    success "Deno installed to /usr/local/bin."
-  else
-    warn "Deno install failed — yt-dlp will fall back to degraded YouTube support." \
-         "Install manually later: https://docs.deno.com/runtime/getting_started/installation/"
-  fi
-fi
+echo "[2/7] Preparing app directories"
+mkdir -p "${APP_DIR}/data" "${APP_DIR}/logs"
 
-# Optional: quickjs-ng, a much lighter JS runtime than Deno (no JIT/V8 to
-# start up). twitch_radio/extraction.py tries it first for every resolve
-# (falling back to Deno automatically if it's missing or fails), since
-# Deno's per-request cost here is dominated by process-spawn + interpreter
-# startup, not actual computation — exactly where a JIT buys nothing. Purely
-# an optimization: everything works with only Deno installed, just slower.
-# Static binary, no package manager needed.
-if command -v qjs >/dev/null 2>&1; then
-  info "quickjs-ng already installed ($(qjs --help 2>&1 | head -n1)) — skipping."
-else
-  case "$(uname -m)" in
-    x86_64)          qjs_asset="qjs-linux-x86_64" ;;
-    aarch64|arm64)   qjs_asset="qjs-linux-aarch64" ;;
-    *)                qjs_asset="" ;;
-  esac
-  if [[ -z "${qjs_asset}" ]]; then
-    warn "No prebuilt quickjs-ng binary for this architecture ($(uname -m)) — not required, the bot will keep using Deno." \
-         "Manual builds: https://github.com/quickjs-ng/quickjs/releases"
-  elif curl -fsSL -o /tmp/qjs "https://github.com/quickjs-ng/quickjs/releases/latest/download/${qjs_asset}" \
-     && sudo install -m 755 /tmp/qjs /usr/local/bin/qjs; then
-    rm -f /tmp/qjs
-    success "quickjs-ng installed to /usr/local/bin ($(qjs --help 2>&1 | head -n1))."
-  else
-    rm -f /tmp/qjs
-    warn "quickjs-ng install failed — not required, the bot will keep using Deno." \
-         "Install manually later if you want the speedup: https://github.com/quickjs-ng/quickjs/releases"
-  fi
-fi
-
-echo "[3/8] Preparing app directories"
-mkdir -p "${APP_DIR}/data" "${APP_DIR}/logs" "${APP_DIR}/data/deno-cache"
-
-echo "[4/8] Creating virtual environment"
+echo "[3/7] Creating virtual environment"
 if [[ ! -d "${APP_DIR}/.venv" ]]; then
   python3 -m venv "${APP_DIR}/.venv"
 fi
 
-echo "[5/8] Installing Python dependencies"
+echo "[4/7] Installing Python dependencies"
 "${APP_DIR}/.venv/bin/pip" install --upgrade pip -q
 "${APP_DIR}/.venv/bin/pip" install -r "${APP_DIR}/requirements.txt" -q
 
-echo "[6/8] Environment file"
+echo "[5/7] Environment file"
 if [[ -f "${ENV_PATH}" ]]; then
   info "Found an existing ${ENV_PATH} — keeping it, only filling in anything still blank below."
   chmod 600 "${ENV_PATH}" 2>/dev/null || true
@@ -444,18 +396,12 @@ else
   echo "─────────────────────────────────────────────────────────────"
 
   echo ""
-  echo "${CYAN}-- Chat & audio --${RESET}"
+  echo "${CYAN}-- Chat --${RESET}"
   prompt_optional_field TWITCH_PREFIX "!" 0 0 \
-    "— Command prefix in chat (!sr, !skip, ...)."
-  prompt_optional_field AUDIO_BITRATE_KBPS "128" 0 1 \
-    "— MP3 bitrate for /stream.mp3 (64-320). Raise it if it sounds thin."
-  prompt_optional_field PAUSE_QUEUE_WHEN_NO_LISTENERS "false" 0 0 \
-    "— true/false. If true, holds off starting the next track while" \
-    "    nobody's connected to /stream.mp3, and resumes on its own once" \
-    "    someone (re)connects. A track already playing always finishes."
+    "— Command prefix in chat (!points, !leaderboard, ...)."
 
   echo ""
-  echo "${CYAN}-- HTTP surface (/stream.mp3, /overlay, /settings) --${RESET}"
+  echo "${CYAN}-- HTTP surface (/commands, /chat-overlay, /settings) --${RESET}"
   if [[ -n "$(get_env_var "TWITCH_NOWPLAYING_HOST" "${ENV_PATH}")" ]]; then
     info "TWITCH_NOWPLAYING_HOST is already set — leaving it alone."
     prompt_optional_field TWITCH_NOWPLAYING_PORT "8098" 0 1 \
@@ -471,8 +417,9 @@ else
 
     echo ""
     echo "${CYAN}Caddy (automatic HTTPS)${RESET}"
-    echo "  Needed if OBS runs on another machine, or so viewers can open the"
-    echo "  /commands page. Skip it if OBS runs on this machine."
+    echo "  Needed so viewers can open the /commands or /chat-overlay pages from"
+    echo "  outside this machine. Skip it if nothing needs to reach the bot"
+    echo "  remotely."
     default_caddy="n"
     if detect_cloud_vm; then
       default_caddy="y"
@@ -497,64 +444,6 @@ else
     "— Under data/. No reason to change unless running >1 instance from one data/."
   prompt_optional_field TWITCH_TUNABLES_FILE "tunables.json" 0 0 \
     "— Same as above, for the /settings tunables."
-  prompt_optional_field TWITCH_BLOCKLIST_FILE "blocklist.json" 0 0 \
-    "— Same as above, for the !block/!unblock moderation list."
-
-  echo ""
-  echo "${CYAN}-- yt-dlp --${RESET}"
-  if detect_cloud_vm; then
-    warn "This looks like a cloud/datacenter VM (a metadata service answered"
-    warn "at 169.254.169.254). YouTube commonly blocks plain requests from"
-    warn "datacenter IPs outright — expect !sr to fail with \"Sign in to"
-    warn "confirm you're not a bot\" without cookies set up below."
-    cookies_desc=(
-      "— Detected as likely needed (see warning above). A REAL cookies.txt"
-      "    from a logged-in browser session — export one now if you have a"
-      "    browser handy (private/incognito window, log into YouTube,"
-      "    export with a browser extension), or leave blank and come back"
-      "    once !sr actually fails (empty/placeholder file makes things"
-      "    worse, not better). MUST be a path under data/ (e.g."
-      "    data/cookies.txt) — anywhere else crashes every !sr (read-only"
-      "    fs under this service's sandbox)."
-    )
-  else
-    cookies_desc=(
-      "— Leave blank on a residential connection. On a cloud VM, YouTube"
-      "    often blocks anonymous requests ('Sign in to confirm you're not a"
-      "    bot') and this is the simplest fix — a REAL cookies.txt from a"
-      "    logged-in browser session (empty/placeholder makes it worse). MUST"
-      "    be a path under data/ (e.g. data/cookies.txt) — anywhere else"
-      "    crashes every !sr (read-only fs under this service's sandbox)."
-    )
-  fi
-  prompt_optional_field YTDLP_COOKIES_FILE "" 0 0 "${cookies_desc[@]}"
-  prompt_optional_field YTDLP_POT_PROVIDER_URL "" 0 0 \
-    "— Advanced, cloud-VM alternative to cookies: URL of a local bgutil-" \
-    "    ytdlp-pot-provider instance (see README) if you've set one up." \
-    "    Leave blank if you haven't — not required."
-  prompt_optional_field YTDLP_JS_RUNTIME_PATH "" 0 0 \
-    "— Advanced: pin a specific JS runtime binary. Leave blank to auto-detect" \
-    "    the Deno install this script just did." \
-    "    Switching YTDLP_JS_RUNTIME_NAME to node instead? It needs Node >=22 —" \
-    "    Ubuntu's own apt nodejs package is almost always older than that." \
-    "    Use https://github.com/nodesource/distributions or nvm, not apt."
-  prompt_optional_field YTDLP_JS_RUNTIME_NAME "deno" 0 0 \
-    "— Only matters if YTDLP_JS_RUNTIME_PATH above is set."
-  prompt_optional_field YTDLP_PLAYER_CLIENT "" 0 0 \
-    "— Advanced: comma-separated yt-dlp YouTube player_client override." \
-    "    Leave blank for the built-in default (web_embedded,web when" \
-    "    cookies are set, to dodge a currently-broken fallback client —" \
-    "    see the README's yt-dlp note — otherwise yt-dlp's own default)." \
-    "    YouTube changes what works here often; check" \
-    "    https://github.com/yt-dlp/yt-dlp/wiki/EJS if requests start failing."
-  prompt_optional_field YTDLP_CACHE_TTL_SECONDS "300" 0 1 \
-    "— Seconds a resolved song is reused instead of re-running yt-dlp (0-3600)." \
-    "    Cuts the usual double-extraction (once in chat, again right before" \
-    "    it plays) for anything near the front of the queue. 0 disables it."
-  prompt_optional_field YTDLP_CONCURRENCY "2" 0 1 \
-    "— Concurrent yt-dlp extractions (1-4). Raise if !sr gets busy."
-  prompt_optional_field YTDLP_EXTRACT_TIMEOUT_SECONDS "45" 0 1 \
-    "— Seconds before giving up on a single resolve (10-120)."
 
   echo ""
   echo "${CYAN}-- Logging --${RESET}"
@@ -565,7 +454,7 @@ else
   echo ""
 fi
 
-echo "[7/8] Installing logrotate config and systemd unit"
+echo "[6/7] Installing logrotate config and systemd unit"
 # Template the path/user instead of installing verbatim — otherwise a custom
 # APP_DIR/SERVICE_USER silently doesn't take effect here even though the
 # rest of the install honors it.
@@ -579,7 +468,7 @@ sed \
 sudo systemctl daemon-reload
 success "Installed /etc/systemd/system/${SERVICE_NAME}.service (not started yet)."
 
-echo "[8/8] Caddy"
+echo "[7/7] Caddy"
 caddy_ok=0
 bot_port="$(get_env_var TWITCH_NOWPLAYING_PORT "${ENV_PATH}")"
 bot_port="${bot_port:-8098}"
@@ -633,12 +522,12 @@ echo "   logged-in session for both silently authorizes the same account"
 echo "   twice. Watch step 5's logs right after starting to catch that."
 echo ""
 if [[ "${caddy_ok}" -eq 1 ]]; then
-  echo "4. In OBS, add a Media Source pointed at https://${SITE_ADDRESS}/stream.mp3 and"
-  echo "   (optionally) a Browser Source pointed at https://${SITE_ADDRESS}/overlay."
+  echo "4. Viewers can browse commands at https://${SITE_ADDRESS}/commands, and (optionally)"
+  echo "   add a Browser Source in OBS pointed at https://${SITE_ADDRESS}/chat-overlay."
   echo "   Sign in to settings at https://${SITE_ADDRESS}/login."
 else
-  echo "4. In OBS, add a Media Source pointed at http://127.0.0.1:${bot_port}/stream.mp3 and"
-  echo "   (optionally) a Browser Source pointed at /overlay — see README.md."
+  echo "4. Commands page: http://127.0.0.1:${bot_port}/commands"
+  echo "   (optionally) add a Browser Source in OBS pointed at /chat-overlay — see README.md."
 fi
 echo ""
 echo "5. journalctl -u ${SERVICE_NAME} -f -o cat    — watch it come up"

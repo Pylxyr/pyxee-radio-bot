@@ -1,4 +1,4 @@
-"""Access control for the gated routes (/settings, /blocklist.json)."""
+"""Access control for the gated /settings route."""
 
 from __future__ import annotations
 

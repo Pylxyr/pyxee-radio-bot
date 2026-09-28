@@ -1,6 +1,6 @@
 """Front-end files and the logo, read from disk once and cached.
 
-The overlay pages, CSS, JS and HTML templates live as real files under
+The overlay page, CSS, JS and HTML templates live as real files under
 static/ (rather than as multi-hundred-line string constants in Python), so
 they get proper editor support and the Python side only deals with logic.
 """
@@ -23,7 +23,6 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 LOGO_DIR = BASE_DIR / "assets"
 
 STATIC_FILES = (
-    "overlay.html",
     "chat_overlay.html",
     "settings.html",
     "settings.css",

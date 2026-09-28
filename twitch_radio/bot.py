@@ -7,16 +7,11 @@ import signal
 
 from twitch_radio.admin.app import run_admin_server
 from twitch_radio.admin.passwords import is_password_hash
-from twitch_radio.player import RadioPlayer
 from twitch_radio.chatbot import TwitchChatBot
 from twitch_radio.chatfeed import ChatFeed
 from twitch_radio.config import Settings, load_settings
 from twitch_radio.db import Database
-from twitch_radio.extraction import Resolver
-from twitch_radio.radio import RadioSuggester
 from twitch_radio.store import JsonStore
-from twitch_radio.toggles import FeatureToggles
-from twitch_radio.tunables import TwitchTunables
 
 _bg_tasks: set[asyncio.Task[object]] = set()
 
@@ -34,7 +29,6 @@ def configure_logging(settings: Settings) -> None:
         root.addHandler(h)
     root.setLevel(settings.log_level)
     logging.getLogger("twitchio").setLevel(logging.WARNING)
-    logging.getLogger("yt_dlp").setLevel(logging.WARNING)
     logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 
 
@@ -42,60 +36,29 @@ async def _async_run(settings: Settings) -> None:
     configure_logging(settings)
     log = logging.getLogger(__name__)
 
-    resolver = Resolver(settings)
     tunables_store = JsonStore(settings.tunables_path)
-    blocklist_store = JsonStore(settings.blocklist_path)
     specs_store = JsonStore(settings.specs_path)
     toggles_store = JsonStore(settings.toggles_path)
     db = Database(settings.db_path)
     await db.connect()
     # Shared between the chat bot (appends every non-bot message — see
     # chatbot.py's _track_and_filter) and the admin server (/chat-overlay,
-    # /chat.json, /ws/chat) — same idea as sharing `player` between the two
-    # for now-playing state.
+    # /chat.json, /ws/chat).
     chat_feed = ChatFeed()
 
-    # Fire-and-forget: warms up yt-dlp's worker threads (and, once cached,
-    # persists across restarts too) before the first real !sr arrives. Never
-    # awaited inline — must not delay startup — and warm_up() is non-fatal
-    # on failure, so this is pure upside.
-    warmup_task = asyncio.create_task(resolver.warm_up(), name="resolver-warmup")
-    _bg_tasks.add(warmup_task)
-    warmup_task.add_done_callback(_bg_tasks.discard)
-
-    player = RadioPlayer(
-        resolver=resolver.resolve,
-        audio_bitrate_kbps=settings.audio_bitrate_kbps,
-        pause_when_no_listeners=settings.pause_when_no_listeners,
-        prefetch_enabled=settings.ytdlp_cache_ttl_seconds > 0,
-    )
-    radio_suggester = RadioSuggester(resolver, blocklist_store)
-    player.set_radio_suggester(radio_suggester.suggest)
-
-    async def _radio_enabled() -> bool:
-        toggles = FeatureToggles.from_dict(await toggles_store.read())
-        return toggles.radio_autoplay_enabled
-
-    player.set_radio_enabled_getter(_radio_enabled)
     # Nested try/finally per resource (not one big try around just the chat
     # bot) so a failure acquiring a *later* resource still tears down
     # everything already acquired.
-    player.start()
     try:
         admin_runner = await run_admin_server(
-            player=player,
             chat_feed=chat_feed,
             tunables_store=tunables_store,
-            blocklist_store=blocklist_store,
             specs_store=specs_store,
             toggles_store=toggles_store,
             db=db,
             settings_password=settings.settings_password,
             broadcast_info={
-                "Audio stream": "/stream.mp3",
-                "Overlay": "/overlay",
                 "Chat overlay": "/chat-overlay",
-                "Audio bitrate": f"{settings.audio_bitrate_kbps} kbps",
                 "Chat command prefix": settings.prefix,
             },
             host=settings.nowplaying_host,
@@ -112,11 +75,8 @@ async def _async_run(settings: Settings) -> None:
                 bot_id=settings.bot_id,
                 owner_id=settings.owner_id,
                 prefix=settings.prefix,
-                resolver=resolver,
-                player=player,
                 chat_feed=chat_feed,
                 tunables_store=tunables_store,
-                blocklist_store=blocklist_store,
                 specs_store=specs_store,
                 toggles_store=toggles_store,
                 db=db,
@@ -124,13 +84,6 @@ async def _async_run(settings: Settings) -> None:
                 public_base_url=settings.public_base_url,
                 emote_sources=settings.chat_emote_sources,
             )
-            player.set_track_failure_notifier(bot.announce)
-
-            async def _duration_limit() -> int:
-                tunables = TwitchTunables.from_dict(await tunables_store.read())
-                return tunables.max_request_duration_seconds
-
-            player.set_duration_limit_getter(_duration_limit)
 
             loop = asyncio.get_running_loop()
 
@@ -160,18 +113,9 @@ async def _async_run(settings: Settings) -> None:
             await admin_runner.cleanup()
     finally:
         # Reverse of setup order: the HTTP surface is already down (inner
-        # finally above), so nothing can still be serving a request
-        # against the player/database — see TwitchChatBot.close()'s
-        # docstring for why it doesn't close the database itself.
-        if not warmup_task.done():
-            warmup_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await warmup_task
-        await player.stop()
-        # Async now: with YTDLP_WORKER_MODE=process this reaps the extraction
-        # child processes, and leaving those orphaned would keep a wedged
-        # yt-dlp/Deno alive past the service stopping.
-        await resolver.aclose()
+        # finally above), so nothing can still be serving a request against
+        # the database — see TwitchChatBot.close()'s docstring for why it
+        # doesn't close the database itself.
         await db.close()
 
 
@@ -192,7 +136,7 @@ def run() -> None:
     parser.add_argument(
         "--check-config",
         action="store_true",
-        help="Validate .env and exit — doesn't start the bot, spawn ffmpeg, or touch Twitch/yt-dlp.",
+        help="Validate .env and exit — doesn't start the bot or touch Twitch.",
     )
     parser.add_argument(
         "--hash-password",
@@ -229,22 +173,15 @@ def _hash_password() -> int:
 
 
 def _check_config() -> int:
-    import shutil
-
     try:
         settings = load_settings()
     except RuntimeError as exc:
         print(f"Config check FAILED: {exc}")
         return 1
 
-    if shutil.which("ffmpeg") is None:
-        print("Config check FAILED: ffmpeg not found on PATH.")
-        return 1
-
     # Deliberately never prints client_secret or settings_password.
     print("Config OK:")
     print(f"  Twitch: bot_id={settings.bot_id} owner_id={settings.owner_id} prefix={settings.prefix!r}")
-    print(f"  Audio: {settings.audio_bitrate_kbps} kbps, pause_when_no_listeners={settings.pause_when_no_listeners}")
     if settings.settings_password is None:
         login = "no password — /settings is reachable only from this machine, never through a proxy"
     else:
@@ -262,10 +199,4 @@ def _check_config() -> int:
     token_status = "found" if settings.token_path.exists() else "missing — run OAuth setup before starting"
     print(f"  Token file: {settings.token_path} ({token_status})")
     print(f"  Community DB: {settings.db_path}")
-    print(
-        f"  yt-dlp: mode={settings.ytdlp_worker_mode} "
-        f"concurrency={settings.ytdlp_concurrency} "
-        f"timeout={settings.ytdlp_extract_timeout_seconds}s "
-        f"cookies={'configured' if settings.ytdlp_cookies_file else 'none'}"
-    )
     return 0

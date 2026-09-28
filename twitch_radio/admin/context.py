@@ -18,27 +18,19 @@ from twitch_radio.admin.sessions import SessionStore
 from twitch_radio.netutil import IPNetwork, is_trusted_peer, resolve_client_ip
 
 if TYPE_CHECKING:
-    import aiohttp
-
     from twitch_radio.chatfeed import ChatFeed
     from twitch_radio.db import Database
-    from twitch_radio.player import RadioPlayer
     from twitch_radio.store import JsonStore
 
 
 @dataclass(slots=True)
 class AdminContext:
-    player: RadioPlayer
     chat_feed: ChatFeed
     tunables_store: JsonStore
-    blocklist_store: JsonStore
     specs_store: JsonStore
     toggles_store: JsonStore
     db: Database
     broadcast_info: dict[str, str]
-    # Reused across every /thumb-proxy request rather than opening a fresh
-    # connection per fetch; owned (created and closed) by run_admin_server().
-    thumb_session: aiohttp.ClientSession
     # Read once at startup; None just means the pages render without a mark.
     logo: bytes | None
     logo_small: bytes | None
@@ -56,9 +48,6 @@ class AdminContext:
     # while still capping a script against the one page advertised to a
     # channel's entire chat.
     commands_limiter: RequestRateLimiter = field(default_factory=lambda: RequestRateLimiter(60, 60.0))
-    # The overlay fetches one thumbnail per track change; this only stops a
-    # client using the proxy as a free download relay.
-    thumb_limiter: RequestRateLimiter = field(default_factory=lambda: RequestRateLimiter(120, 60.0))
 
 
 CTX_KEY = web.AppKey("admin_ctx", AdminContext)

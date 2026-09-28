@@ -3,8 +3,8 @@
 Built once at startup by run_admin_server() from commands_reference.COMMANDS
 and the configured prefix — both fixed for the process's lifetime — and served
 byte-for-byte identical on every request. It shows every public=True command
-exactly like chat's own !commands does (block/unblock/blocklist stay out here
-too), just with full descriptions instead of a terse pipe-separated line.
+exactly like chat's own !commands does, just with full descriptions instead
+of a terse pipe-separated line.
 
 No per-request or otherwise untrusted input feeds this at all, since it runs
 once against static, owner-controlled data. The data is still embedded as JSON

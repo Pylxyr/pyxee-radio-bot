@@ -6,11 +6,11 @@ as tunables.py's TUNABLE_BOUNDS/TUNABLE_LABELS and toggles.py's
 TOGGLE_KEYS: add a command here once, every consumer picks it up.
 
 `public=False` hides a command from chat's !commands listing while still
-documenting it on /settings — used for !block/!unblock/!blocklist, which
-work fine as commands, just aren't advertised to every viewer watching
-mods work in chat. `category` only affects the /commands page's tab
-layout, never visibility — every public=True command still shows there
-regardless of `group`.
+documenting it on /settings — nothing currently uses it, but a future
+mod-only command that shouldn't be advertised to every viewer can opt in.
+`category` only affects the /commands page's tab layout, never
+visibility — every public=True command still shows there regardless of
+`group`.
 
 Documentation only: has no bearing on what a command actually does or the
 richer, dynamic usage messages it replies with on its own malformed-
@@ -26,15 +26,13 @@ from twitch_radio.toggles import TOGGLE_KEYS
 from twitch_radio.tunables import TUNABLE_BOUNDS
 
 # "anyone" vs "moderators" buckets !commands and the /settings table's
-# section headings — coarser than the free-text `who` field below: !skip
-# is group="anyone" since a chatter can use it on their own song, even
-# though `who` spells out the real restriction for /settings.
+# section headings — coarser than the free-text `who` field below.
 _GROUPS = ("anyone", "moderators")
 
 # Tab order on the public /commands page, and the source of truth for
 # which categories exist — a command naming one not in this tuple would
 # silently never render there; the self-test below catches that.
-CATEGORIES: tuple[str, ...] = ("Song Requests", "Points & Leaderboard", "Stream Info", "Moderator Tools")
+CATEGORIES: tuple[str, ...] = ("Points & Leaderboard", "Stream Info", "Moderator Tools")
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,7 +44,7 @@ class CommandInfo:
     usage: str = ""  # the part after "!name" — empty if the command takes no arguments
     description: str = ""
     public: bool = True  # False => documented on /settings only, hidden from chat's !commands and /commands
-    category: str = "Song Requests"
+    category: str = "Stream Info"
 
     def usage_line(self, prefix: str) -> str:
         names = "/".join(f"{prefix}{n}" for n in (self.name, *self.aliases))
@@ -57,49 +55,6 @@ _SETLIMIT_KEYS = ", ".join(TUNABLE_BOUNDS)
 _TOGGLE_KEYS_TEXT = ", ".join(TOGGLE_KEYS)
 
 COMMANDS: tuple[CommandInfo, ...] = (
-    CommandInfo(
-        name="sr", aliases=("songrequest",), usage="<song name or URL>",
-        description="Searches YouTube/SoundCloud (or resolves a link) and queues a track.",
-        category="Song Requests",
-    ),
-    CommandInfo(
-        name="skip", who="Moderators, or anyone skipping their own current/loading song",
-        description="Skips the currently playing track.", category="Song Requests",
-    ),
-    CommandInfo(
-        name="voteskip", aliases=("vs",),
-        description="Adds a vote to skip the current track — skips once enough unique chatters "
-                    "have voted (see !setlimit vote_skip_threshold).",
-        category="Song Requests",
-    ),
-    CommandInfo(
-        name="remove", aliases=("cancel", "unqueue"),
-        description="Pulls your own most-recently-queued (not-yet-playing) request back out.",
-        category="Song Requests",
-    ),
-    CommandInfo(name="position", aliases=("pos",), description="Shows where your request(s) sit in the queue.",
-               category="Song Requests"),
-    CommandInfo(name="queue", description="Shows how many requests are queued and the next few titles.",
-               category="Song Requests"),
-    CommandInfo(name="nowplaying", aliases=("np",), description="Shows the current track and who requested it.",
-               category="Song Requests"),
-    CommandInfo(
-        name="radio", usage="[on|off]", who="Anyone to check the status; moderators to change it",
-        description="Shows, or (mods) changes, whether the queue auto-fills with related tracks "
-                    "when it runs dry.",
-        category="Song Requests",
-    ),
-    CommandInfo(
-        name="pause", group="moderators", who="Moderators",
-        description="Stops the current track immediately and holds the queue at silence. The "
-                    "interrupted track (if any) plays again from the start once resumed — there's "
-                    "no mid-song resume position.",
-        category="Song Requests",
-    ),
-    CommandInfo(
-        name="resume", aliases=("unpause",), group="moderators", who="Moderators",
-        description="Resumes playback after !pause.", category="Song Requests",
-    ),
     CommandInfo(name="points", aliases=("balance",), description="Shows your points and tracked watch-time.",
                category="Points & Leaderboard"),
     CommandInfo(name="watchtime", description="Shows your tracked chat-activity time.",
@@ -116,34 +71,13 @@ COMMANDS: tuple[CommandInfo, ...] = (
                category="Stream Info"),
     CommandInfo(
         name="setlimit", group="moderators", who="Moderators", usage="<key> <value>",
-        description=f"Adjusts one request-limit tunable live — same keys/ranges as /settings. "
+        description=f"Adjusts one runtime tunable live — same keys/ranges as /settings. "
                     f"Keys: {_SETLIMIT_KEYS}.",
         category="Moderator Tools",
     ),
     CommandInfo(
         name="toggle", group="moderators", who="Moderators", usage="<key> [on|off]",
         description=f"Flips a feature toggle — same keys as /settings. Keys: {_TOGGLE_KEYS_TEXT}.",
-        category="Moderator Tools",
-    ),
-    CommandInfo(
-        name="block", group="moderators", who="Moderators", public=False,
-        usage="<YouTube/SoundCloud URL, or an uploader name>",
-        description="Blocks a track (by link) or every track from an uploader (by name); also "
-                    "pulls any already-queued match out of the queue.",
-        category="Moderator Tools",
-    ),
-    CommandInfo(
-        name="unblock", group="moderators", who="Moderators", public=False,
-        usage="<YouTube/SoundCloud URL, or an uploader name>", description="Reverses !block.",
-        category="Moderator Tools",
-    ),
-    CommandInfo(
-        name="blocklist", group="moderators", who="Moderators", public=False,
-        description="Shows how many tracks/uploaders are currently blocked.", category="Moderator Tools",
-    ),
-    CommandInfo(
-        name="clearqueue", group="moderators", who="Moderators",
-        description="Empties the queue (not the currently playing track — use !skip for that).",
         category="Moderator Tools",
     ),
     CommandInfo(

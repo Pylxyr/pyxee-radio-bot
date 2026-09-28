@@ -5,12 +5,9 @@ import time
 
 class CooldownTracker:
     """Generic per-key cooldown — extracted so every new command gets spam
-    protection for free instead of hand-rolling a last-used dict each time
-    (as !sr's own request_cooldown_seconds check still does; that one's left
-    untouched deliberately, see song_requests.py — not migrated here, to
-    avoid changing a proven, load-bearing path as part of an unrelated
-    refactor). Each feature owns its own instance so cooldowns don't leak
-    across unrelated commands.
+    protection for free instead of hand-rolling a last-used dict each time.
+    Each feature owns its own instance so cooldowns don't leak across
+    unrelated commands.
     """
 
     def __init__(self) -> None:

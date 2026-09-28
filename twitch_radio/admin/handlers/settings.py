@@ -1,4 +1,4 @@
-"""The sign-in-gated routes: /settings (view and save) and /blocklist.json."""
+"""The sign-in-gated routes: /settings (view and save)."""
 
 from __future__ import annotations
 
@@ -12,8 +12,6 @@ from aiohttp import web
 from twitch_radio.admin.context import AdminContext, client_ip, get_ctx
 from twitch_radio.admin.handlers.auth import authorize, origin_ok, protect
 from twitch_radio.admin.render.settings_page import FORM_MARKER, LiveStatus, render_settings_page
-from twitch_radio.blocklist import clean_list
-from twitch_radio.blocklist import counts as blocklist_counts
 from twitch_radio.specs import PC_SPEC_FIELDS, PERIPHERAL_FIELDS, PCSpecs, Peripherals
 from twitch_radio.toggles import TOGGLE_KEYS, FeatureToggles
 from twitch_radio.tunables import TUNABLE_BOUNDS, TwitchTunables
@@ -53,13 +51,7 @@ def _parse_tunables(form: Mapping[str, Any]) -> tuple[dict[str, int], list[str]]
 
 
 def _live_status(ctx: AdminContext) -> LiveStatus:
-    np = ctx.player.now_playing
-    return LiveStatus(
-        state=ctx.player.state.value,
-        queue_size=ctx.player.queue_size(),
-        uptime_seconds=int(time.monotonic() - ctx.started_at),
-        now_playing_title=np.title if np is not None else None,
-    )
+    return LiveStatus(uptime_seconds=int(time.monotonic() - ctx.started_at))
 
 
 async def _community_snapshot(ctx: AdminContext) -> dict[str, Any]:
@@ -151,10 +143,10 @@ async def handle_settings_post(request: web.Request) -> web.Response:
 
     # Absent-means-unchecked is right for this page's own form, but
     # catastrophic for a non-browser caller (curl, a Stream Deck script,
-    # allowed through by origin_ok) — POSTing just `queue_cap=100` would
-    # silently switch off every toggle it didn't mention. FORM_MARKER is a
-    # hidden field only this page's form carries, so a partial POST updates
-    # only the toggles it actually names.
+    # allowed through by origin_ok) — POSTing just `points_per_active_minute=2`
+    # would silently switch off every toggle it didn't mention. FORM_MARKER
+    # is a hidden field only this page's form carries, so a partial POST
+    # updates only the toggles it actually names.
     full_form = form.get(FORM_MARKER) is not None
 
     def _mutate_toggles(current: dict[str, Any]) -> dict[str, Any]:
@@ -183,25 +175,4 @@ async def handle_settings_post(request: web.Request) -> web.Response:
         specs_data=specs_result,
         toggles=FeatureToggles.from_dict(toggles_result),
         message="Saved.",
-    )
-
-
-async def handle_blocklist(request: web.Request) -> web.Response:
-    """Full blocklist contents, gated like /settings — !blocklist in chat only
-    gives counts, so this is where a mod actually audits what's blocked."""
-    ctx = get_ctx(request)
-    denied = authorize(ctx, request)
-    if denied is not None:
-        return denied
-    data = await ctx.blocklist_store.read()
-    tracks, uploaders = blocklist_counts(data)
-    return protect(
-        web.json_response(
-            {
-                "tracks": clean_list(data.get("tracks")),
-                "uploaders": clean_list(data.get("uploaders")),
-                "track_count": tracks,
-                "uploader_count": uploaders,
-            }
-        )
     )

@@ -1,6 +1,5 @@
 __SITE_ADDRESS__ {
-	@compressible not path /stream.mp3
-	encode @compressible zstd gzip
+	encode zstd gzip
 
 	header -Server
 

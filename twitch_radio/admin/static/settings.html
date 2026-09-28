@@ -23,17 +23,12 @@
 <main>
 ${banner}
 
-<section class="card live-card" id="live-card">
-  <h2>Now Playing</h2>
-  <div id="np-body"><p class="empty">Loading…</p></div>
-</section>
-
 <form method="post" autocomplete="off">
 <input type="hidden" name="${form_marker}" value="1">
 
   <section class="card">
-    <h2>Request limits</h2>
-    <p class="section-help">Live — no restart needed. Mods can change the same values from chat with
+    <h2>Points</h2>
+    <p class="section-help">Live — no restart needed. Mods can change the same value from chat with
       <code>!setlimit &lt;key&gt; &lt;value&gt;</code>.</p>
     <div class="grid">${tunable_rows}</div>
   </section>

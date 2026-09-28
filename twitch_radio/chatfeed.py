@@ -99,11 +99,10 @@ class ChatFeed:
         self._max_age_seconds = max_age_seconds
         self._entries: list[ChatEntry] = []
         self._next_id = 1
-        # Same wakeup-queue idea as RadioPlayer's subscribe_state()/
-        # _notify_state_changed(): subscribers get an empty "something
+        # Wakeup-queue pattern: subscribers get an empty "something
         # changed" ping and re-fetch snapshot() themselves, rather than the
         # payload being pushed through the queue directly. Consistent with
-        # how /ws/nowplaying already works, and it means this class has no
+        # how /ws/chat already works, and it means this class has no
         # opinion at all about JSON shape — that's admin/handlers/live.py's job.
         self._state_subscribers: set[asyncio.Queue[None]] = set()
 

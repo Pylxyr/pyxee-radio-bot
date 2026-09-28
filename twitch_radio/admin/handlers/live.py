@@ -1,5 +1,5 @@
-"""Read-only, unauthenticated routes: live now-playing/chat data (JSON and
-WebSocket), the health check, the OBS overlay pages, the logo, and the public
+"""Read-only, unauthenticated routes: live chat data (JSON and WebSocket),
+the health check, the OBS chat overlay page, the logo, and the public
 /commands page. All of it is data the streamer already shows on stream or in
 chat, which is why none of it is gated."""
 
@@ -13,8 +13,7 @@ from typing import Any
 from aiohttp import web
 
 from twitch_radio.admin.assets import static_text
-from twitch_radio.admin.context import AdminContext, client_ip, get_ctx
-from twitch_radio.telemetry import counters
+from twitch_radio.admin.context import client_ip, get_ctx
 
 # Everything the public /commands page may load: its own inline style and
 # script, Google Fonts, and the logo. Nothing else, and never framed.
@@ -33,58 +32,15 @@ _COMMANDS_CSP = (
 _WS_HEARTBEAT_SECONDS = 30
 
 
-def nowplaying_payload(ctx: AdminContext) -> dict[str, Any]:
-    np = ctx.player.now_playing
-    queue = [
-        {"title": item.title or "Unknown title", "requester_name": item.requester_name}
-        for item in ctx.player.queued_items()
-    ]
-    # "state" drives the /settings page's realtime chips (idle / resolving /
-    # playing / paused); the overlay ignores fields it doesn't recognise.
-    state = ctx.player.state.value
-    if np is None:
-        return {"playing": False, "state": state, "queue_size": len(queue), "queue": queue}
-    return {
-        "playing": True,
-        "state": state,
-        "title": np.title,
-        "uploader": np.uploader,
-        "thumbnail_url": np.thumbnail_url,
-        "requester_name": np.requester_name,
-        "webpage_url": np.webpage_url,
-        "elapsed_seconds": max(0.0, time.monotonic() - np.started_at),
-        "duration_seconds": np.duration,
-        "queue_size": len(queue),
-        "queue": queue,
-    }
-
-
-async def handle_nowplaying(request: web.Request) -> web.Response:
-    return web.json_response(nowplaying_payload(get_ctx(request)))
-
-
 async def handle_chat(request: web.Request) -> web.Response:
     return web.json_response({"messages": get_ctx(request).chat_feed.snapshot()})
 
 
 async def handle_healthz(request: web.Request) -> web.Response:
-    """Unauthenticated on purpose (same exposure as /nowplaying.json;
-    nothing here is sensitive) — for an uptime monitor, or a quick health
-    check without opening /settings. Resolve counts are an in-memory
-    rolling window (telemetry.py) that resets on restart, not a
-    persisted log."""
+    """Unauthenticated on purpose (nothing here is sensitive) — for an
+    uptime monitor, or a quick health check without opening /settings."""
     ctx = get_ctx(request)
-    return web.json_response(
-        {
-            "uptime_seconds": round(time.monotonic() - ctx.started_at, 1),
-            "player_state": ctx.player.state.value,
-            "queue_size": ctx.player.queue_size(),
-            "resolves_last_hour": {
-                "success": counters.count_last_hour("resolve_success"),
-                "failure": counters.count_last_hour("resolve_failure"),
-            },
-        }
-    )
+    return web.json_response({"uptime_seconds": round(time.monotonic() - ctx.started_at, 1)})
 
 
 async def _push_ws(
@@ -117,19 +73,6 @@ async def _push_ws(
     return ws
 
 
-async def handle_ws_nowplaying(request: web.Request) -> web.WebSocketResponse:
-    """Push counterpart to /nowplaying.json — the overlay prefers it and falls
-    back to polling. The client ticks elapsed time between pushes itself, so
-    nothing needs to be sent every second."""
-    ctx = get_ctx(request)
-    return await _push_ws(
-        request,
-        payload=lambda: nowplaying_payload(ctx),
-        subscribe=ctx.player.subscribe_state,
-        unsubscribe=ctx.player.unsubscribe_state,
-    )
-
-
 async def handle_ws_chat(request: web.Request) -> web.WebSocketResponse:
     """Push counterpart to /chat.json. There is no server-side tick here: the
     chat overlay ages messages out of its last snapshot on its own timer, so a
@@ -141,10 +84,6 @@ async def handle_ws_chat(request: web.Request) -> web.WebSocketResponse:
         subscribe=ctx.chat_feed.subscribe_state,
         unsubscribe=ctx.chat_feed.unsubscribe_state,
     )
-
-
-async def handle_overlay(request: web.Request) -> web.Response:
-    return web.Response(text=static_text("overlay.html"), content_type="text/html")
 
 
 async def handle_chat_overlay(request: web.Request) -> web.Response:

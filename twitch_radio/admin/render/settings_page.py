@@ -32,13 +32,10 @@ _SIGNOUT_FORM = '<form class="signout" method="post" action="/logout"><button ty
 
 @dataclass(frozen=True, slots=True)
 class LiveStatus:
-    """What the header chips show on first paint; from then on the page's own
-    script keeps them current over /ws/nowplaying."""
+    """What the header chip shows on first paint; from then on the page's own
+    script keeps it current with a local tick."""
 
-    state: str
-    queue_size: int
     uptime_seconds: int
-    now_playing_title: str | None
 
 
 def _tunable_rows(tunables: TwitchTunables) -> str:
@@ -102,11 +99,10 @@ def _command_row(cmd: Any, prefix: str) -> str:
 
 
 def _commands_table(prefix: str) -> str:
-    """Everything commands_reference.py knows, laid out in three
-    groups. The third group (hidden) is exactly the commands that
-    chat's own !commands deliberately leaves out — see
-    components/info.py — so a mod who only ever reads /settings still
-    finds !block/!unblock/!blocklist documented here in full."""
+    """Everything commands_reference.py knows, laid out in groups. The
+    hidden group (public=False) is exactly what chat's own !commands
+    deliberately leaves out — see components/info.py — so a mod who only
+    ever reads /settings still finds it documented here in full."""
     anyone = [c for c in COMMANDS if c.public and c.group == "anyone"]
     mods = [c for c in COMMANDS if c.public and c.group == "moderators"]
     hidden = [c for c in COMMANDS if not c.public]
@@ -126,21 +122,9 @@ def _commands_table(prefix: str) -> str:
 
 
 def _status_chips(status: LiveStatus) -> str:
-    """chip-np always renders (possibly hidden) rather than being conditionally
-    included, so the live script only ever updates an existing element's
-    text/visibility instead of inserting and removing nodes."""
     hours, rem = divmod(status.uptime_seconds, 3600)
     uptime_text = f"{hours}h {rem // 60}m" if hours else f"{rem // 60}m"
-    title = status.now_playing_title
-    np_style = "" if title is not None else "display:none"
-    np_text = f"\u25b6 {escape(title)}" if title is not None else ""
-    np_title_attr = escape(title) if title is not None else ""
-    return (
-        f'<span class="chip state-{escape(status.state)}" id="chip-state">{escape(status.state)}</span>'
-        f'<span class="chip" id="chip-queue">{status.queue_size} queued</span>'
-        f'<span class="chip" id="chip-uptime" data-uptime-base="{status.uptime_seconds}">up {uptime_text}</span>'
-        f'<span class="chip chip-np" id="chip-np" style="{np_style}" title="{np_title_attr}">{np_text}</span>'
-    )
+    return f'<span class="chip" id="chip-uptime" data-uptime-base="{status.uptime_seconds}">up {uptime_text}</span>'
 
 
 def render_settings_page(

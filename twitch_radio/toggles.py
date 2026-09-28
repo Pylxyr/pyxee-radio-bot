@@ -6,7 +6,6 @@ from typing import Any
 # Same "single source of truth" idea as tunables.TUNABLE_BOUNDS — shared by
 # /settings and !toggle so both stay in sync on valid keys.
 TOGGLE_KEYS: dict[str, str] = {
-    "radio_autoplay_enabled": "Auto-queue similar tracks when the queue runs dry",
     "link_filter_enabled": "Warn on links from chatters (mods/broadcaster exempt)",
     "caps_filter_enabled": "Warn on excessive-caps messages (mods/broadcaster exempt)",
     "filter_delete_enabled": (
@@ -24,11 +23,9 @@ TOGGLE_KEYS: dict[str, str] = {
 
 @dataclass(slots=True)
 class FeatureToggles:
-    # Defaults to on: this is the specific gap ("radio silence") this
-    # feature exists to close. Everything else defaults off — new
-    # chat-visible behavior (a filter warning, a follow announcement) is
-    # something the streamer should opt into, not discover.
-    radio_autoplay_enabled: bool = True
+    # All default off — new chat-visible behavior (a filter warning, a
+    # follow announcement) is something the streamer should opt into, not
+    # discover.
     link_filter_enabled: bool = False
     caps_filter_enabled: bool = False
     filter_delete_enabled: bool = False
@@ -45,7 +42,6 @@ class FeatureToggles:
             return value if isinstance(value, bool) else default
 
         return cls(
-            radio_autoplay_enabled=_field("radio_autoplay_enabled", defaults.radio_autoplay_enabled),
             link_filter_enabled=_field("link_filter_enabled", defaults.link_filter_enabled),
             caps_filter_enabled=_field("caps_filter_enabled", defaults.caps_filter_enabled),
             filter_delete_enabled=_field("filter_delete_enabled", defaults.filter_delete_enabled),
@@ -54,7 +50,6 @@ class FeatureToggles:
 
     def to_dict(self) -> dict[str, bool]:
         return {
-            "radio_autoplay_enabled": self.radio_autoplay_enabled,
             "link_filter_enabled": self.link_filter_enabled,
             "caps_filter_enabled": self.caps_filter_enabled,
             "filter_delete_enabled": self.filter_delete_enabled,
