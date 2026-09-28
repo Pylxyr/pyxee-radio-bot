@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" alt="Twitch Radio Bot" width="140">
+  <img src="assets/logo.png" alt="Pyxee Twitch Bot" width="140">
 </p>
 
 ## <p align="center">Twitch Radio Bot</p>
