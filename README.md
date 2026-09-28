@@ -2,7 +2,7 @@
   <img src="assets/logo.png" alt="Pyxee Twitch Bot" width="140">
 </p>
 
-## <p align="center">Twitch Radio Bot</p>
+## <p align="center">Pyxee Twitch Bot</p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+">
