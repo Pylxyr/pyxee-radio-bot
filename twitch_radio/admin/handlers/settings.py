@@ -60,6 +60,11 @@ async def _community_snapshot(ctx: AdminContext) -> dict[str, Any]:
     return {
         "top_points": await ctx.db.top_points(limit=5),
         "custom_commands": sorted(await ctx.db.list_commands()),
+        "timers": await ctx.db.list_timers(),
+        "blocked_term_count": len(await ctx.db.list_filter_values("term")),
+        "allowed_domains": await ctx.db.list_filter_values("domain"),
+        "quote_count": await ctx.db.quote_count(),
+        "counters": [c.name for c in await ctx.db.load_counters()],
     }
 
 

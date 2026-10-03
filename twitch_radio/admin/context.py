@@ -20,6 +20,7 @@ from twitch_radio.netutil import IPNetwork, is_trusted_peer, resolve_client_ip
 if TYPE_CHECKING:
     from twitch_radio.chatfeed import ChatFeed
     from twitch_radio.db import Database
+    from twitch_radio.runtime import RuntimeStatus
     from twitch_radio.store import JsonStore
 
 
@@ -30,12 +31,14 @@ class AdminContext:
     specs_store: JsonStore
     toggles_store: JsonStore
     db: Database
+    status: RuntimeStatus
     broadcast_info: dict[str, str]
     # Read once at startup; None just means the pages render without a mark.
     logo: bytes | None
     logo_small: bytes | None
     # Built once at startup — see render/commands_page.py.
-    commands_page_html: str
+    commands_prefix: str
+    has_logo: bool
     # Plain text or a scrypt hash; None means no password is configured.
     settings_password: str | None
     exposed: bool
@@ -48,6 +51,8 @@ class AdminContext:
     # while still capping a script against the one page advertised to a
     # channel's entire chat.
     commands_limiter: RequestRateLimiter = field(default_factory=lambda: RequestRateLimiter(60, 60.0))
+    # (built_at monotonic, html) for the /commands page — see handlers/live.py.
+    commands_cache: tuple[float, str] | None = None
 
 
 CTX_KEY = web.AppKey("admin_ctx", AdminContext)

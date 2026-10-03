@@ -1,5 +1,6 @@
-"""Twitch chat bot — wires up moderation, info, and viewer engagement
-commands (split across twitch_radio/components/*).
+"""Twitch chat bot — connection, auth and message plumbing. The features
+themselves live in services (automod.py, economy.py, customcommands.py) with
+thin command layers in twitch_radio/components/*.
 
 Built against twitchio 3.x's EventSub-based Bot (not the old IRC-token
 pattern from twitchio 2.x).
@@ -19,9 +20,9 @@ README.md; short version:
   2. On a remote host, tunnel the port first:
      `ssh -L 4343:localhost:4343 <user>@<host>`
   3. In a browser, logged in as the BOT's own account:
-     http://localhost:4343/oauth?scopes=user:read:chat+user:write:chat+user:bot+moderator:manage:chat_messages+moderator:read:followers+moderator:manage:shoutouts&force_verify=true
+     http://localhost:4343/oauth?scopes=user:read:chat+user:write:chat+user:bot+moderator:manage:chat_messages+moderator:read:followers+moderator:manage:shoutouts+moderator:manage:banned_users&force_verify=true
   4. In a SEPARATE browser session, logged in as the BROADCASTER's account:
-     http://localhost:4343/oauth?scopes=channel:bot+channel:read:subscriptions+bits:read+clips:edit+channel:manage:polls&force_verify=true
+     http://localhost:4343/oauth?scopes=channel:bot+channel:read:subscriptions+bits:read+clips:edit+channel:manage:polls+channel:manage:predictions+channel:read:hype_train&force_verify=true
 
   Reusing the same logged-in session for steps 3 and 4 is the most common
   way this goes wrong — Twitch authorizes whichever account is currently
@@ -31,8 +32,8 @@ README.md; short version:
   reload automatically on future starts.
 
 event_message() filters the bot's own messages via `chatter.id ==
-self.bot_id` (ChatMessage has no `.echo`-style attribute) — the
-engagement/moderation logic below assumes that filtering already happened.
+self.bot_id` (ChatMessage has no `.echo`-style attribute), then hands every
+other message to the chat feed, the economy and AutoMod as one ChatEvent.
 
 Every feature below is gated by its own toggle (default off — see
 toggles.py), even though the scopes above already cover all of them, so
@@ -42,27 +43,35 @@ failure once and stops retrying, rather than erroring or spamming the log.
 
   moderator:manage:chat_messages (bot)     -> filter_delete_enabled actually
                                                deleting a flagged message
+  moderator:manage:banned_users (bot)      -> filter_timeout_enabled (timeouts
+                                               after repeated violations)
   moderator:read:followers (bot)           -> !followage, follow alerts
   moderator:manage:shoutouts (bot)         -> !so, auto-shoutout on raid
   channel:read:subscriptions (broadcaster) -> sub alerts
   bits:read (broadcaster)                  -> cheer alerts
   clips:edit (broadcaster)                 -> !clip
   channel:manage:polls (broadcaster)       -> !poll
+  channel:manage:predictions (broadcaster) -> !predict
+  channel:read:hype_train (broadcaster)    -> Hype Train alerts
 
-Follow/sub/cheer/raid alerts and auto-shoutout-on-raid are all gated by one
-toggle, alerts_enabled (off by default) — see components/alerts.py. Raid
-detection needs no extra scope (channel.raid is public); the shoutout
-still needs moderator:manage:shoutouts, so a raid can announce without a
-shoutout if only that one scope is missing.
+Follow/sub/cheer/raid/Hype-Train alerts and auto-shoutout-on-raid are all
+gated by one toggle, alerts_enabled (off by default) — see
+components/alerts.py. Raid detection needs no extra scope (channel.raid is
+public); the shoutout still needs moderator:manage:shoutouts, so a raid can
+announce without a shoutout if only that one scope is missing.
+
+!duel/!gamble (gated by their own toggles) and !predict/!poll/!queue/
+!giveaway (mod-initiated, no toggle — same precedent as !addcom) round out
+engagement; !quote and !8ball need no scope or toggle at all. See each
+service module (duels.py, predictions.py, queue.py, giveaway.py, quotes.py,
+eightball.py, counters.py) for how each actually works.
 """
-
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import json
 import logging
-import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -71,22 +80,41 @@ from twitchio import eventsub
 from twitchio.exceptions import HTTPException, TwitchioException
 from twitchio.ext import commands
 
+from twitch_radio.automod import AutoMod
+from twitch_radio.chatevent import ChatEvent, display_name_of
 from twitch_radio.chatfeed import ChatFeed, fragments_to_dicts
+from twitch_radio.commands_reference import BY_NAME
 from twitch_radio.components.alerts import AlertsComponent
-from twitch_radio.components.engagement import EngagementComponent
+from twitch_radio.components.counters import CountersComponent
+from twitch_radio.components.custom_commands import CustomCommandsComponent
+from twitch_radio.components.economy import EconomyComponent
+from twitch_radio.components.eightball import EightBallComponent
+from twitch_radio.components.games import GamesComponent
+from twitch_radio.components.giveaway import GiveawayComponent
 from twitch_radio.components.info import InfoComponent
-from twitch_radio.components.moderation import ModerationComponent
 from twitch_radio.components.moderation import USAGE as _MODERATION_USAGE
+from twitch_radio.components.moderation import ModerationComponent
+from twitch_radio.components.predictions import build_manager as build_prediction_manager
+from twitch_radio.components.predictions import PredictionsComponent
+from twitch_radio.components.queue import QueueComponent
+from twitch_radio.components.quotes import QuotesComponent
 from twitch_radio.components.stream_info import StreamInfoComponent
-from twitch_radio.cooldown import CooldownTracker
+from twitch_radio.components.timers import TimersComponent
+from twitch_radio.counters import CounterStore, split_suffix
+from twitch_radio.customcommands import CustomCommandStore
 from twitch_radio.db import Database
+from twitch_radio.duels import DuelManager
+from twitch_radio.economy import AWARD_TICK_SECONDS, Economy
 from twitch_radio.emotes import EmoteService
+from twitch_radio.giveaway import GiveawayManager
+from twitch_radio.queue import ViewerQueue
+from twitch_radio.runtime import DEFAULT_REPLY_SUFFIXES, RuntimeStatus
 from twitch_radio.store import JsonStore
 from twitch_radio.toggles import FeatureToggles
 from twitch_radio.tunables import TwitchTunables
 
 if TYPE_CHECKING:
-    from twitchio import ChatMessage
+    from twitchio import ChatMessage, StreamOffline, StreamOnline
     from twitchio.authentication import ValidateTokenPayload
     from twitchio.payloads import TokenRefreshedPayload
 
@@ -96,41 +124,19 @@ log = logging.getLogger(__name__)
 # handler below. Keyed by canonical command name, not alias.
 _USAGE = dict(_MODERATION_USAGE)
 
-# Twitch silently drops a chat message byte-identical to one this account
-# sent recently — a real server-side rolling window, not just "the last
-# message" (seen dropping a repeat 17s later, and even across a process
-# restart with no local memory of what it sent). Too unpredictable to
-# track client-side, so every safe_reply instead gets a small rotating
-# cosmetic suffix, guaranteeing it's never byte-identical to the last one.
-_DEDUP_SUFFIXES = (" \U0001f3b5", " \U0001f3b6", " \U0001f3a7", " \U0001f50a")
+# Twitch silently drops a chat message byte-identical to one this account sent
+# recently — a server-side rolling window (seen dropping a repeat 17s later,
+# even across a restart). Too unpredictable to track client-side, so every
+# reply gets a small rotating cosmetic suffix (runtime.DEFAULT_REPLY_SUFFIXES;
+# configurable or disabled with TWITCH_REPLY_SUFFIXES).
 
-# How long a chatter needs to have gone quiet before they stop counting as
-# "active" for passive points/watch-time, and how often the award loop
-# ticks. A chatter who never sends a second message just gets one tick's
-# worth of credit and then ages out of last_seen below.
-_ACTIVE_WINDOW_SECONDS = 300.0
-_AWARD_TICK_SECONDS = 60.0
-_LAST_SEEN_PRUNE_SECONDS = 3600.0
-
-_LINK_RE = re.compile(r"(https?://|www\.)\S+", re.IGNORECASE)
-_CUSTOM_COMMAND_COOLDOWN_SECONDS = 3.0
-
-# Twitch's hard limit on a single chat message. PartialUser.send_message
-# raises a plain ValueError above it — not a TwitchioException, so it sails
-# past safe_reply's delivery-failure handling unless caught explicitly.
-# Reachable without trying: long titles in !queue, long names in
-# !leaderboard, or an unchecked !addcom response.
+# Twitch's hard limit on a single chat message. PartialUser.send_message raises
+# a plain ValueError above it — not a TwitchioException.
 _MAX_CHAT_MESSAGE_LENGTH = 500
 
-# How often the passive-points loop re-checks whether the channel is
-# actually live. Cheap (one Helix call per tick at most) and the answer
-# doesn't change on a shorter timescale than this anyway.
+# How long a live/offline reading is trusted before the next Helix poll.
+# EventSub stream.online/offline update it immediately when available.
 _LIVE_CHECK_TTL_SECONDS = 120.0
-
-
-def _is_excessive_caps(text: str) -> bool:
-    letters = [c for c in text if c.isalpha()]
-    return len(letters) >= 10 and sum(1 for c in letters if c.isupper()) / len(letters) > 0.7
 
 
 class TwitchChatBot(commands.Bot):
@@ -149,7 +155,10 @@ class TwitchChatBot(commands.Bot):
         toggles_store: JsonStore,
         db: Database,
         token_storage_path: Path,
+        status: RuntimeStatus,
         emote_sources: tuple[str, ...] = (),
+        reply_suffixes: tuple[str, ...] = DEFAULT_REPLY_SUFFIXES,
+        reserved_commands: frozenset[str] = frozenset(),
     ) -> None:
         super().__init__(
             client_id=client_id,
@@ -171,46 +180,42 @@ class TwitchChatBot(commands.Bot):
         self.specs_store = specs_store
         self.toggles_store = toggles_store
         self.db = db
+        self.status = status
         self.prefix = prefix
-        # Set only when TWITCH_PUBLIC_BASE_URL is configured — see !commands
-        # in components/info.py, which falls back to the terse in-chat
-        # listing when this is None rather than showing a broken link.
+        # Set only when TWITCH_PUBLIC_BASE_URL is configured — !commands falls
+        # back to the terse in-chat listing when this is None.
         self.public_commands_url = f"{public_base_url}/commands" if public_base_url else None
         self._owner_id = owner_id
         self._bot_id = bot_id
         self._token_storage_path = token_storage_path
-        # Set once subscribe_websocket() succeeds — save_tokens() retries the
-        # subscription on every call until this is True (see add_token()
-        # and event_token_refreshed() below for what actually triggers
-        # save_tokens() live, not just at shutdown).
-        self._chat_subscribed = False
-        # Round-robins through _DEDUP_SUFFIXES on every safe_reply call —
-        # shared across every component (not one counter each) so replies
-        # from different commands still can't collide on Twitch's dedup
-        # window back to back.
+        self._reply_suffixes = reply_suffixes
         self._reply_counter = 0
-        # Chat-activity tracking for the passive points/watch-time loop —
-        # "active" here means "has sent a chat message recently", not true
-        # viewer presence (that would need viewer-list/EventSub data this
-        # bot doesn't have). Known simplification, not a bug.
-        self.last_seen: dict[str, float] = {}
-        self.last_seen_name: dict[str, str] = {}
+        # Every name a mod may not reuse for a custom command: our own commands
+        # and aliases, plus whatever another bot in the channel answers to.
+        self.reserved_names: frozenset[str] = frozenset(BY_NAME) | reserved_commands
+        # Chat messages seen since startup (excluding the bot's own) — the
+        # timers use it so they never talk to an empty room.
+        self.chat_messages = 0
+        self._live_checked_at = 0.0
         self._points_task: asyncio.Task[None] | None = None
-        # Cached "is the channel live" answer for the points loop — see
-        # _channel_is_live(). (value, checked_at_monotonic).
-        self._live_cache: tuple[bool, float] | None = None
-        self.custom_command_cooldowns = CooldownTracker()
-        # Sticky "give up" flag for filter_delete_enabled — set on the first
-        # permission failure so a missing scope doesn't mean retrying (and
-        # logging) a failed delete on every single flagged message forever.
-        self._delete_scope_missing = False
-        # Same idea for shoutouts (moderator:manage:shoutouts) — shared by
-        # the auto-raid-shoutout and the manual !so command.
-        self._shoutout_scope_missing = False
-        # Tracks which alert EventSub subscriptions have already succeeded,
-        # so _try_subscribe_alerts (called again from save_tokens, for a
-        # scope granted after startup) only retries the ones that haven't.
-        self._alert_subscriptions_done: dict[str, bool] = {}
+
+        # Services (the logic) — the components are thin command layers over these.
+        self.economy = Economy(db, tunables_store, toggles_store, status, is_live=self.channel_is_live)
+        self.automod = AutoMod(
+            db,
+            tunables_store,
+            toggles_store,
+            status,
+            announce=self.announce,
+            delete_message=self.delete_message,
+            timeout_user=self.timeout_user,
+        )
+        self.custom = CustomCommandStore(db)
+        self.counters = CounterStore(db)
+        self.viewer_queue = ViewerQueue()
+        self.giveaway = GiveawayManager()
+        self.duels = DuelManager(db)
+        self.predictions = build_prediction_manager(self.create_partialuser(user_id=self.owner_id_required))
 
     @property
     def owner_id_required(self) -> str:
@@ -272,95 +277,6 @@ class TwitchChatBot(commands.Bot):
             return False
         return self._bot_id in saved_ids and self._owner_id in saved_ids
 
-    async def _try_subscribe_chat(self) -> None:
-        if self._chat_subscribed:
-            return
-        self._log_token_diagnostics()
-        subscription = eventsub.ChatMessageSubscription(
-            broadcaster_user_id=self._owner_id,
-            user_id=self._bot_id,
-        )
-        try:
-            await self.subscribe_websocket(payload=subscription)
-            log.info("Subscribed to chat messages for broadcaster=%s bot=%s", self._owner_id, self._bot_id)
-            self._chat_subscribed = True
-        except Exception as e:
-            if self._oauth_complete():
-                log.exception(
-                    "Chat subscription failed even though both accounts have saved tokens — "
-                    "chat commands won't work until this is fixed. See the token diagnostics "
-                    "logged above, or redo the OAuth steps in README.md with &force_verify=true "
-                    "if a token was revoked or scopes changed. Error: %s",
-                    e,
-                )
-            else:
-                log.warning(
-                    "Skipping chat subscription for now — the one-time OAuth steps in "
-                    "README.md aren't done for both accounts yet at %s. Will retry "
-                    "automatically as soon as a token is saved, no restart needed. Error: %s",
-                    self._token_storage_path,
-                    e,
-                )
-
-    async def _try_subscribe_alerts(self) -> None:
-        """Follow/sub/cheer/raid EventSub subscriptions — independent of
-        alerts_enabled (subscribing is side-effect-free; the toggle only
-        gates whether an arriving event gets announced) and of each other
-        (raid needs no extra scope, so it keeps working even if the rest
-        fail). Re-run from save_tokens() so a scope granted after startup
-        is picked up without a restart."""
-        attempts = (
-            (
-                "follow",
-                eventsub.ChannelFollowSubscription(broadcaster_user_id=self._owner_id, moderator_user_id=self._bot_id),
-            ),
-            ("subscription", eventsub.ChannelSubscribeSubscription(broadcaster_user_id=self._owner_id)),
-            ("cheer", eventsub.ChannelCheerSubscription(broadcaster_user_id=self._owner_id)),
-            ("raid", eventsub.ChannelRaidSubscription(to_broadcaster_user_id=self._owner_id)),
-        )
-        for name, subscription in attempts:
-            if self._alert_subscriptions_done.get(name):
-                continue
-            try:
-                await self.subscribe_websocket(payload=subscription)
-                self._alert_subscriptions_done[name] = True
-                log.info("Subscribed to %s alerts.", name)
-            except Exception as e:
-                # Routine, not a warning — most streamers never touch
-                # alerts at all, so noise for a scope nobody asked for
-                # would just be confusing.
-                log.info("Skipping %s alerts for now (%s) — see module docstring for the optional scope.", name, e)
-
-    async def try_shoutout(self, to_user_id: str, to_display_name: str) -> bool:
-        """Best-effort — shared by AlertsComponent's auto-raid-shoutout and
-        the manual !so command. Needs moderator:manage:shoutouts; a
-        permission failure is logged once and remembered so a train of
-        raids doesn't repeat the same warning for every raider."""
-        if self._shoutout_scope_missing:
-            return False
-        try:
-            broadcaster = self.create_partialuser(user_id=self.owner_id_required)
-            await broadcaster.send_shoutout(to_broadcaster=to_user_id, moderator=self.bot_id)
-            return True
-        except HTTPException as e:
-            if e.status in (401, 403):
-                self._shoutout_scope_missing = True
-                log.warning(
-                    "Shoutout failed with HTTP %s — the bot's token is probably missing "
-                    "moderator:manage:shoutouts. Staying off for the rest of this run; see "
-                    "chatbot.py's module docstring for the OAuth step to add it. (%s)",
-                    e.status, e,
-                )
-            else:
-                # Likely Twitch's own shoutout cooldown (2min channel-wide,
-                # 60min per target) — routine, not a scope issue, so no
-                # sticky flag; the next raid tries again.
-                log.info("Shoutout to %s not sent (%s) — likely Twitch's own cooldown.", to_display_name, e)
-            return False
-        except Exception:
-            log.debug("Shoutout to %s failed (non-fatal).", to_display_name, exc_info=True)
-            return False
-
     async def resolve_user_id(self, login: str) -> str | None:
         """Login name -> user ID, for !so <username> (send_shoutout needs an
         ID, not a login name). Public endpoint, no extra scope needed."""
@@ -370,18 +286,6 @@ class TwitchChatBot(commands.Bot):
             log.debug("Failed to resolve Twitch login %r to a user ID.", login, exc_info=True)
             return None
         return users[0].id if users else None
-
-    async def setup_hook(self) -> None:
-        await self.add_component(ModerationComponent(self))
-        await self.add_component(InfoComponent(self))
-        await self.add_component(EngagementComponent(self))
-        await self.add_component(AlertsComponent(self))
-        await self.add_component(StreamInfoComponent(self))
-        await self._try_subscribe_chat()
-        await self._try_subscribe_alerts()
-        self._points_task = asyncio.create_task(self._points_award_loop(), name="points-award-loop")
-        if self.emotes.enabled:
-            self._emotes_task = asyncio.create_task(self.emotes.run(), name="chat-emotes")
 
     async def _fetch_cheermotes(self) -> list[Any]:
         # App-token request (no user token needed): global cheermotes plus the
@@ -421,32 +325,168 @@ class TwitchChatBot(commands.Bot):
     async def event_ready(self) -> None:
         log.info("Twitch chat bot ready (bot_id=%s).", self._bot_id)
 
+    async def _try_subscribe_chat(self) -> None:
+        if self.status.chat_subscribed:
+            return
+        self._log_token_diagnostics()
+        subscription = eventsub.ChatMessageSubscription(
+            broadcaster_user_id=self._owner_id,
+            user_id=self._bot_id,
+        )
+        try:
+            await self.subscribe_websocket(payload=subscription)
+            log.info("Subscribed to chat messages for broadcaster=%s bot=%s", self._owner_id, self._bot_id)
+            self.status.chat_subscribed = True
+        except Exception as e:
+            if self._oauth_complete():
+                log.exception(
+                    "Chat subscription failed even though both accounts have saved tokens — "
+                    "chat commands won't work until this is fixed. See the token diagnostics "
+                    "logged above, or redo the OAuth steps in README.md with &force_verify=true "
+                    "if a token was revoked or scopes changed. Error: %s",
+                    e,
+                )
+            else:
+                log.warning(
+                    "Skipping chat subscription for now — the one-time OAuth steps in "
+                    "README.md aren't done for both accounts yet at %s. Will retry "
+                    "automatically as soon as a token is saved, no restart needed. Error: %s",
+                    self._token_storage_path,
+                    e,
+                )
+
+    async def _try_subscribe_alerts(self) -> None:
+        """Follow/sub/cheer/raid and stream online/offline EventSub subscriptions.
+        Independent of the feature toggles (subscribing has no side effects; the
+        toggles only gate what an arriving event *says*) and of each other. Re-run
+        from save_tokens() so a scope granted after startup is picked up without a
+        restart."""
+        attempts = (
+            (
+                "follow",
+                eventsub.ChannelFollowSubscription(broadcaster_user_id=self._owner_id, moderator_user_id=self._bot_id),
+            ),
+            ("subscription", eventsub.ChannelSubscribeSubscription(broadcaster_user_id=self._owner_id)),
+            ("cheer", eventsub.ChannelCheerSubscription(broadcaster_user_id=self._owner_id)),
+            ("raid", eventsub.ChannelRaidSubscription(to_broadcaster_user_id=self._owner_id)),
+            ("stream_online", eventsub.StreamOnlineSubscription(broadcaster_user_id=self._owner_id)),
+            ("stream_offline", eventsub.StreamOfflineSubscription(broadcaster_user_id=self._owner_id)),
+            ("hype_train_begin", eventsub.HypeTrainBeginSubscription(broadcaster_user_id=self._owner_id)),
+            ("hype_train_progress", eventsub.HypeTrainProgressSubscription(broadcaster_user_id=self._owner_id)),
+            ("hype_train_end", eventsub.HypeTrainEndSubscription(broadcaster_user_id=self._owner_id)),
+            # Needs channel:manage:predictions (the same scope !predict itself
+            # needs to create/end one) — subscribing costs nothing extra if
+            # that scope is already missing, this attempt just also fails.
+            ("prediction_end", eventsub.ChannelPredictionEndSubscription(broadcaster_user_id=self._owner_id)),
+        )
+        for name, subscription in attempts:
+            if self.status.alert_subscriptions.get(name):
+                continue
+            try:
+                await self.subscribe_websocket(payload=subscription)
+                self.status.alert_subscriptions[name] = True
+                log.info("Subscribed to %s events.", name)
+            except Exception as e:
+                # Routine, not a warning — most optional scopes are never granted.
+                self.status.alert_subscriptions.setdefault(name, False)
+                log.info("Skipping %s events for now (%s) — see module docstring for the optional scope.", name, e)
+
+    def _note_scope_failure(self, scope_key: str, e: HTTPException, what: str, scope: str) -> None:
+        if e.status in (401, 403):
+            if scope_key not in self.status.scopes_missing:
+                log.warning(
+                    "%s failed with HTTP %s — the bot's token is probably missing %s. Staying off for "
+                    "the rest of this run; see chatbot.py's module docstring for the OAuth step. (%s)",
+                    what, e.status, scope, e,
+                )
+            self.status.scopes_missing.add(scope_key)
+
+    async def try_shoutout(self, to_user_id: str, to_display_name: str) -> bool:
+        """Best-effort — shared by the auto-raid-shoutout and !so. Needs
+        moderator:manage:shoutouts; a permission failure is remembered so a train
+        of raids doesn't repeat the same warning."""
+        if "shoutout" in self.status.scopes_missing:
+            return False
+        try:
+            broadcaster = self.create_partialuser(user_id=self.owner_id_required)
+            await broadcaster.send_shoutout(to_broadcaster=to_user_id, moderator=self.bot_id)
+            return True
+        except HTTPException as e:
+            if e.status in (401, 403):
+                self._note_scope_failure("shoutout", e, "Shoutout", "moderator:manage:shoutouts")
+            else:
+                # Likely Twitch's own shoutout cooldown — routine, not a scope issue.
+                log.info("Shoutout to %s not sent (%s) — likely Twitch's own cooldown.", to_display_name, e)
+            return False
+        except Exception:
+            log.debug("Shoutout to %s failed (non-fatal).", to_display_name, exc_info=True)
+            return False
+
+    async def delete_message(self, message_id: str) -> bool:
+        """Deletes one chat message (needs moderator:manage:chat_messages)."""
+        try:
+            broadcaster = self.create_partialuser(user_id=self.owner_id_required)
+            await broadcaster.delete_chat_messages(moderator=self.bot_id, message_id=message_id)
+            return True
+        except HTTPException as e:
+            self._note_scope_failure("delete", e, "Message delete", "moderator:manage:chat_messages")
+        except Exception:
+            log.debug("Message delete failed (non-fatal).", exc_info=True)
+        return False
+
+    async def timeout_user(self, user_id: str, seconds: int, reason: str) -> bool:
+        """Times a chatter out (needs moderator:manage:banned_users)."""
+        try:
+            broadcaster = self.create_partialuser(user_id=self.owner_id_required)
+            await broadcaster.timeout_user(moderator=self.bot_id, user=user_id, duration=seconds, reason=reason)
+            return True
+        except HTTPException as e:
+            self._note_scope_failure("timeout", e, "Timeout", "moderator:manage:banned_users")
+        except Exception:
+            log.debug("Timeout failed (non-fatal).", exc_info=True)
+        return False
+
+    async def setup_hook(self) -> None:
+        await self.automod.load()
+        await self.custom.load()
+        await self.counters.load()
+        for component in (
+            ModerationComponent(self),
+            InfoComponent(self),
+            EconomyComponent(self),
+            CustomCommandsComponent(self),
+            TimersComponent(self),
+            AlertsComponent(self),
+            StreamInfoComponent(self),
+            QuotesComponent(self),
+            EightBallComponent(self),
+            CountersComponent(self),
+            GamesComponent(self),
+            QueueComponent(self),
+            GiveawayComponent(self),
+            PredictionsComponent(self),
+        ):
+            await self.add_component(component)
+        await self._try_subscribe_chat()
+        await self._try_subscribe_alerts()
+        self._points_task = asyncio.create_task(self._points_award_loop(), name="points-award-loop")
+        if self.emotes.enabled:
+            self._emotes_task = asyncio.create_task(self.emotes.run(), name="chat-emotes")
+
     async def announce(self, message: str) -> None:
-        """Sends a message to the broadcaster's channel — used by the
-        moderation filter below (no command Context to reply() from there).
-        Not tied to a Context, so this goes through PartialUser.send_message
-        directly."""
+        """Sends a message to the broadcaster's channel (no command Context to
+        reply() from — timers, filters, alerts). Best-effort."""
         channel = self.create_partialuser(user_id=self.owner_id_required)
         text = self._decorate(message)
         try:
             await channel.send_message(sender=self.bot_id, message=text)
         except (TwitchioException, ValueError) as e:
-            # Same rationale as safe_reply: a delivery failure is Twitch
-            # declining to show a message, not a caller bug — every caller
-            # already treats announcing as best-effort.
             log.info("Announcement not delivered (%s): %r", type(e).__name__, text)
 
     async def safe_reply(self, ctx: commands.Context, message: str) -> None:
         """ctx.reply() that swallows Twitch's delivery failures (rate limit,
-        exact-duplicate-message rule — both TwitchioException) instead of
-        letting them propagate. Two chatters triggering the same reply back
-        to back hits the duplicate-message rule normally, not just rapid
-        self-testing.
-
-        Every message gets a rotating suffix (_DEDUP_SUFFIXES) unconditionally
-        before delivery — Twitch's own dedup window isn't something this
-        process can reliably reconstruct.
-        """
+        duplicate-message rule) instead of letting them propagate. Every message
+        gets a rotating suffix unconditionally — see DEFAULT_REPLY_SUFFIXES."""
         text = self._decorate(message)
         try:
             await ctx.reply(text)
@@ -454,209 +494,198 @@ class TwitchChatBot(commands.Bot):
             log.info("Chat reply not delivered (%s): %r", type(e).__name__, text)
 
     def _decorate(self, message: str) -> str:
-        """Adds the rotating anti-dedup suffix and enforces Twitch's
-        500-char limit. Shared by safe_reply()/announce() — announce()'s
-        filter warnings are if anything more exposed to the dedup rule,
-        since a repeat offender triggers the same warning every time.
-
-        Truncating beats the alternative: over the limit, send_message
-        raises and the message never appears, which looks exactly like
-        the bot ignoring the command.
-        """
-        suffix = _DEDUP_SUFFIXES[self._reply_counter % len(_DEDUP_SUFFIXES)]
-        self._reply_counter += 1
+        """Adds the rotating anti-dedup suffix and enforces Twitch's 500-char
+        limit (over it, send_message raises and the message never appears)."""
+        suffix = ""
+        if self._reply_suffixes:
+            suffix = self._reply_suffixes[self._reply_counter % len(self._reply_suffixes)]
+            self._reply_counter += 1
         budget = _MAX_CHAT_MESSAGE_LENGTH - len(suffix)
         if len(message) > budget:
             message = message[: budget - 1] + "\u2026"
         return f"{message}{suffix}"
 
+    # -- incoming chat ----------------------------------------------------
+
     async def event_message(self, message: ChatMessage) -> None:
         # super() first and unconditionally — Bot.event_message is what
-        # dispatches commands, so skipping it would silently break every
-        # command in the bot.
+        # dispatches commands, so skipping it would silently break every command.
         await super().event_message(message)
         try:
-            await self._track_and_filter(message)
+            await self._process_chat(message)
         except Exception:
-            log.debug("event_message tracking/filter hook failed (non-fatal).", exc_info=True)
+            # Bookkeeping must never take command handling down with it.
+            log.exception("Chat processing failed for message %s.", getattr(message, "id", "?"))
 
-    async def _track_and_filter(self, message: ChatMessage) -> None:
-        # EventSub delivers the bot's own messages back like any other —
-        # no `.echo` flag on ChatMessage — so filter the same way the base
-        # class does for command dispatch: chatter.id == bot_id.
+    async def _process_chat(self, message: ChatMessage) -> None:
         chatter = message.chatter
-        chatter_id = chatter.id
-        if chatter_id == self._bot_id:
+        if chatter is None or str(chatter.id) == self._bot_id:
             return
-        self.last_seen[chatter_id] = time.monotonic()
-        self.last_seen_name[chatter_id] = chatter.display_name or chatter_id
-        text = message.text or ""
-
-        # Every non-bot message reaches the overlay, mods/broadcaster
-        # included — only the link/caps filter exemption below is mod-only.
-        # Must happen before the moderator early-return or a mod's own
-        # messages would never appear on stream.
-        if text:
-            try:
-                fragments = self.emotes.decorate(fragments_to_dicts(getattr(message, "fragments", ())))
-            except Exception:
-                # Emote artwork is decoration: if building it ever fails, the
-                # message still reaches the overlay as plain text.
-                log.debug("Building emote fragments failed (non-fatal).", exc_info=True)
-                fragments = None
-            self.chat_feed.append(chatter.display_name or str(chatter_id), text, fragments=fragments)
-
-        if chatter.moderator:  # covers the broadcaster too — see Chatter.moderator
-            return  # mods/broadcaster exempt from the chat filters below
-        if not text:
-            return
-        toggles = FeatureToggles.from_dict(await self.toggles_store.read())
-        display_name = self.last_seen_name[chatter_id]
-        flagged = False
-        if toggles.link_filter_enabled and _LINK_RE.search(text):
-            await self.announce(f"@{display_name} links aren't allowed in chat — ask a mod if that's wrong.")
-            flagged = True
-        elif toggles.caps_filter_enabled and _is_excessive_caps(text):
-            await self.announce(f"@{display_name} easy on the caps!")
-            flagged = True
-        if flagged and toggles.filter_delete_enabled:
-            await self._run_filter_delete(message)
-
-    async def _run_filter_delete(self, message: ChatMessage) -> None:
-        """Deletes a message the filter above flagged — separate from the
-        warn-only path since it needs moderator:manage:chat_messages, a
-        scope the default OAuth setup doesn't request. Logs once on a
-        missing scope, then stays warn-only rather than retrying forever."""
-        if self._delete_scope_missing:
-            return
+        name = display_name_of(chatter)
         try:
-            await message.broadcaster.delete_chat_messages(moderator=self.bot_id, message_id=message.id)
-        except HTTPException as e:
-            if e.status in (401, 403):
-                self._delete_scope_missing = True
-                log.warning(
-                    "filter_delete_enabled is on, but deleting a message failed with HTTP %s — the bot's "
-                    "token is probably missing moderator:manage:chat_messages. Staying warn-only for the "
-                    "rest of this run; see chatbot.py's module docstring for the OAuth step to add it. (%s)",
-                    e.status, e,
-                )
-            else:
-                log.debug("Failed to delete a flagged chat message (non-fatal): %s", e, exc_info=True)
+            fragments: list[dict[str, object]] = self.emotes.decorate(fragments_to_dicts(message.fragments))
         except Exception:
-            log.debug("Failed to delete a flagged chat message (non-fatal).", exc_info=True)
+            # Emote artwork is cosmetic: the message still reaches the overlay
+            # (and the filters) as plain text.
+            log.debug("Building emote fragments failed (non-fatal).", exc_info=True)
+            fragments = []
+        # The overlay first: it is the one consumer that must see every message,
+        # even when a later step throws.
+        self.chat_feed.append(name, message.text, fragments=fragments or None)
+        self.chat_messages += 1
+        self.status.last_chat_message_at = time.monotonic()
+        event = ChatEvent(
+            user_id=str(chatter.id),
+            login=chatter.name or "",
+            name=name,
+            text=message.text,
+            message_id=str(getattr(message, "id", "") or ""),
+            fragments=fragments,
+            is_moderator=bool(chatter.moderator),
+            is_vip=bool(chatter.vip),
+            is_subscriber=bool(chatter.subscriber),
+        )
+        self.economy.note_activity(event)
+        await self.automod.inspect(event)
 
-    async def _try_custom_command(self, ctx: commands.Context, name: str) -> bool:
-        """Dispatches a mod-defined !addcom response — hooked from
-        event_command_error's CommandNotFound branch rather than a second
-        parsing layer, reusing ctx.content (already proven present there)."""
-        remaining = self.custom_command_cooldowns.remaining(name, _CUSTOM_COMMAND_COOLDOWN_SECONDS)
-        if remaining > 0:
-            return True  # swallow silently — don't spam chat about a cooldown on a custom command
-        response = await self.db.get_command(name)
-        if response is None:
-            return False
-        self.custom_command_cooldowns.mark(name)
-        display_name = ctx.chatter.display_name or ctx.chatter.name or "there"
-        text = response.replace("{user}", display_name)
-        # safe_reply, not ctx.reply: !addcom never length-checks the
-        # response (could raise ValueError), and firing the same custom
-        # command twice in a row is exactly Twitch's dedup case.
-        await self.safe_reply(ctx, text)
-        return True
+    # -- live state and passive points -------------------------------------
 
-    async def _points_award_loop(self) -> None:
-        while True:
-            await asyncio.sleep(_AWARD_TICK_SECONDS)
-            try:
-                await self._run_points_award_tick()
-            except Exception:
-                log.debug("Points award tick failed (non-fatal).", exc_info=True)
-
-    async def _channel_is_live(self) -> bool:
-        """Best-effort, cached for _LIVE_CHECK_TTL_SECONDS. On a lookup
-        failure this reports True — the points loop is a nice-to-have, and
-        silently zeroing out everyone's earnings because one Helix call
-        timed out is a worse failure than over-awarding for one tick."""
+    async def channel_is_live(self) -> bool:
+        """Best-effort, cached. EventSub stream.online/offline update the state
+        instantly; otherwise a Helix poll refreshes it every _LIVE_CHECK_TTL_SECONDS.
+        On a failed lookup the last known state is kept (assuming live if there
+        is none) — silently zeroing everyone's earnings over one timed-out call
+        is worse than over-awarding for a tick."""
         now = time.monotonic()
-        if self._live_cache is not None and now - self._live_cache[1] < _LIVE_CHECK_TTL_SECONDS:
-            return self._live_cache[0]
+        known = self.status.live.is_live
+        if known is not None and now - self._live_checked_at < _LIVE_CHECK_TTL_SECONDS:
+            return known
         try:
             stream = await self.create_partialuser(user_id=self.owner_id_required).fetch_stream()
             live = stream is not None
         except Exception:
-            log.debug("Live check failed (non-fatal) — assuming live.", exc_info=True)
-            live = True
-        self._live_cache = (live, now)
+            log.debug("Live check failed (non-fatal).", exc_info=True)
+            return True if known is None else known
+        self._live_checked_at = now
+        self._set_live(live)
         return live
 
-    async def _run_points_award_tick(self) -> None:
-        now = time.monotonic()
-        stale = [uid for uid, ts in self.last_seen.items() if now - ts > _LAST_SEEN_PRUNE_SECONDS]
-        for uid in stale:
-            self.last_seen.pop(uid, None)
-            self.last_seen_name.pop(uid, None)
+    def _set_live(self, live: bool) -> bool:
+        """Records a live/offline reading; True if the state actually changed."""
+        first = self.status.live.is_live is None
+        flipped = self.status.live.update(live)
+        if live and (flipped or first):
+            self.economy.reset_session()
+        self._live_checked_at = time.monotonic()
+        return flipped
 
+    async def event_stream_online(self, payload: StreamOnline) -> None:
+        self._set_live(True)
+        log.info("Stream went live.")
+
+    async def event_stream_offline(self, payload: StreamOffline) -> None:
+        flipped = self._set_live(False)
+        log.info("Stream went offline.")
+        if not flipped:
+            return
+        toggles = FeatureToggles.from_dict(await self.toggles_store.read())
+        summary = self.economy.session_summary()
+        if toggles.stream_summary_enabled and summary:
+            await self.announce(f"Thanks for hanging out! {summary}")
+        self.economy.reset_session()
+
+    async def _points_award_loop(self) -> None:
+        while True:
+            await asyncio.sleep(AWARD_TICK_SECONDS)
+            try:
+                await self.economy.award_tick()
+            except Exception:
+                log.exception("Points award tick failed (non-fatal).")
+
+    # -- errors -----------------------------------------------------------
+
+    async def _try_custom_command(self, ctx: commands.Context, name: str) -> bool:
+        content = getattr(ctx, "content", "") or ""
+        args = content[len(self.prefix) + len(name) :].strip() if content.startswith(self.prefix) else ""
+        chatter = ctx.chatter
+        channel = display_name_of(ctx.broadcaster) or "the channel"
         tunables = TwitchTunables.from_dict(await self.tunables_store.read())
-        if tunables.points_per_active_minute <= 0:
-            return
-        active = [uid for uid, ts in self.last_seen.items() if now - ts <= _ACTIVE_WINDOW_SECONDS]
-        if not active:
-            return
-        # README describes these as earned "while live"; nothing enforced
-        # that before, so !leaderboard could just measure who idles in an
-        # offline channel.
-        if not await self._channel_is_live():
-            return
-        entries = [
-            (uid, self.last_seen_name.get(uid, uid), tunables.points_per_active_minute, int(_AWARD_TICK_SECONDS))
-            for uid in active
-        ]
-        await self.db.bulk_award(entries)
+        reply = await self.custom.execute(
+            name,
+            user=display_name_of(chatter),
+            args=args,
+            channel=str(channel),
+            default_cooldown=tunables.custom_command_cooldown_seconds,
+            subscriber=bool(getattr(chatter, "subscriber", False)),
+            vip=bool(getattr(chatter, "vip", False)),
+            moderator=bool(getattr(chatter, "moderator", False)),
+        )
+        if reply is None:
+            return False
+        await self.safe_reply(ctx, reply)
+        return True
+
+    async def _try_counter_command(self, ctx: commands.Context, token: str) -> bool:
+        """`!<name>` shows a counter's value; `!<name>++`/`!<name>--` adjusts
+        it (mod-only unless the counter is marked public — see counters.py).
+        `token` is tried as-is (case already lowered by the caller), so this
+        only ever matches a real counter name, with or without the suffix."""
+        split = split_suffix(token)
+        if split is None:
+            return False
+        name, suffix = split
+        if suffix is None:
+            reply = self.counters.view(name)
+        else:
+            reply = await self.counters.apply_suffix(
+                name, suffix, is_moderator=bool(getattr(ctx.chatter, "moderator", False))
+            )
+        if reply is None:
+            return False
+        await self.safe_reply(ctx, reply)
+        return True
 
     async def event_command_error(self, payload: commands.CommandErrorPayload) -> None:
         exc = payload.exception
         ctx = payload.context
         if isinstance(exc, commands.CommandNotFound):
-            # Fires for every prefixed message that isn't ours — with
-            # another bot sharing "!" (Nightbot, StreamElements), that's
-            # most of them, so try a custom command before giving up.
+            # Fires for every prefixed message that isn't ours — with another bot
+            # sharing "!" that's most of them, so try a custom command, then a
+            # counter (both dict lookups, no database hit) before giving up quietly.
             content = getattr(ctx, "content", "") or ""
             if content.startswith(self.prefix):
-                name = content[len(self.prefix) :].split(maxsplit=1)[0].lower()
-                if name:
+                parts = content[len(self.prefix) :].split(maxsplit=1)
+                if parts:
+                    token = parts[0].lower()
                     with contextlib.suppress(Exception):
-                        if await self._try_custom_command(ctx, name):
-                            return
+                        if not await self._try_custom_command(ctx, token):
+                            await self._try_counter_command(ctx, token)
             return
         if isinstance(exc, commands.GuardFailure):
-            await self.safe_reply(ctx, "You don't have permission to use that command.")
+            # Stay quiet: replying to every non-mod who tries a mod command is
+            # chat noise (and, with another bot sharing the prefix, often wrong).
+            log.debug("Guard failure for %r", getattr(ctx, "content", ""))
             return
         if isinstance(exc, commands.MissingRequiredArgument):
-            # ctx.command.name is the canonical name even via an alias.
             name = ctx.command.name if ctx.command is not None else None
             usage = _USAGE.get(name) if name else None
-            await self.safe_reply(ctx, usage or f"Missing an argument for !{name or 'that command'}.")
+            await self.safe_reply(ctx, usage or f"Missing an argument for {self.prefix}{name or 'that command'}.")
+            return
+        if isinstance(exc, commands.BadArgument):
+            await self.safe_reply(ctx, "I couldn't understand that argument.")
             return
         log.error("Command error in %r: %r", getattr(ctx, "content", "<unknown>"), exc, exc_info=exc)
 
     async def close(self, **options: Any) -> None:
-        """Deliberately doesn't close self.db — the admin server outlives
-        this object during shutdown, and a /settings request landing in
-        that window used to hit "Database.connect() was never called" on
-        the already-closed connection. bot.py creates and closes the
-        database itself, after the HTTP surface is down.
-
-        `**options` (e.g. `save_tokens`) passes straight through to
-        commands.Bot.close/Client.close; this signature is only widened to
-        match the base class."""
-        if self._points_task is not None:
-            self._points_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._points_task
-            self._points_task = None
-        if self._emotes_task is not None:
-            self._emotes_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._emotes_task
-            self._emotes_task = None
+        """Deliberately doesn't close self.db — the admin server outlives this
+        object during shutdown, so bot.py creates and closes the database itself
+        after the HTTP surface is down. `**options` (e.g. `save_tokens`) passes
+        straight through to commands.Bot.close/Client.close."""
+        for task in (self._points_task, self._emotes_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        self._points_task = None
+        self._emotes_task = None
         await super().close(**options)

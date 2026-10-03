@@ -399,20 +399,23 @@ else
   echo "${CYAN}-- Chat --${RESET}"
   prompt_optional_field TWITCH_PREFIX "!" 0 0 \
     "— Command prefix in chat (!points, !leaderboard, ...)."
+  prompt_optional_field TWITCH_RESERVED_COMMANDS "" 0 0 \
+    "— Command names another bot in your channel answers to (e.g. sr,skip)." \
+    "    Mods then can't create a custom command with those names."
 
   echo ""
   echo "${CYAN}-- HTTP surface (/commands, /chat-overlay, /settings) --${RESET}"
-  if [[ -n "$(get_env_var "TWITCH_NOWPLAYING_HOST" "${ENV_PATH}")" ]]; then
-    info "TWITCH_NOWPLAYING_HOST is already set — leaving it alone."
-    prompt_optional_field TWITCH_NOWPLAYING_PORT "8098" 0 1 \
+  if [[ -n "$(get_env_var "TWITCH_HTTP_HOST" "${ENV_PATH}")" ]]; then
+    info "TWITCH_HTTP_HOST is already set — leaving it alone."
+    prompt_optional_field TWITCH_HTTP_PORT "8098" 0 1 \
       "— Port for the HTTP surface (1024-65535)."
     prompt_optional_field TWITCH_SETTINGS_PASSWORD "" 1 0 \
       "— Sign-in password for /settings. Required once the bot is reachable" \
       "    from anywhere but this machine."
   else
-    set_env_var "TWITCH_NOWPLAYING_HOST" "127.0.0.1" "${ENV_PATH}"
-    success "TWITCH_NOWPLAYING_HOST = 127.0.0.1 (Caddy is the only thing that faces the internet)"
-    prompt_optional_field TWITCH_NOWPLAYING_PORT "8098" 0 1 \
+    set_env_var "TWITCH_HTTP_HOST" "127.0.0.1" "${ENV_PATH}"
+    success "TWITCH_HTTP_HOST = 127.0.0.1 (Caddy is the only thing that faces the internet)"
+    prompt_optional_field TWITCH_HTTP_PORT "8098" 0 1 \
       "— Port for the HTTP surface (1024-65535)."
 
     echo ""
@@ -470,7 +473,7 @@ success "Installed /etc/systemd/system/${SERVICE_NAME}.service (not started yet)
 
 echo "[7/7] Caddy"
 caddy_ok=0
-bot_port="$(get_env_var TWITCH_NOWPLAYING_PORT "${ENV_PATH}")"
+bot_port="$(get_env_var TWITCH_HTTP_PORT "${ENV_PATH}")"
 bot_port="${bot_port:-8098}"
 if [[ -z "${SITE_ADDRESS}" ]]; then
   info "Skipping. To add it later: CADDY_DOMAIN=radio.example.com ${BASH_SOURCE[0]}"

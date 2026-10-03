@@ -11,6 +11,8 @@ from twitch_radio.chatbot import TwitchChatBot
 from twitch_radio.chatfeed import ChatFeed
 from twitch_radio.config import Settings, load_settings
 from twitch_radio.db import Database
+from twitch_radio.maintenance import backup_loop
+from twitch_radio.runtime import RuntimeStatus
 from twitch_radio.store import JsonStore
 
 _bg_tasks: set[asyncio.Task[object]] = set()
@@ -42,9 +44,10 @@ async def _async_run(settings: Settings) -> None:
     db = Database(settings.db_path)
     await db.connect()
     # Shared between the chat bot (appends every non-bot message — see
-    # chatbot.py's _track_and_filter) and the admin server (/chat-overlay,
+    # chatbot.py's _process_chat) and the admin server (/chat-overlay,
     # /chat.json, /ws/chat).
     chat_feed = ChatFeed()
+    status = RuntimeStatus()
 
     # Nested try/finally per resource (not one big try around just the chat
     # bot) so a failure acquiring a *later* resource still tears down
@@ -52,6 +55,7 @@ async def _async_run(settings: Settings) -> None:
     try:
         admin_runner = await run_admin_server(
             chat_feed=chat_feed,
+            status=status,
             tunables_store=tunables_store,
             specs_store=specs_store,
             toggles_store=toggles_store,
@@ -61,8 +65,8 @@ async def _async_run(settings: Settings) -> None:
                 "Chat overlay": "/chat-overlay",
                 "Chat command prefix": settings.prefix,
             },
-            host=settings.nowplaying_host,
-            port=settings.nowplaying_port,
+            host=settings.http_host,
+            port=settings.http_port,
             trusted_proxies=settings.trusted_proxies,
             session_hours=settings.session_hours,
             session_remember_days=settings.session_remember_days,
@@ -83,7 +87,16 @@ async def _async_run(settings: Settings) -> None:
                 token_storage_path=settings.token_path,
                 public_base_url=settings.public_base_url,
                 emote_sources=settings.chat_emote_sources,
+                status=status,
+                reply_suffixes=settings.reply_suffixes,
+                reserved_commands=settings.reserved_commands,
             )
+            if settings.db_backup_keep > 0:
+                backup_task = asyncio.create_task(
+                    backup_loop(db, settings.backup_dir, settings.db_backup_keep), name="db-backup"
+                )
+                _bg_tasks.add(backup_task)
+                backup_task.add_done_callback(_bg_tasks.discard)
 
             loop = asyncio.get_running_loop()
 
@@ -186,7 +199,7 @@ def _check_config() -> int:
         login = "no password — /settings is reachable only from this machine, never through a proxy"
     else:
         login = f"password {'hashed' if is_password_hash(settings.settings_password) else 'set (plain text)'}"
-    print(f"  HTTP: http://{settings.nowplaying_host}:{settings.nowplaying_port} ({login})")
+    print(f"  HTTP: http://{settings.http_host}:{settings.http_port} ({login})")
     print(
         f"  Sessions: {settings.session_hours}h"
         + (f", or {settings.session_remember_days}d with 'keep me signed in'" if settings.session_remember_days else "")

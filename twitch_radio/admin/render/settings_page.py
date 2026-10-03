@@ -18,7 +18,7 @@ from twitch_radio.admin.assets import static_text, template
 from twitch_radio.commands_reference import COMMANDS
 from twitch_radio.specs import MAX_FIELD_LENGTH, PC_SPEC_FIELDS, PERIPHERAL_FIELDS, PCSpecs, Peripherals
 from twitch_radio.toggles import TOGGLE_KEYS, FeatureToggles
-from twitch_radio.tunables import TUNABLE_BOUNDS, TUNABLE_LABELS, TwitchTunables
+from twitch_radio.tunables import TUNABLE_BOUNDS, TUNABLE_GROUPS, TUNABLE_LABELS, TwitchTunables
 
 # Hidden field present only in the /settings form this module renders. The POST
 # handler uses it to tell a browser submitting the full form (unchecked boxes
@@ -39,11 +39,20 @@ class LiveStatus:
 
 
 def _tunable_rows(tunables: TwitchTunables) -> str:
-    rows = []
+    """One field per tunable, under a small heading per group (the group is
+    declared next to the tunable in tunables.py)."""
+    out: list[str] = []
+    current_group = None
     for name, (lo, hi) in TUNABLE_BOUNDS.items():
+        group = TUNABLE_GROUPS.get(name, "")
+        if group != current_group:
+            if current_group is not None:
+                out.append("</div>")
+            out.append(f'<h3 class="group">{escape(group)}</h3><div class="grid">')
+            current_group = group
         label, help_text = TUNABLE_LABELS.get(name, (name, ""))
         value = getattr(tunables, name)
-        rows.append(
+        out.append(
             f'<div class="field">'
             f'<label for="f-{escape(name)}">{escape(label)}</label>'
             f'<input id="f-{escape(name)}" type="number" name="{escape(name)}" '
@@ -51,7 +60,9 @@ def _tunable_rows(tunables: TwitchTunables) -> str:
             f'<p class="help">{escape(help_text)} <span class="range">{lo}\u2013{hi}</span></p>'
             f'</div>'
         )
-    return "".join(rows)
+    if current_group is not None:
+        out.append("</div>")
+    return "".join(out)
 
 
 def _toggle_rows(toggles: FeatureToggles) -> str:
@@ -168,6 +179,26 @@ def render_settings_page(
         if custom_commands
         else ""
     )
+    timers = community.get("timers", [])
+    if timers:
+        listing = ", ".join(
+            f"<code>{escape(t.name)}</code> ({t.interval_minutes}m{'' if t.enabled else ', off'})" for t in timers
+        )
+        custom_commands_html += f'<p class="help">Timers: {listing}</p>'
+    blocked = community.get("blocked_term_count", 0)
+    domains = community.get("allowed_domains", [])
+    if blocked or domains:
+        allowed = ", ".join(f"<code>{escape(d)}</code>" for d in domains) or "none"
+        custom_commands_html += (
+            f'<p class="help">Blocked terms: {blocked} (kept out of view). Allowed link domains: {allowed}</p>'
+        )
+    counters = community.get("counters", [])
+    if counters:
+        listing = ", ".join(f"<code>{prefix}{escape(n)}</code>" for n in counters)
+        custom_commands_html += f'<p class="help">Counters: {listing}</p>'
+    quote_count = community.get("quote_count", 0)
+    if quote_count:
+        custom_commands_html += f'<p class="help">{quote_count} quote(s) saved — {prefix}quote to see one.</p>'
     logo = '<img class="mark" src="/logo.png" alt="" onerror="this.remove()">' if has_logo else ""
     return template("settings.html").substitute(
         css=static_text("settings.css"),

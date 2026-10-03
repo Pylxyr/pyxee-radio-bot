@@ -52,14 +52,11 @@ class InfoComponent(commands.Component):
         p = self.bot.prefix
         anyone = [c for c in COMMANDS if c.public and c.group == "anyone"]
         mods = [c for c in COMMANDS if c.public and c.group == "moderators"]
-        # !sr is the one command worth a visible argument hint here — it's
-        # the single most-used command and the one people are most likely
-        # to type bare and wonder what goes after it.
-        main = " | ".join(
-            f"{p}{c.name} <song/URL>" if c.name == "sr" else f"{p}{c.name}" for c in anyone
-        )
-        mod_list = ", ".join(f"{p}{c.name}" for c in mods)
-        await self.bot.safe_reply(
-            ctx, f"{main}  |  mods: {mod_list}  |  full reference (incl. a couple of mod-only "
-                 f"extras not shown here): /settings"
-        )
+        parts = [" | ".join(f"{p}{c.name}" for c in anyone), "mods: " + ", ".join(f"{p}{c.name}" for c in mods)]
+        custom = self.bot.custom.all()
+        if custom:
+            parts.append("custom: " + ", ".join(f"{p}{c.name}" for c in custom))
+        counters = self.bot.counters.all()
+        if counters:
+            parts.append("counters: " + ", ".join(f"{p}{c.name}" for c in counters))
+        await self.bot.safe_reply(ctx, "  |  ".join(parts))

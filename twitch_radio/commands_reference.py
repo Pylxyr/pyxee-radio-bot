@@ -32,7 +32,7 @@ _GROUPS = ("anyone", "moderators")
 # Tab order on the public /commands page, and the source of truth for
 # which categories exist — a command naming one not in this tuple would
 # silently never render there; the self-test below catches that.
-CATEGORIES: tuple[str, ...] = ("Points & Leaderboard", "Stream Info", "Moderator Tools")
+CATEGORIES: tuple[str, ...] = ("Points & Leaderboard", "Games & Fun", "Stream Info", "Moderator Tools")
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,12 +55,40 @@ _SETLIMIT_KEYS = ", ".join(TUNABLE_BOUNDS)
 _TOGGLE_KEYS_TEXT = ", ".join(TOGGLE_KEYS)
 
 COMMANDS: tuple[CommandInfo, ...] = (
-    CommandInfo(name="points", aliases=("balance",), description="Shows your points and tracked watch-time.",
+    CommandInfo(name="points", aliases=("balance",), usage="[user]",
+               description="Shows your points, watch-time and rank — or another chatter's.",
+               category="Points & Leaderboard"),
+    CommandInfo(name="rank", description="Shows your rank (Newcomer to Legend) and time to the next one.",
+               category="Points & Leaderboard"),
+    CommandInfo(name="daily", description="Claims your daily points bonus (once every ~20 hours).",
+               category="Points & Leaderboard"),
+    CommandInfo(name="give", aliases=("pay",), usage="<user> <amount>",
+               description="Gives some of your points to another chatter.", category="Points & Leaderboard"),
+    CommandInfo(name="gamble", aliases=("bet",), usage="<amount|all|half|25%>",
+               description="Bets points on a coin flip (off unless the streamer enables it).",
                category="Points & Leaderboard"),
     CommandInfo(name="watchtime", description="Shows your tracked chat-activity time.",
                category="Points & Leaderboard"),
-    CommandInfo(name="leaderboard", aliases=("top",), description="Shows the top 5 point earners.",
+    CommandInfo(name="leaderboard", aliases=("top",), usage="[watch]",
+               description="Shows the top 5 point earners — or the most chat time with `watch`.",
                category="Points & Leaderboard"),
+    CommandInfo(name="duel", usage="<user> <amount>",
+               description="Challenges another chatter to a points wager (off unless the streamer enables it).",
+               category="Points & Leaderboard"),
+    CommandInfo(name="accept", description="Accepts a pending !duel challenge against you.",
+               category="Points & Leaderboard"),
+    CommandInfo(name="decline", description="Declines a pending !duel challenge against you.",
+               category="Points & Leaderboard"),
+    CommandInfo(name="quote", usage="[id]", description="Shows a random quote, or a specific one by id.",
+               category="Games & Fun"),
+    CommandInfo(name="8ball", usage="<question>", description="Answers a yes/no question.",
+               category="Games & Fun"),
+    CommandInfo(name="queue", usage="[join|leave|list]",
+               description="Joins the viewer queue, or checks your position — mods: open|close|next|clear.",
+               category="Games & Fun"),
+    CommandInfo(name="giveaway", usage="[status]",
+               description="Enters the running giveaway — mods: start <prize>|pick|cancel.",
+               category="Games & Fun"),
     CommandInfo(name="specs", description="Shows the streamer's PC specs (set from /settings).",
                category="Stream Info"),
     CommandInfo(
@@ -70,26 +98,69 @@ COMMANDS: tuple[CommandInfo, ...] = (
     CommandInfo(name="commands", aliases=("help",), description="Lists the commands above.",
                category="Stream Info"),
     CommandInfo(
-        name="setlimit", group="moderators", who="Moderators", usage="<key> <value>",
-        description=f"Adjusts one runtime tunable live — same keys/ranges as /settings. "
+        name="setlimit", group="moderators", who="Moderators", usage="<key> [value]",
+        description=f"Shows or sets one runtime tunable — same keys/ranges as /settings. "
                     f"Keys: {_SETLIMIT_KEYS}.",
         category="Moderator Tools",
     ),
     CommandInfo(
         name="toggle", group="moderators", who="Moderators", usage="<key> [on|off]",
-        description=f"Flips a feature toggle — same keys as /settings. Keys: {_TOGGLE_KEYS_TEXT}.",
+        description=f"Flips a feature toggle (or sets it with on/off) — same keys as /settings. "
+                    f"Keys: {_TOGGLE_KEYS_TEXT}.",
         category="Moderator Tools",
     ),
     CommandInfo(
         name="addcom", aliases=("editcom",), group="moderators", who="Moderators",
         usage="<name> <response text>",
-        description="Adds or edits a custom command. {user} in the response is replaced with the "
-                    "caller's display name.",
+        description="Adds or edits a custom command. Variables: {user} {touser} {args} {count} {channel}.",
+        category="Moderator Tools",
+    ),
+    CommandInfo(
+        name="comopt", group="moderators", who="Moderators", usage="<name> cd <seconds|default> | role <everyone|sub|vip|mod>",
+        description="Sets a custom command's cooldown or who may use it.", category="Moderator Tools",
+    ),
+    CommandInfo(
+        name="timer", group="moderators", who="Moderators",
+        usage="add <name> <minutes> <message> | remove|on|off <name> | min <name> <messages> | list",
+        description="Manages timers: messages posted every N minutes while live, once enough chat has happened.",
+        category="Moderator Tools",
+    ),
+    CommandInfo(
+        name="permit", group="moderators", who="Moderators", usage="<user> [seconds]",
+        description="Lets a chatter post links for a short while (the link filter ignores them).",
+        category="Moderator Tools",
+    ),
+    CommandInfo(
+        name="blockterm", group="moderators", who="Moderators", usage="add|remove <term> | list",
+        description="Manages the blocked-terms list used by the term filter.", category="Moderator Tools",
+    ),
+    CommandInfo(
+        name="allowdomain", group="moderators", who="Moderators", usage="add|remove <domain> | list",
+        description="Manages link domains the link filter always allows (subdomains included).",
         category="Moderator Tools",
     ),
     CommandInfo(
         name="delcom", group="moderators", who="Moderators", usage="<name>",
         description="Removes a custom command.", category="Moderator Tools",
+    ),
+    CommandInfo(
+        name="counter", group="moderators", who="Moderators", usage="add|del|set|public <name> [value] | list",
+        description="Manages a named counter (e.g. deaths) — view/adjust it with !<name>, !<name>++, !<name>--.",
+        category="Moderator Tools",
+    ),
+    CommandInfo(
+        name="addquote", group="moderators", who="Moderators", usage="<text>",
+        description="Saves a new quote.", category="Moderator Tools",
+    ),
+    CommandInfo(
+        name="delquote", group="moderators", who="Moderators", usage="<id>",
+        description="Removes a quote by id.", category="Moderator Tools",
+    ),
+    CommandInfo(
+        name="predict", group="moderators", who="Moderators",
+        usage="start <seconds> <title> ; <outcome> ; <outcome> [...] | lock | resolve <n> | cancel",
+        description="Runs a native Twitch prediction — needs channel:manage:predictions on the broadcaster's token.",
+        category="Moderator Tools",
     ),
     CommandInfo(name="uptime", description="Shows how long the stream's been live (or that it's offline).",
                category="Stream Info"),

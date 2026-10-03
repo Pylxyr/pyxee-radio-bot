@@ -1,57 +1,51 @@
+"""On/off feature switches, declared once as dataclass fields (see tunables.py
+for the same pattern). `TOGGLE_KEYS` (key -> description) is derived."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields
 from typing import Any
 
-# Same "single source of truth" idea as tunables.TUNABLE_BOUNDS — shared by
-# /settings and !toggle so both stay in sync on valid keys.
-TOGGLE_KEYS: dict[str, str] = {
-    "link_filter_enabled": "Warn on links from chatters (mods/broadcaster exempt)",
-    "caps_filter_enabled": "Warn on excessive-caps messages (mods/broadcaster exempt)",
-    "filter_delete_enabled": (
-        "Also delete the offending message (needs moderator:manage:chat_messages "
-        "on the bot's token — see README; silently stays warn-only without it)"
-    ),
-    "alerts_enabled": (
-        "Post chat announcements for follows/subs/cheers/raids, and auto-shoutout "
-        "a raider (needs extra OAuth scopes for some of these — see README; each "
-        "degrades independently, so this is safe to turn on regardless of which "
-        "scopes are actually granted)"
-    ),
-}
+
+def _b(default: bool, description: str) -> Any:
+    return field(default=default, metadata={"description": description})
 
 
 @dataclass(slots=True)
 class FeatureToggles:
-    # All default off — new chat-visible behavior (a filter warning, a
-    # follow announcement) is something the streamer should opt into, not
-    # discover.
-    link_filter_enabled: bool = False
-    caps_filter_enabled: bool = False
-    filter_delete_enabled: bool = False
-    alerts_enabled: bool = False
+    # Anything that makes the bot say something new defaults off — the
+    # streamer opts in rather than discovering it in chat.
+    link_filter_enabled: bool = _b(False, "Warn on links from chatters (mods/broadcaster exempt; see !permit and !allowdomain)")
+    caps_filter_enabled: bool = _b(False, "Warn on excessive-caps messages (emotes are ignored)")
+    term_filter_enabled: bool = _b(False, "Warn on blocked terms (manage with !blockterm)")
+    filter_delete_enabled: bool = _b(
+        False,
+        "Also delete the offending message (needs moderator:manage:chat_messages on the bot's token — "
+        "stays warn-only without it)",
+    )
+    filter_timeout_enabled: bool = _b(
+        False,
+        "Time a chatter out after repeated violations (needs moderator:manage:banned_users on the bot's token)",
+    )
+    filter_exempt_vips: bool = _b(True, "VIPs are exempt from the chat filters")
+    filter_exempt_subs: bool = _b(False, "Subscribers are exempt from the chat filters")
+    alerts_enabled: bool = _b(
+        False,
+        "Announce follows/subs/cheers/raids/Hype Trains in chat and auto-shoutout raiders (some need extra "
+        "OAuth scopes; each degrades independently)",
+    )
+    gamble_enabled: bool = _b(False, "Let chatters spend points on !gamble")
+    duels_enabled: bool = _b(False, "Let chatters wager points against each other with !duel")
+    timers_enabled: bool = _b(True, "Post scheduled timer messages while the channel is live (manage with !timer)")
+    stream_summary_enabled: bool = _b(False, "Post the top point earners when the stream ends")
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "FeatureToggles":
-        defaults = cls()
-
-        def _field(name: str, default: bool) -> bool:
-            if name not in data:
-                return default
-            value = data[name]
-            return value if isinstance(value, bool) else default
-
-        return cls(
-            link_filter_enabled=_field("link_filter_enabled", defaults.link_filter_enabled),
-            caps_filter_enabled=_field("caps_filter_enabled", defaults.caps_filter_enabled),
-            filter_delete_enabled=_field("filter_delete_enabled", defaults.filter_delete_enabled),
-            alerts_enabled=_field("alerts_enabled", defaults.alerts_enabled),
-        )
+    def from_dict(cls, data: dict[str, Any]) -> FeatureToggles:
+        values = {f.name: data[f.name] for f in fields(cls) if isinstance(data.get(f.name), bool)}
+        return cls(**values)
 
     def to_dict(self) -> dict[str, bool]:
-        return {
-            "link_filter_enabled": self.link_filter_enabled,
-            "caps_filter_enabled": self.caps_filter_enabled,
-            "filter_delete_enabled": self.filter_delete_enabled,
-            "alerts_enabled": self.alerts_enabled,
-        }
+        return {f.name: getattr(self, f.name) for f in fields(self)}
+
+
+TOGGLE_KEYS: dict[str, str] = {f.name: f.metadata["description"] for f in fields(FeatureToggles)}

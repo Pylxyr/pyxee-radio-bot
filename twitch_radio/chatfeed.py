@@ -5,10 +5,10 @@ public chat overlay (see the admin server's /chat-overlay, /chat.json,
 Deliberately not persisted: this is a live "what's happening right now"
 strip, not a chat log archive, so starting empty on every restart is
 correct, not a bug. The bot's own messages never reach this class —
-chatbot.py's _track_and_filter only calls append() after its own
-chatter.id == self._bot_id check returns, the same point every other
-per-chatter tracking hooks in, so there's one exclusion point, not two
-that could disagree.
+chatbot.py's `_process_chat` only calls append() after its own
+`chatter.id == self._bot_id` check returns, the same point every other
+per-chatter hook (the economy, AutoMod) plugs in, so there's one
+exclusion point, not several that could disagree.
 """
 
 from __future__ import annotations

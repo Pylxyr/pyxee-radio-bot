@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 from twitch_radio.admin.passwords import validate_stored_password
 from twitch_radio.netutil import DEFAULT_TRUSTED_PROXIES, IPNetwork, is_loopback_host, parse_networks
+from twitch_radio.runtime import DEFAULT_REPLY_SUFFIXES
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
@@ -55,6 +56,21 @@ _TRUE_TOKENS = {"1", "true", "yes", "on"}
 _FALSE_TOKENS = {"0", "false", "no", "off"}
 
 
+def _reply_suffixes_env(name: str) -> tuple[str, ...]:
+    """Comma-separated suffixes rotated onto bot messages; unset = the default set, "none" = no suffix."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return DEFAULT_REPLY_SUFFIXES
+    if raw.lower() in ("none", "off", "false", "0"):
+        return ()
+    return tuple(" " + token.strip() for token in raw.split(",") if token.strip())
+
+
+def _command_names_env(name: str) -> frozenset[str]:
+    """Comma-separated command names (with or without the prefix) another bot answers to."""
+    return frozenset(t.strip().lstrip("!").lower() for t in os.getenv(name, "").split(",") if t.strip().lstrip("!"))
+
+
 def _bool_env(name: str, default: bool) -> bool:
     raw = os.getenv(name, "").strip().lower()
     if not raw:
@@ -98,8 +114,8 @@ class Settings:
     prefix: str
 
     # Local HTTP surface — serves /chat-overlay, /commands, /settings
-    nowplaying_host: str
-    nowplaying_port: int
+    http_host: str
+    http_port: int
     settings_password: str | None
     settings_allow_open: bool
     session_hours: int
@@ -111,6 +127,10 @@ class Settings:
     # 7tv, bttv, ffz, cheermotes (Twitch's own emotes always work). Empty
     # tuple = none. TWITCH_CHAT_EMOTE_SOURCES.
     chat_emote_sources: tuple[str, ...]
+    reply_suffixes: tuple[str, ...]
+    reserved_commands: frozenset[str]
+    db_backup_keep: int
+    backup_dir: Path
 
     # Persistence — all under DATA_DIR so one ReadWritePaths entry in the
     # systemd unit covers everything this process writes.
@@ -156,14 +176,18 @@ def load_settings() -> Settings:
 
     chat_emote_sources = _emote_sources_env("TWITCH_CHAT_EMOTE_SOURCES")
 
-    nowplaying_host = os.getenv("TWITCH_NOWPLAYING_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    # TWITCH_NOWPLAYING_* are the pre-rename names; still honoured so existing
+    # .env files keep working.
+    http_host = (
+        os.getenv("TWITCH_HTTP_HOST") or os.getenv("TWITCH_NOWPLAYING_HOST") or "127.0.0.1"
+    ).strip() or "127.0.0.1"
     settings_password = os.getenv("TWITCH_SETTINGS_PASSWORD", "").strip() or None
     if settings_password is not None:
         password_problem = validate_stored_password(settings_password)
         if password_problem is not None:
             raise RuntimeError(f"TWITCH_SETTINGS_PASSWORD {password_problem}")
     settings_allow_open = _bool_env("TWITCH_SETTINGS_ALLOW_OPEN", False)
-    host_is_exposed = not is_loopback_host(nowplaying_host)
+    host_is_exposed = not is_loopback_host(http_host)
     if settings_password is None and settings_allow_open:
         print(
             "WARNING: TWITCH_SETTINGS_PASSWORD is unset with TWITCH_SETTINGS_ALLOW_OPEN on — anyone "
@@ -172,7 +196,7 @@ def load_settings() -> Settings:
         )
     elif settings_password is None and host_is_exposed:
         print(
-            f"WARNING: TWITCH_NOWPLAYING_HOST={nowplaying_host!r} is reachable off this machine but "
+            f"WARNING: TWITCH_HTTP_HOST={http_host!r} is reachable off this machine but "
             f"TWITCH_SETTINGS_PASSWORD is unset — /settings is DISABLED until you set a password. "
             f"(TWITCH_SETTINGS_ALLOW_OPEN=true re-enables it without one; only do that on a network "
             f"you trust.)"
@@ -214,8 +238,10 @@ def load_settings() -> Settings:
         bot_id=bot_id,
         owner_id=owner_id,
         prefix=os.getenv("TWITCH_PREFIX", "!").strip() or "!",
-        nowplaying_host=nowplaying_host,
-        nowplaying_port=_clamped_int_env("TWITCH_NOWPLAYING_PORT", 8098, 1024, 65535),
+        http_host=http_host,
+        http_port=_clamped_int_env(
+            "TWITCH_HTTP_PORT" if os.getenv("TWITCH_HTTP_PORT") else "TWITCH_NOWPLAYING_PORT", 8098, 1024, 65535
+        ),
         settings_password=settings_password,
         settings_allow_open=settings_allow_open,
         session_hours=_clamped_int_env("TWITCH_SESSION_HOURS", 12, 1, 168),
@@ -223,6 +249,10 @@ def load_settings() -> Settings:
         trusted_proxies=trusted_proxies,
         public_base_url=public_base_url,
         chat_emote_sources=chat_emote_sources,
+        reply_suffixes=_reply_suffixes_env("TWITCH_REPLY_SUFFIXES"),
+        reserved_commands=_command_names_env("TWITCH_RESERVED_COMMANDS"),
+        db_backup_keep=_clamped_int_env("TWITCH_DB_BACKUP_KEEP", 7, 0, 90),
+        backup_dir=DATA_DIR / "backups",
         token_path=DATA_DIR / os.getenv("TWITCH_TOKEN_FILE", "twitch_tokens.json").strip(),
         tunables_path=DATA_DIR / os.getenv("TWITCH_TUNABLES_FILE", "tunables.json").strip(),
         specs_path=DATA_DIR / os.getenv("TWITCH_SPECS_FILE", "specs.json").strip(),

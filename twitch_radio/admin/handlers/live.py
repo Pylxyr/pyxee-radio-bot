@@ -13,7 +13,8 @@ from typing import Any
 from aiohttp import web
 
 from twitch_radio.admin.assets import static_text
-from twitch_radio.admin.context import client_ip, get_ctx
+from twitch_radio.admin.context import AdminContext, client_ip, get_ctx
+from twitch_radio.admin.render.commands_page import build_commands_page
 
 # Everything the public /commands page may load: its own inline style and
 # script, Google Fonts, and the logo. Nothing else, and never framed.
@@ -37,10 +38,17 @@ async def handle_chat(request: web.Request) -> web.Response:
 
 
 async def handle_healthz(request: web.Request) -> web.Response:
-    """Unauthenticated on purpose (nothing here is sensitive) — for an
-    uptime monitor, or a quick health check without opening /settings."""
+    """Unauthenticated on purpose (nothing here is sensitive) — for an uptime
+    monitor. 503 only when the database is unreachable; a bot still waiting on
+    OAuth is a normal state, reported as `chat_subscribed: false` instead."""
     ctx = get_ctx(request)
-    return web.json_response({"uptime_seconds": round(time.monotonic() - ctx.started_at, 1)})
+    db_ok = await ctx.db.ping()
+    body: dict[str, Any] = ctx.status.snapshot()
+    body.update(
+        ok=db_ok, db_ok=db_ok, uptime_seconds=round(time.monotonic() - ctx.started_at, 1),
+        db_schema_version=await ctx.db.schema_version() if db_ok else None,
+    )
+    return web.json_response(body, status=200 if db_ok else 503)
 
 
 async def _push_ws(
@@ -101,6 +109,22 @@ async def handle_logo(request: web.Request) -> web.Response:
     return web.Response(body=body, content_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
 
 
+_COMMANDS_PAGE_TTL_SECONDS = 30.0
+
+
+async def _commands_html(ctx: AdminContext) -> str:
+    """The /commands page, rebuilt at most every 30s so custom commands a mod
+    just added show up without a restart (and without a database hit per view)."""
+    now = time.monotonic()
+    if ctx.commands_cache is not None and now - ctx.commands_cache[0] < _COMMANDS_PAGE_TTL_SECONDS:
+        return ctx.commands_cache[1]
+    html = build_commands_page(
+        ctx.commands_prefix, has_logo=ctx.has_logo, custom=await ctx.db.load_commands(), counters=await ctx.db.load_counters()
+    )
+    ctx.commands_cache = (now, html)
+    return html
+
+
 async def handle_commands_page(request: web.Request) -> web.Response:
     """Public, read-only command reference, linked from chat's !commands
     once TWITCH_PUBLIC_BASE_URL is set — reachable by every viewer, not
@@ -113,7 +137,7 @@ async def handle_commands_page(request: web.Request) -> web.Response:
     if not ctx.commands_limiter.allow(client_ip(request)):
         return web.Response(status=429, text="Too many requests — try again in a minute.")
     return web.Response(
-        text=ctx.commands_page_html,
+        text=await _commands_html(ctx),
         content_type="text/html",
         headers={
             "Cache-Control": "public, max-age=120",

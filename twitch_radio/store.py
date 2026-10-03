@@ -46,14 +46,6 @@ class JsonStore:
             return None
         return (st.st_mtime_ns, st.st_size)
 
-    def invalidate(self) -> None:
-        """Drops the cached copy — next read() goes to disk unconditionally.
-        Not needed for writes through this class (they refresh the cache
-        themselves); here for a caller that knows the file changed underneath
-        it in a way stat() can't see."""
-        self._cache = None
-        self._cache_key = None
-
     async def read(self) -> dict[str, Any]:
         async with self._lock:
             key = self._stat_key()
@@ -70,12 +62,6 @@ class JsonStore:
             # pre-write key and served stale until the next change.
             self._cache_key = self._stat_key()
             return dict(data)
-
-    async def write(self, data: dict[str, Any]) -> None:
-        async with self._lock:
-            await asyncio.to_thread(self._write_sync, data)
-            self._cache = dict(data)
-            self._cache_key = self._stat_key()
 
     async def update(
         self, mutator: Callable[[dict[str, Any]], dict[str, Any] | None]

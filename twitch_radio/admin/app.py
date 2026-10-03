@@ -13,11 +13,11 @@ from twitch_radio.admin.assets import preload_static, read_logo
 from twitch_radio.admin.context import CTX_KEY, AdminContext, is_https
 from twitch_radio.admin.handlers import live, login
 from twitch_radio.admin.handlers import settings as settings_handlers
-from twitch_radio.admin.render.commands_page import build_commands_page
 from twitch_radio.admin.sessions import SessionStore
 from twitch_radio.chatfeed import ChatFeed
 from twitch_radio.db import Database
 from twitch_radio.netutil import IPNetwork, is_loopback_host
+from twitch_radio.runtime import RuntimeStatus
 from twitch_radio.store import JsonStore
 
 log = logging.getLogger(__name__)
@@ -61,6 +61,7 @@ async def _security_headers_middleware(request: web.Request, handler: _Handler) 
 async def run_admin_server(
     *,
     chat_feed: ChatFeed,
+    status: RuntimeStatus,
     tunables_store: JsonStore,
     specs_store: JsonStore,
     toggles_store: JsonStore,
@@ -99,10 +100,12 @@ async def run_admin_server(
         specs_store=specs_store,
         toggles_store=toggles_store,
         db=db,
+        status=status,
         broadcast_info=broadcast_info,
         logo=logo,
         logo_small=read_logo("logo-32.png"),
-        commands_page_html=build_commands_page(commands_prefix, has_logo=logo is not None),
+        commands_prefix=commands_prefix,
+        has_logo=logo is not None,
         settings_password=settings_password,
         exposed=exposed,
         allow_open=allow_open_settings,
